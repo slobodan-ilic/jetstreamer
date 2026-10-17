@@ -1704,7 +1704,13 @@ fn latest_status_publication_receipt(
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+        let Some(timestamp) = name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if timestamp.len() != 14 || !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
             continue;
         }
         let path = entry.path();
@@ -3324,6 +3330,11 @@ mod tests {
         newer.object_etag = "newer-etag".to_owned();
         let newer_path = write_status_receipt(directory.path(), &newer).unwrap();
         let newer_digest = hex_lower(&Sha256::digest(fs::read(&newer_path).unwrap()));
+        fs::write(
+            status_deletion_receipt_path(directory.path(), 218),
+            b"not a status publication receipt\n",
+        )
+        .unwrap();
         let (latest, latest_path, latest_digest) =
             latest_status_publication_receipt(directory.path(), "bucket", 218).unwrap();
         assert_eq!(latest, newer);
