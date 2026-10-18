@@ -52,6 +52,10 @@ path = "src/horizon_boundary_bridge_bin.rs"
 name = "jetstreamer-horizon-retire-scratch"
 path = "src/horizon_retire_scratch_bin.rs"
 
+[[bin]]
+name = "jetstreamer-horizon-growth-claim"
+path = "src/horizon_growth_claim_bin.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
 log.workspace = true

@@ -1,0 +1,700 @@
+//! Validate an invocation-bound remaining-growth claim from coordinated Horizon samples.
+//!
+//! The output is evidence for a later admission manifest. It never launches replay or
+//! authorizes local, remote, or R2 mutation.
+
+use {
+    serde::{Deserialize, Serialize},
+    serde_json::Value,
+    sha2::{Digest as _, Sha256},
+    std::{
+        collections::BTreeSet,
+        env,
+        ffi::OsStr,
+        fs::{self, File, OpenOptions},
+        io::{Read, Write},
+        os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    },
+};
+
+const PLAN_SCHEMA: &str = "jetstreamer-horizon-growth-claim-plan-v1";
+const RECEIPT_SCHEMA: &str = "jetstreamer-horizon-growth-claim-v1";
+const OBSERVER_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-v2";
+const FLOOR_SCHEMA: &str = "jetstreamer-horizon-century-jet-floor-v1";
+const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
+const GIB: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Plan {
+    schema: String,
+    range: String,
+    expected_controller_invocation_id: String,
+    expected_producer_invocation_id: String,
+    observations: Vec<Evidence>,
+    century_floor_evidence: Evidence,
+    scratch_multiplier: u64,
+    max_jet_multiplier: u64,
+    requested_claim_gib: u64,
+    output_receipt: PathBuf,
+    authority: Authority,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Evidence {
+    path: PathBuf,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Authority {
+    replay_launch_authorized: bool,
+    local_deletion_authorized: bool,
+    remote_mutations: bool,
+    r2_mutations: bool,
+}
+
+#[derive(Debug)]
+struct Arguments {
+    plan: PathBuf,
+    plan_sha256: String,
+    self_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ObservationReceipt {
+    path: String,
+    sha256: String,
+    recorded_at_utc: String,
+    scratch_bytes: u64,
+    slot: u64,
+    terminal_slot: u64,
+    slots_per_second: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct Receipt {
+    schema: &'static str,
+    recorded_at_unix_seconds: u64,
+    plan: String,
+    plan_sha256: String,
+    verifier_sha256: String,
+    range: String,
+    controller_invocation_id: String,
+    producer_invocation_id: String,
+    observations: Vec<ObservationReceipt>,
+    maximum_observed_scratch_bytes: u64,
+    maximum_verified_jet_bytes: u64,
+    scratch_multiplier: u64,
+    max_jet_multiplier: u64,
+    formula_minimum_bytes: u64,
+    requested_claim_gib: u64,
+    requested_claim_bytes: u64,
+    replay_launch_authorized: bool,
+    local_deletion_authorized: bool,
+    remote_mutations: bool,
+    r2_mutations: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Identity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+}
+
+fn identity(metadata: &fs::Metadata) -> Identity {
+    Identity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        mtime_seconds: metadata.mtime(),
+        mtime_nanoseconds: metadata.mtime_nsec(),
+    }
+}
+
+fn lowercase_sha256(value: &str, field: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{field} must contain 64 lowercase hex digits"));
+    }
+    Ok(())
+}
+
+fn lowercase_invocation_id(value: &str, field: &str) -> Result<(), String> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{field} must contain 32 lowercase hex digits"));
+    }
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(DIGITS[usize::from(byte >> 4)] as char);
+        output.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
+
+fn usage(program: &str) -> String {
+    format!("usage: {program} PLAN.json --plan-sha256 HEX --self-sha256 HEX")
+}
+
+fn parse_arguments() -> Result<Arguments, String> {
+    let mut arguments = env::args_os();
+    let program = arguments
+        .next()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "jetstreamer-horizon-growth-claim".to_string());
+    let plan = arguments.next().ok_or_else(|| usage(&program))?;
+    if arguments.next().as_deref() != Some(OsStr::new("--plan-sha256")) {
+        return Err(usage(&program));
+    }
+    let plan_sha256 = arguments
+        .next()
+        .ok_or_else(|| usage(&program))?
+        .into_string()
+        .map_err(|_| "plan SHA-256 is not UTF-8".to_string())?;
+    if arguments.next().as_deref() != Some(OsStr::new("--self-sha256")) {
+        return Err(usage(&program));
+    }
+    let self_sha256 = arguments
+        .next()
+        .ok_or_else(|| usage(&program))?
+        .into_string()
+        .map_err(|_| "self SHA-256 is not UTF-8".to_string())?;
+    if arguments.next().is_some() {
+        return Err(usage(&program));
+    }
+    Ok(Arguments {
+        plan: PathBuf::from(plan),
+        plan_sha256,
+        self_sha256,
+    })
+}
+
+fn open_regular_nofollow(path: &Path, max_bytes: u64) -> Result<(File, Identity), String> {
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {}", path.display()));
+    }
+    let before =
+        fs::symlink_metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
+    if !before.is_file() || before.nlink() != 1 || before.size() > max_bytes {
+        return Err(format!("unsafe regular file identity: {}", path.display()));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("canonicalize {}: {error}", path.display()))?;
+    if canonical != path {
+        return Err(format!("path is not canonical: {}", path.display()));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("fstat {}: {error}", path.display()))?;
+    if identity(&before) != identity(&opened) {
+        return Err(format!("file changed while opening: {}", path.display()));
+    }
+    Ok((file, identity(&opened)))
+}
+
+fn read_hashed_bytes_with_policy(
+    path: &Path,
+    expected_sha256: &str,
+    require_sealed_plan: bool,
+) -> Result<Vec<u8>, String> {
+    lowercase_sha256(expected_sha256, &format!("{} SHA-256", path.display()))?;
+    let (mut file, before) = open_regular_nofollow(path, MAX_JSON_BYTES)?;
+    if require_sealed_plan {
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("fstat plan {}: {error}", path.display()))?;
+        let mode = metadata.permissions().mode();
+        if metadata.uid() != 0 || metadata.nlink() != 1 || mode & 0o400 == 0 || mode & 0o222 != 0 {
+            return Err(
+                "plan must be root-owned, singly linked, owner-readable, and non-writable"
+                    .to_string(),
+            );
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let observed = hex(&Sha256::digest(&bytes));
+    if observed != expected_sha256 {
+        return Err(format!(
+            "SHA-256 mismatch for {}: expected {expected_sha256}, observed {observed}",
+            path.display()
+        ));
+    }
+    let after = fs::symlink_metadata(path)
+        .map_err(|error| format!("restat {}: {error}", path.display()))?;
+    if identity(&after) != before {
+        return Err(format!("file changed while reading: {}", path.display()));
+    }
+    Ok(bytes)
+}
+
+fn read_hashed_bytes(path: &Path, expected_sha256: &str) -> Result<Vec<u8>, String> {
+    read_hashed_bytes_with_policy(path, expected_sha256, false)
+}
+
+fn read_sealed_plan_bytes(path: &Path, expected_sha256: &str) -> Result<Vec<u8>, String> {
+    read_hashed_bytes_with_policy(path, expected_sha256, true)
+}
+
+fn read_json(path: &Path, expected_sha256: &str) -> Result<Value, String> {
+    serde_json::from_slice(&read_hashed_bytes(path, expected_sha256)?)
+        .map_err(|error| format!("decode {}: {error}", path.display()))
+}
+
+fn value_str<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing string {pointer}"))
+}
+
+fn value_u64(value: &Value, pointer: &str) -> Result<u64, String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("missing integer {pointer}"))
+}
+
+fn value_f64(value: &Value, pointer: &str) -> Result<f64, String> {
+    let number = value
+        .pointer(pointer)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("missing number {pointer}"))?;
+    if !number.is_finite() || number <= 0.0 {
+        return Err(format!("{pointer} must be a positive finite number"));
+    }
+    Ok(number)
+}
+
+fn value_bool(value: &Value, pointer: &str) -> Result<bool, String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("missing boolean {pointer}"))
+}
+
+fn validate_unit_binding(
+    replay: &Value,
+    prefix: &str,
+    expected_invocation: &str,
+) -> Result<(), String> {
+    for phase in ["before", "after"] {
+        let base = format!("/{prefix}_{phase}");
+        if value_str(replay, &format!("{base}/invocation_id"))? != expected_invocation
+            || value_u64(replay, &format!("{base}/restarts"))? != 0
+            || value_str(replay, &format!("{base}/load_state"))? != "loaded"
+            || value_str(replay, &format!("{base}/active_state"))? != "active"
+            || value_str(replay, &format!("{base}/result"))? != "success"
+        {
+            return Err(format!("unstable or unhealthy {prefix} {phase} binding"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_observations(plan: &Plan) -> Result<(Vec<ObservationReceipt>, u64), String> {
+    if plan.observations.len() < 6 {
+        return Err("at least six contiguous routine observations are required".to_string());
+    }
+    let mut receipts = Vec::with_capacity(plan.observations.len());
+    let mut maximum_scratch = 0_u64;
+    let mut prior_path: Option<&Path> = None;
+    let mut prior_sha: Option<&str> = None;
+    let mut prior_recorded: Option<String> = None;
+    let mut prior_slot: Option<u64> = None;
+    let mut terminal_slot: Option<u64> = None;
+    for evidence in &plan.observations {
+        let value = read_json(&evidence.path, &evidence.sha256)?;
+        if value_str(&value, "/schema")? != OBSERVER_SCHEMA
+            || value_str(&value, "/cadence/observation_reason")? != "routine"
+            || value_u64(&value, "/cadence/minimum_interval_seconds")? != 1800
+            || value_u64(&value, "/cadence/observed_interval_seconds")? < 1800
+            || !value_bool(&value, "/cadence/routine_minimum_interval_enforced")?
+            || value_bool(&value, "/mutation/producer_or_controller_signals_sent")?
+            || value_bool(&value, "/mutation/service_state_changed")?
+            || value_bool(&value, "/mutation/remote_mutations")?
+            || value_bool(&value, "/mutation/r2_mutations")?
+        {
+            return Err(format!(
+                "observer cadence or mutation gate failed: {}",
+                evidence.path.display()
+            ));
+        }
+        if let (Some(path), Some(sha)) = (prior_path, prior_sha)
+            && (value_str(&value, "/cadence/previous_sample")? != path.to_string_lossy()
+                || value_str(&value, "/cadence/previous_sample_sha256")? != sha)
+        {
+            return Err("observer evidence is not one contiguous routine chain".to_string());
+        }
+        let recorded = value_str(&value, "/recorded_at_utc")?.to_string();
+        if prior_recorded
+            .as_ref()
+            .is_some_and(|prior| recorded <= *prior)
+        {
+            return Err("observer timestamps are not strictly increasing".to_string());
+        }
+        let replays = value
+            .pointer("/replays")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "observer replays must be an array".to_string())?;
+        let matches: Vec<&Value> = replays
+            .iter()
+            .filter(|replay| replay.get("range").and_then(Value::as_str) == Some(&plan.range))
+            .collect();
+        if matches.len() != 1 {
+            return Err(format!(
+                "observer must contain exactly one {} replay",
+                plan.range
+            ));
+        }
+        let replay = matches[0];
+        if !value_bool(replay, "/invocation_binding_stable")? {
+            return Err("observer invocation binding is not stable".to_string());
+        }
+        validate_unit_binding(
+            replay,
+            "controller",
+            &plan.expected_controller_invocation_id,
+        )?;
+        validate_unit_binding(replay, "producer", &plan.expected_producer_invocation_id)?;
+        if !value_bool(replay, "/useful_work/sufficient_for_rates")? {
+            return Err("observer lacks sufficient useful-work rates".to_string());
+        }
+        let scratch = value_u64(replay, "/conservative_observed_physical_bytes")?;
+        let slot = value_u64(replay, "/useful_work/last/slot")?;
+        let observed_terminal = value_u64(replay, "/useful_work/last/terminal_slot")?;
+        let rate = value_f64(replay, "/useful_work/slots_per_second")?;
+        if slot > observed_terminal
+            || prior_slot.is_some_and(|prior| slot <= prior)
+            || terminal_slot.is_some_and(|prior| observed_terminal != prior)
+        {
+            return Err("observer slot sequence or terminal slot is invalid".to_string());
+        }
+        maximum_scratch = maximum_scratch.max(scratch);
+        receipts.push(ObservationReceipt {
+            path: evidence.path.display().to_string(),
+            sha256: evidence.sha256.clone(),
+            recorded_at_utc: recorded.clone(),
+            scratch_bytes: scratch,
+            slot,
+            terminal_slot: observed_terminal,
+            slots_per_second: rate,
+        });
+        prior_path = Some(&evidence.path);
+        prior_sha = Some(&evidence.sha256);
+        prior_recorded = Some(recorded);
+        prior_slot = Some(slot);
+        terminal_slot = Some(observed_terminal);
+    }
+    Ok((receipts, maximum_scratch))
+}
+
+fn maximum_verified_jet(plan: &Plan) -> Result<u64, String> {
+    let value = read_json(
+        &plan.century_floor_evidence.path,
+        &plan.century_floor_evidence.sha256,
+    )?;
+    if value_str(&value, "/schema")? != FLOOR_SCHEMA {
+        return Err("century floor evidence schema mismatch".to_string());
+    }
+    if value_u64(&value, "/century/first_epoch")? != 200
+        || value_u64(&value, "/century/last_epoch")? != 300
+        || value_str(&value, "/selection_policy")?
+            != "one canonical complete jet per epoch with normal full/plugin evidence and an authenticated R2 ready-pair receipt; exclude partial, diagnostic, verification-tail, archive-only, and growing files"
+        || value_bool(&value, "/remote_mutations")?
+        || value_bool(&value, "/r2_mutations")?
+    {
+        return Err("century floor scope, policy, or mutation declaration mismatch".to_string());
+    }
+    let samples = value
+        .pointer("/samples")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "century floor samples must be an array".to_string())?;
+    if samples.is_empty() {
+        return Err("century floor evidence has no verified jets".to_string());
+    }
+    let mut sum = 0_u64;
+    let mut maximum = 0_u64;
+    let mut epochs = BTreeSet::new();
+    for sample in samples {
+        let epoch = value_u64(sample, "/epoch")?;
+        if !(200..=300).contains(&epoch) || !epochs.insert(epoch) {
+            return Err("century floor sample epoch is out of range or duplicated".to_string());
+        }
+        let size = value_u64(sample, "/jet_size_bytes")?;
+        let archive_sha = value_str(sample, "/archive_sha256")?;
+        lowercase_sha256(archive_sha, "archive SHA-256")?;
+        let receipt_path = PathBuf::from(value_str(sample, "/r2_receipt")?);
+        let receipt_sha = value_str(sample, "/r2_receipt_sha256")?;
+        lowercase_sha256(receipt_sha, "R2 receipt SHA-256")?;
+        let receipt = read_json(&receipt_path, receipt_sha)?;
+        if value_str(&receipt, "/schema")? != "jetstreamer-horizon-r2-receipt-v1"
+            || value_u64(&receipt, "/epoch")? != epoch
+            || value_str(&receipt, "/archive_key")? != format!("epoch-{epoch}.jet")
+            || value_str(&receipt, "/checksum_key")? != format!("epoch-{epoch}.jet.sha256")
+            || value_u64(&receipt, "/archive_length")? != size
+            || value_str(&receipt, "/archive_sha256")? != archive_sha
+            || !value_bool(&receipt, "/remote_sha256_readback")?
+        {
+            return Err(format!("R2 ready-pair receipt mismatch for epoch {epoch}"));
+        }
+        sum = sum
+            .checked_add(size)
+            .ok_or_else(|| "jet size sum overflow".to_string())?;
+        maximum = maximum.max(size);
+    }
+    let count = u64::try_from(samples.len()).map_err(|_| "sample count overflow".to_string())?;
+    let expected_floor = sum
+        .checked_mul(2)
+        .and_then(|twice| twice.checked_add(count - 1))
+        .map(|rounded| rounded / count)
+        .ok_or_else(|| "century floor arithmetic overflow".to_string())?;
+    if value_u64(&value, "/arithmetic/sample_count")? != count
+        || value_u64(&value, "/arithmetic/sum_jet_size_bytes")? != sum
+        || value_u64(&value, "/arithmetic/floor_bytes")? != expected_floor
+    {
+        return Err("century floor arithmetic does not reproduce".to_string());
+    }
+    Ok(maximum)
+}
+
+fn compute_formula_minimum(
+    maximum_scratch: u64,
+    maximum_jet: u64,
+    scratch_multiplier: u64,
+    max_jet_multiplier: u64,
+) -> Result<u64, String> {
+    maximum_scratch
+        .checked_mul(scratch_multiplier)
+        .and_then(|scratch| {
+            maximum_jet
+                .checked_mul(max_jet_multiplier)
+                .and_then(|jet| scratch.checked_add(jet))
+        })
+        .ok_or_else(|| "growth claim arithmetic overflow".to_string())
+}
+
+fn verify_running_executable(expected_sha256: &str) -> Result<String, String> {
+    lowercase_sha256(expected_sha256, "self SHA-256")?;
+    let mut executable = File::open("/proc/self/exe")
+        .map_err(|error| format!("open running executable: {error}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = executable
+            .read(&mut buffer)
+            .map_err(|error| format!("read running executable: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let observed = hex(&digest.finalize());
+    if observed != expected_sha256 {
+        return Err(format!(
+            "self SHA-256 mismatch: expected {expected_sha256}, observed {observed}"
+        ));
+    }
+    Ok(observed)
+}
+
+fn validate_output_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("output receipt must be absolute".to_string());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "output receipt has no parent".to_string())?;
+    let metadata = fs::symlink_metadata(parent)
+        .map_err(|error| format!("stat output parent {}: {error}", parent.display()))?;
+    if parent.canonicalize().map_err(|error| error.to_string())? != parent
+        || !metadata.is_dir()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err("output parent must be canonical, root-owned, and owner-only".to_string());
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err("output receipt already exists".to_string()),
+        Err(error) => Err(format!("inspect output receipt: {error}")),
+    }
+}
+
+fn fsync_directory(path: &Path) -> Result<(), String> {
+    let directory =
+        File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    directory
+        .sync_all()
+        .map_err(|error| format!("fsync {}: {error}", path.display()))
+}
+
+fn write_receipt(path: &Path, receipt: &Receipt) -> Result<(), String> {
+    validate_output_path(path)?;
+    let bytes =
+        serde_json::to_vec_pretty(receipt).map_err(|error| format!("encode receipt: {error}"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.write_all(b"\n"))
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    fsync_directory(path.parent().expect("validated output parent"))
+}
+
+fn run(arguments: &Arguments) -> Result<Receipt, String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("growth claim verification must run as root".to_string());
+    }
+    lowercase_sha256(&arguments.plan_sha256, "plan SHA-256")?;
+    let plan_bytes = read_sealed_plan_bytes(&arguments.plan, &arguments.plan_sha256)?;
+    let plan: Plan =
+        serde_json::from_slice(&plan_bytes).map_err(|error| format!("decode plan: {error}"))?;
+    if plan.schema != PLAN_SCHEMA
+        || plan.range.is_empty()
+        || plan.scratch_multiplier < 1
+        || plan.max_jet_multiplier < 1
+        || plan.requested_claim_gib < 1
+        || plan.authority.replay_launch_authorized
+        || plan.authority.local_deletion_authorized
+        || plan.authority.remote_mutations
+        || plan.authority.r2_mutations
+    {
+        return Err("plan schema, multipliers, claim, or authority is invalid".to_string());
+    }
+    lowercase_invocation_id(
+        &plan.expected_controller_invocation_id,
+        "controller invocation ID",
+    )?;
+    lowercase_invocation_id(
+        &plan.expected_producer_invocation_id,
+        "producer invocation ID",
+    )?;
+    let verifier_sha256 = verify_running_executable(&arguments.self_sha256)?;
+    let (observations, maximum_scratch) = validate_observations(&plan)?;
+    let maximum_jet = maximum_verified_jet(&plan)?;
+    let formula_minimum = compute_formula_minimum(
+        maximum_scratch,
+        maximum_jet,
+        plan.scratch_multiplier,
+        plan.max_jet_multiplier,
+    )?;
+    let requested_claim_bytes = plan
+        .requested_claim_gib
+        .checked_mul(GIB)
+        .ok_or_else(|| "requested claim overflow".to_string())?;
+    if requested_claim_bytes < formula_minimum {
+        return Err(format!(
+            "requested claim {requested_claim_bytes} is below formula minimum {formula_minimum}"
+        ));
+    }
+    validate_output_path(&plan.output_receipt)?;
+    let recorded_at_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("clock before Unix epoch: {error}"))?
+        .as_secs();
+    Ok(Receipt {
+        schema: RECEIPT_SCHEMA,
+        recorded_at_unix_seconds,
+        plan: arguments.plan.display().to_string(),
+        plan_sha256: arguments.plan_sha256.clone(),
+        verifier_sha256,
+        range: plan.range,
+        controller_invocation_id: plan.expected_controller_invocation_id,
+        producer_invocation_id: plan.expected_producer_invocation_id,
+        observations,
+        maximum_observed_scratch_bytes: maximum_scratch,
+        maximum_verified_jet_bytes: maximum_jet,
+        scratch_multiplier: plan.scratch_multiplier,
+        max_jet_multiplier: plan.max_jet_multiplier,
+        formula_minimum_bytes: formula_minimum,
+        requested_claim_gib: plan.requested_claim_gib,
+        requested_claim_bytes,
+        replay_launch_authorized: false,
+        local_deletion_authorized: false,
+        remote_mutations: false,
+        r2_mutations: false,
+    })
+}
+
+fn main() {
+    let result = parse_arguments().and_then(|arguments| {
+        let receipt = run(&arguments)?;
+        let plan_bytes = read_sealed_plan_bytes(&arguments.plan, &arguments.plan_sha256)?;
+        let plan: Plan = serde_json::from_slice(&plan_bytes)
+            .map_err(|error| format!("decode plan before publication: {error}"))?;
+        write_receipt(&plan.output_receipt, &receipt)?;
+        println!(
+            "{}",
+            serde_json::to_string(&receipt).map_err(|error| error.to_string())?
+        );
+        Ok(())
+    });
+    if let Err(error) = result {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formula_is_checked_and_conservative() {
+        assert_eq!(
+            compute_formula_minimum(90_878_533_632, 128_820_081_409, 2, 2).unwrap(),
+            439_397_230_082
+        );
+        assert!(512_u64 * GIB > 439_397_230_082);
+    }
+
+    #[test]
+    fn rejects_overflow() {
+        assert!(compute_formula_minimum(u64::MAX, 1, 2, 2).is_err());
+    }
+
+    #[test]
+    fn invocation_ids_are_32_lowercase_hex_digits() {
+        assert!(lowercase_invocation_id("0123456789abcdef0123456789abcdef", "invocation").is_ok());
+        assert!(
+            lowercase_invocation_id(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "invocation"
+            )
+            .is_err()
+        );
+        assert!(lowercase_invocation_id("0123456789ABCDEF0123456789abcdef", "invocation").is_err());
+    }
+}
