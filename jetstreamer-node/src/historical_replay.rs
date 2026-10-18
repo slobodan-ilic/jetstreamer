@@ -28,10 +28,189 @@ use {
     },
 };
 
+#[cfg(feature = "epoch224-account-delta-diagnostic")]
+use sha2::{Digest as _, Sha256};
+
 const HISTORICAL_BATCH_MAX_SLOTS: usize = 4;
 // Leave half of the 64 MiB frame for entry/vector framing and keep batches of
 // unusually large transactions from turning one response into a huge burst.
 const HISTORICAL_BATCH_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
+
+#[cfg(feature = "epoch224-account-delta-diagnostic")]
+const EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT: Slot = 96_767_525;
+
+#[cfg(feature = "epoch224-account-delta-diagnostic")]
+fn verify_epoch224_transaction_write_lamports(
+    entry: &ReadyEntry,
+    writes: &[HistoricalAccountWrite],
+    seen: &mut BTreeSet<([u8; 64], [u8; 32])>,
+) -> Result<(), String> {
+    for write in writes {
+        if write.slot != EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT {
+            continue;
+        }
+        let Some(signature) = write.transaction_signature else {
+            info!(
+                "epoch224 freeze write: slot={} write_version={} pubkey={} lamports={} owner={} executable={} rent_epoch={} stored_hash={} data_sha256={:x}",
+                write.slot,
+                write.write_version,
+                Address::new_from_array(write.pubkey),
+                write.lamports,
+                Address::new_from_array(write.owner),
+                write.executable,
+                write.rent_epoch,
+                Hash::new_from_array(write.stored_hash),
+                Sha256::digest(&write.data),
+            );
+            continue;
+        };
+        if entry.slot != EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT {
+            return Err(format!(
+                "epoch224 diagnostic transaction write for slot {} arrived with entry slot {}",
+                write.slot, entry.slot
+            ));
+        }
+        let mut matches = entry.txs.iter().enumerate().filter(|(_, scheduled)| {
+            scheduled
+                .tx
+                .signatures
+                .first()
+                .is_some_and(|candidate| *candidate.as_array() == signature)
+        });
+        let (transaction_index, scheduled) = matches.next().ok_or_else(|| {
+            format!(
+                "epoch224 diagnostic write version {} has unknown transaction signature {}",
+                write.write_version,
+                Signature::from(signature)
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "epoch224 diagnostic signature {} maps to multiple source transactions",
+                Signature::from(signature)
+            ));
+        }
+        if scheduled.expected_status.is_none() || scheduled.reconstruct_fee {
+            return Err(format!(
+                "epoch224 diagnostic transaction {} lacks exact canonical metadata",
+                transaction_index
+            ));
+        }
+        let keys = scheduled.tx.message.static_account_keys();
+        if scheduled.status_meta.pre_balances.len() != keys.len()
+            || scheduled.status_meta.post_balances.len() != keys.len()
+        {
+            return Err(format!(
+                "epoch224 diagnostic transaction {} balance vectors do not match its {} static keys",
+                transaction_index,
+                keys.len()
+            ));
+        }
+        let mut key_matches = keys
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| key.to_bytes() == write.pubkey);
+        let (account_index, _) = key_matches.next().ok_or_else(|| {
+            format!(
+                "epoch224 diagnostic write version {} pubkey {} is absent from transaction {}",
+                write.write_version,
+                Address::new_from_array(write.pubkey),
+                transaction_index
+            )
+        })?;
+        if key_matches.next().is_some() {
+            return Err(format!(
+                "epoch224 diagnostic transaction {} contains duplicate key {}",
+                transaction_index,
+                Address::new_from_array(write.pubkey)
+            ));
+        }
+        let expected = scheduled.status_meta.post_balances[account_index];
+        if write.lamports != expected {
+            return Err(format!(
+                "epoch224 diagnostic lamport mismatch at slot {} entry {} transaction {} signature {} pubkey {}: expected {}, observed {}, write version {}",
+                entry.slot,
+                entry.entry_index,
+                entry.start_index + transaction_index,
+                Signature::from(signature),
+                Address::new_from_array(write.pubkey),
+                expected,
+                write.lamports,
+                write.write_version,
+            ));
+        }
+        // The epoch-224 diagnostic is sealed with the v1.6.20 worker. Its
+        // conflict-free execution wave attributes one committed final account
+        // image per writable message key; a repeated key inside one sanitized
+        // transaction cannot reach commit. A second `(signature, pubkey)` is
+        // therefore ambiguous evidence, not a value we may silently replace.
+        if !seen.insert((signature, write.pubkey)) {
+            return Err(format!(
+                "epoch224 diagnostic transaction {} emitted duplicate final write for {}",
+                transaction_index,
+                Address::new_from_array(write.pubkey)
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "epoch224-account-delta-diagnostic")]
+fn verify_epoch224_changed_lamport_writes(
+    entry: &ReadyEntry,
+    seen: &BTreeSet<([u8; 64], [u8; 32])>,
+) -> Result<(), String> {
+    if entry.slot != EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT {
+        return Ok(());
+    }
+    for (transaction_index, scheduled) in entry.txs.iter().enumerate() {
+        if scheduled.expected_status.is_none() || scheduled.reconstruct_fee {
+            return Err(format!(
+                "epoch224 diagnostic transaction {} lacks exact canonical metadata",
+                transaction_index
+            ));
+        }
+        let signature = scheduled
+            .tx
+            .signatures
+            .first()
+            .map(|value| *value.as_array())
+            .ok_or_else(|| {
+                format!(
+                    "epoch224 diagnostic transaction {} has no signature",
+                    transaction_index
+                )
+            })?;
+        let keys = scheduled.tx.message.static_account_keys();
+        if scheduled.status_meta.pre_balances.len() != keys.len()
+            || scheduled.status_meta.post_balances.len() != keys.len()
+        {
+            return Err(format!(
+                "epoch224 diagnostic transaction {} balance vectors do not match its {} static keys",
+                transaction_index,
+                keys.len()
+            ));
+        }
+        for (account_index, key) in keys.iter().enumerate() {
+            if scheduled.status_meta.pre_balances[account_index]
+                != scheduled.status_meta.post_balances[account_index]
+                && !seen.contains(&(signature, key.to_bytes()))
+            {
+                return Err(format!(
+                    "epoch224 diagnostic missing write at slot {} entry {} transaction {} signature {} pubkey {}: pre {}, post {}",
+                    entry.slot,
+                    entry.entry_index,
+                    entry.start_index + transaction_index,
+                    Signature::from(signature),
+                    key,
+                    scheduled.status_meta.pre_balances[account_index],
+                    scheduled.status_meta.post_balances[account_index],
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 fn apply_runtime_reconstructed_metadata(
     scheduled: &mut super::ScheduledTransaction,
@@ -457,6 +636,8 @@ impl HistoricalReplay {
         let mut current = entries.next().expect("nonempty batch");
         let mut current_outcomes = Vec::new();
         let mut outcomes_verified = false;
+        #[cfg(feature = "epoch224-account-delta-diagnostic")]
+        let mut epoch224_seen_transaction_writes = BTreeSet::new();
         let mut checkpoint_after = None;
         let processed = {
             let mut state = self.state.lock().expect("historical replay lock poisoned");
@@ -505,6 +686,12 @@ impl HistoricalReplay {
                             Self::verify_outcomes(&mut current.entry, &current_outcomes)?;
                             outcomes_verified = true;
                         }
+                        #[cfg(feature = "epoch224-account-delta-diagnostic")]
+                        verify_epoch224_transaction_write_lamports(
+                            &current.entry,
+                            &writes,
+                            &mut epoch224_seen_transaction_writes,
+                        )?;
                         let extended = extend_emitted_write_versions(
                             emitted_write_versions.as_ref(),
                             self.live_start_slot,
@@ -533,6 +720,11 @@ impl HistoricalReplay {
                         if !outcomes_verified {
                             Self::verify_outcomes(entry, &current_outcomes)?;
                         }
+                        #[cfg(feature = "epoch224-account-delta-diagnostic")]
+                        verify_epoch224_changed_lamport_writes(
+                            entry,
+                            &epoch224_seen_transaction_writes,
+                        )?;
 
                         let post_start = Instant::now();
                         if entry.slot >= self.live_start_slot {
@@ -575,6 +767,8 @@ impl HistoricalReplay {
 
                         current_outcomes.clear();
                         outcomes_verified = false;
+                        #[cfg(feature = "epoch224-account-delta-diagnostic")]
+                        epoch224_seen_transaction_writes.clear();
                         if let Some(next) = entries.next() {
                             current = next;
                             self.cursor.start_inflight(
@@ -1152,6 +1346,164 @@ mod tests {
             data: Vec::new(),
             stored_hash: [0; 32],
         }
+    }
+
+    #[cfg(feature = "epoch224-account-delta-diagnostic")]
+    fn epoch224_diagnostic_entry(
+        slot: Slot,
+        signature_byte: u8,
+        key_byte: u8,
+        pre_lamports: u64,
+        post_lamports: u64,
+    ) -> ReadyEntry {
+        ReadyEntry {
+            slot,
+            entry_index: 8,
+            start_index: 7,
+            txs: vec![super::super::ScheduledTransaction {
+                tx: solana_transaction::versioned::VersionedTransaction {
+                    signatures: vec![Signature::from([signature_byte; 64])],
+                    message: solana_message::VersionedMessage::Legacy(
+                        solana_message::legacy::Message {
+                            header: solana_message::MessageHeader {
+                                num_required_signatures: 1,
+                                ..Default::default()
+                            },
+                            account_keys: vec![Address::new_from_array([key_byte; 32])],
+                            recent_blockhash: Hash::new_unique(),
+                            instructions: vec![],
+                        },
+                    ),
+                },
+                expected_status: Some(Ok(())),
+                reconstruct_fee: false,
+                status_meta: solana_transaction_status::TransactionStatusMeta {
+                    pre_balances: vec![pre_lamports],
+                    post_balances: vec![post_lamports],
+                    ..Default::default()
+                },
+            }],
+            hash: Hash::default(),
+            num_hashes: 1,
+            tx_count: 1,
+        }
+    }
+
+    #[cfg(feature = "epoch224-account-delta-diagnostic")]
+    fn epoch224_transaction_write(
+        signature_byte: u8,
+        key_byte: u8,
+        lamports: u64,
+    ) -> HistoricalAccountWrite {
+        HistoricalAccountWrite {
+            transaction_signature: Some([signature_byte; 64]),
+            pubkey: [key_byte; 32],
+            lamports,
+            ..account_write(EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT, 42)
+        }
+    }
+
+    #[cfg(feature = "epoch224-account-delta-diagnostic")]
+    #[test]
+    fn epoch224_diagnostic_accepts_matching_transaction_write() {
+        let entry =
+            epoch224_diagnostic_entry(EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT, 3, 7, 100, 90);
+        let write = epoch224_transaction_write(3, 7, 90);
+        let mut seen = BTreeSet::new();
+
+        verify_epoch224_transaction_write_lamports(&entry, std::slice::from_ref(&write), &mut seen)
+            .unwrap();
+        verify_epoch224_changed_lamport_writes(&entry, &seen).unwrap();
+        assert!(seen.contains(&([3; 64], [7; 32])));
+    }
+
+    #[cfg(feature = "epoch224-account-delta-diagnostic")]
+    #[test]
+    fn epoch224_diagnostic_rejects_lamport_mismatch() {
+        let entry =
+            epoch224_diagnostic_entry(EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT, 3, 7, 100, 90);
+        let error = verify_epoch224_transaction_write_lamports(
+            &entry,
+            &[epoch224_transaction_write(3, 7, 89)],
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("lamport mismatch"), "{error}");
+        assert!(error.contains("expected 90, observed 89"), "{error}");
+    }
+
+    #[cfg(feature = "epoch224-account-delta-diagnostic")]
+    #[test]
+    fn epoch224_diagnostic_rejects_duplicate_final_write() {
+        let entry =
+            epoch224_diagnostic_entry(EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT, 3, 7, 100, 90);
+        let write = epoch224_transaction_write(3, 7, 90);
+        let mut seen = BTreeSet::new();
+        verify_epoch224_transaction_write_lamports(&entry, std::slice::from_ref(&write), &mut seen)
+            .unwrap();
+        let error =
+            verify_epoch224_transaction_write_lamports(&entry, &[write], &mut seen).unwrap_err();
+
+        assert!(error.contains("duplicate final write"), "{error}");
+    }
+
+    #[cfg(feature = "epoch224-account-delta-diagnostic")]
+    #[test]
+    fn epoch224_diagnostic_rejects_missing_changed_key_write() {
+        let entry =
+            epoch224_diagnostic_entry(EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT, 3, 7, 100, 90);
+        let error = verify_epoch224_changed_lamport_writes(&entry, &BTreeSet::new()).unwrap_err();
+
+        assert!(error.contains("missing write"), "{error}");
+        assert!(error.contains("pre 100, post 90"), "{error}");
+    }
+
+    #[cfg(feature = "epoch224-account-delta-diagnostic")]
+    #[test]
+    fn epoch224_diagnostic_rejects_missing_exact_metadata() {
+        let mut entry =
+            epoch224_diagnostic_entry(EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT, 3, 7, 100, 90);
+        entry.txs[0].expected_status = None;
+        let error = verify_epoch224_transaction_write_lamports(
+            &entry,
+            &[epoch224_transaction_write(3, 7, 90)],
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("lacks exact canonical metadata"), "{error}");
+    }
+
+    #[cfg(feature = "epoch224-account-delta-diagnostic")]
+    #[test]
+    fn epoch224_diagnostic_accepts_unattributed_freeze_write() {
+        let entry =
+            epoch224_diagnostic_entry(EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT, 3, 7, 100, 100);
+        let mut freeze_write = account_write(EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT, 43);
+        freeze_write.pubkey = [9; 32];
+        freeze_write.lamports = 55;
+        freeze_write.data = vec![1, 2, 3];
+        let mut seen = BTreeSet::new();
+
+        verify_epoch224_transaction_write_lamports(&entry, &[freeze_write], &mut seen).unwrap();
+        verify_epoch224_changed_lamport_writes(&entry, &seen).unwrap();
+        assert!(seen.is_empty());
+    }
+
+    #[cfg(feature = "epoch224-account-delta-diagnostic")]
+    #[test]
+    fn epoch224_diagnostic_rejects_signature_write_for_wrong_entry_slot() {
+        let entry =
+            epoch224_diagnostic_entry(EPOCH224_ACCOUNT_DELTA_DIAGNOSTIC_SLOT + 1, 3, 7, 100, 90);
+        let error = verify_epoch224_transaction_write_lamports(
+            &entry,
+            &[epoch224_transaction_write(3, 7, 90)],
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("arrived with entry slot"), "{error}");
     }
 
     fn checkpoint_summary(slot: Slot, next_write_version: u64) -> HistoricalCheckpointSummary {

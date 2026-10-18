@@ -8,6 +8,13 @@ repository.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 
+[features]
+default = []
+# Build-bound, non-production epoch-224 diagnostic. It compares the historical
+# worker's transaction-attributed lamport writes with canonical source metadata
+# and records the exact freeze-time writes at the first divergent boundary.
+epoch224-account-delta-diagnostic = []
+
 [dependencies]
 agave-snapshots.workspace = true
 base64.workspace = true
