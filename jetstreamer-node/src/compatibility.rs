@@ -256,6 +256,7 @@ pub const SOLANA_V1_6_15_REVISION: &str = "5c2dab8055e8162386fcac313b6547f223fd3
 pub const SOLANA_V1_6_16_REVISION: &str = "86c26f843276581509c3434acc2efbf4202c44e0";
 pub const SOLANA_V1_6_17_REVISION: &str = "8f3ce5fc578da93405ccedf22150b9fae2bd83c7";
 pub const SOLANA_V1_6_20_REVISION: &str = "77bdb45d4af61fc687161ec06cc0178ff79726d5";
+pub const SOLANA_V1_6_25_REVISION: &str = "7de8a55b54d3e11058b82f9483bb405d143b455c";
 pub const SOLANA_V1_7_13_REVISION: &str = "257ddbeee1e8e7db2daa54e86f8eeedf76ace8f1";
 pub const SOLANA_V1_7_15_REVISION: &str = "4892eb4e1ad278d5249b6cda8983f88effb3e98b";
 pub const SOLANA_V1_8_11_REVISION: &str = "423a4d65461e36fefb371a2f164c20c4e7ed5afa";
@@ -1228,8 +1229,16 @@ pub static SOLANA_V1_6_17_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
 pub static SOLANA_V1_6_20_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     backend: RuntimeBackend::SolanaV1_6_20,
     identity: RuntimeIdentity {
-        name: "solana-v1.6.20",
-        revision: SOLANA_V1_6_20_REVISION,
+        name: if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+            "solana-v1.6.25"
+        } else {
+            "solana-v1.6.20"
+        },
+        revision: if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+            SOLANA_V1_6_25_REVISION
+        } else {
+            SOLANA_V1_6_20_REVISION
+        },
         rust_toolchain: "rustc 1.51.0 (2fd73fabe 2021-03-23)",
         target: Some("x86_64-unknown-linux-gnu"),
         genesis_hash: MAINNET_GENESIS_HASH,
@@ -1241,9 +1250,21 @@ pub static SOLANA_V1_6_20_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
-        identity: "jetstreamer-historical-worker-v1-6-20",
-        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_6_20",
-        default_manifest_relative_path: "../historical-runtime/v1_6_20/target/release/jetstreamer-historical-worker-v1-6-20",
+        identity: if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+            "jetstreamer-historical-worker-v1-6-25"
+        } else {
+            "jetstreamer-historical-worker-v1-6-20"
+        },
+        environment_override: if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+            "JETSTREAMER_HISTORICAL_WORKER_V1_6_25"
+        } else {
+            "JETSTREAMER_HISTORICAL_WORKER_V1_6_20"
+        },
+        default_manifest_relative_path: if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+            "../historical-runtime/v1_6_25/target/release/jetstreamer-historical-worker-v1-6-25"
+        } else {
+            "../historical-runtime/v1_6_20/target/release/jetstreamer-historical-worker-v1-6-20"
+        },
     }),
 };
 
@@ -2809,9 +2830,21 @@ mod tests {
             ),
             (
                 RuntimeBackend::SolanaV1_6_20,
-                SOLANA_V1_6_20_REVISION,
-                "JETSTREAMER_HISTORICAL_WORKER_V1_6_20",
-                "../historical-runtime/v1_6_20/target/release/jetstreamer-historical-worker-v1-6-20",
+                if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+                    SOLANA_V1_6_25_REVISION
+                } else {
+                    SOLANA_V1_6_20_REVISION
+                },
+                if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+                    "JETSTREAMER_HISTORICAL_WORKER_V1_6_25"
+                } else {
+                    "JETSTREAMER_HISTORICAL_WORKER_V1_6_20"
+                },
+                if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+                    "../historical-runtime/v1_6_25/target/release/jetstreamer-historical-worker-v1-6-25"
+                } else {
+                    "../historical-runtime/v1_6_20/target/release/jetstreamer-historical-worker-v1-6-20"
+                },
             ),
             (
                 RuntimeBackend::SolanaV1_7_13,

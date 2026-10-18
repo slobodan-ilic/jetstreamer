@@ -188,6 +188,9 @@ const SOLANA_V1_6_20_TAG: &str = "v1.6.20";
 const SOLANA_V1_6_20_COMMIT: &str = "77bdb45d4af61fc687161ec06cc0178ff79726d5";
 const SOLANA_V1_6_20_RUST_TOOLCHAIN: &str = "rustc 1.51.0 (2fd73fabe 2021-03-23)";
 const SOLANA_V1_6_20_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_6_25_BACKEND_ID: &str = "solana-v1.6.25";
+const SOLANA_V1_6_25_TAG: &str = "v1.6.25";
+const SOLANA_V1_6_25_COMMIT: &str = "7de8a55b54d3e11058b82f9483bb405d143b455c";
 const SOLANA_V1_7_13_BACKEND_ID: &str = "solana-v1.7.13";
 const SOLANA_V1_7_13_TAG: &str = "v1.7.13";
 const SOLANA_V1_7_13_COMMIT: &str = "257ddbeee1e8e7db2daa54e86f8eeedf76ace8f1";
@@ -232,6 +235,7 @@ fn backend_supports_entry_batches(backend_id: &str) -> bool {
             | SOLANA_V1_6_16_BACKEND_ID
             | SOLANA_V1_6_17_BACKEND_ID
             | SOLANA_V1_6_20_BACKEND_ID
+            | SOLANA_V1_6_25_BACKEND_ID
             | SOLANA_V1_7_13_BACKEND_ID
             | SOLANA_V1_7_15_BACKEND_ID
             | SOLANA_V1_8_11_BACKEND_ID
@@ -527,9 +531,21 @@ pub const SOLANA_V1_6_17_CANDIDATE: WorkerProfile = WorkerProfile {
 };
 
 pub const SOLANA_V1_6_20_CANDIDATE: WorkerProfile = WorkerProfile {
-    backend_id: SOLANA_V1_6_20_BACKEND_ID,
-    solana_tag: SOLANA_V1_6_20_TAG,
-    solana_commit: SOLANA_V1_6_20_COMMIT,
+    backend_id: if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+        SOLANA_V1_6_25_BACKEND_ID
+    } else {
+        SOLANA_V1_6_20_BACKEND_ID
+    },
+    solana_tag: if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+        SOLANA_V1_6_25_TAG
+    } else {
+        SOLANA_V1_6_20_TAG
+    },
+    solana_commit: if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+        SOLANA_V1_6_25_COMMIT
+    } else {
+        SOLANA_V1_6_20_COMMIT
+    },
     rust_toolchain: SOLANA_V1_6_20_RUST_TOOLCHAIN,
     target: SOLANA_V1_6_20_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,

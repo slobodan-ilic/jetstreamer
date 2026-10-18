@@ -14,6 +14,9 @@ default = []
 # worker's transaction-attributed lamport writes with canonical source metadata
 # and records the exact freeze-time writes at the first divergent boundary.
 epoch224-account-delta-diagnostic = []
+# Build-bound comparison of exact upstream Solana v1.6.25 at the epoch-224
+# bootstrap divergence. This never changes the default v1.6.20 route.
+epoch224-v1-6-25-diagnostic = []
 
 [dependencies]
 agave-snapshots.workspace = true
