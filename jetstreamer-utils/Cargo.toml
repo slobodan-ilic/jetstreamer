@@ -48,6 +48,10 @@ path = "src/gcs_metadata_observe_bin.rs"
 name = "jetstreamer-horizon-boundary-bridge"
 path = "src/horizon_boundary_bridge_bin.rs"
 
+[[bin]]
+name = "jetstreamer-horizon-retire-scratch"
+path = "src/horizon_retire_scratch_bin.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
 log.workspace = true
