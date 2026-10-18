@@ -16,8 +16,10 @@ use {
     },
 };
 
-const PLAN_SCHEMA: &str = "jetstreamer-focused-package-attestation-plan-v1";
+const PLAN_SCHEMA_V1: &str = "jetstreamer-focused-package-attestation-plan-v1";
+const PLAN_SCHEMA_V2: &str = "jetstreamer-focused-package-attestation-plan-v2";
 const RECEIPT_SCHEMA: &str = "jetstreamer-private-configured-immutable-complete-span-package-v1";
+const CAPABILITY_RECEIPT_SCHEMA: &str = "jetstreamer-private-focused-package-capability-v1";
 const DEPLOYMENT_RECEIPT_SCHEMA: &str = "jetstreamer-sealed-deployment-receipt-v1";
 const MANIFEST_SCHEMA: &str = "jetstreamer-private-focused-qualification-deployment-v5";
 const MAX_PLAN_BYTES: u64 = 1024 * 1024;
@@ -43,6 +45,10 @@ struct Plan {
     terminal_root_slot: u64,
     successor_tail_slots: u64,
     receipt: PathBuf,
+    #[serde(default)]
+    capability_receipt: Option<PathBuf>,
+    #[serde(default)]
+    capability_receipt_sha256: Option<String>,
 }
 
 #[derive(Debug)]
@@ -149,8 +155,16 @@ struct Receipt {
     package: PackageReceipt,
     snapshot_copy: SnapshotCopyReceipt,
     resource_check: ResourceCheck,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability_evidence: Option<CapabilityEvidence>,
     attestation: Attestation,
     attester: Attester,
+}
+
+#[derive(Debug, Serialize)]
+struct CapabilityEvidence {
+    path: String,
+    sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -423,11 +437,44 @@ fn canonical_package_path(epoch: u64) -> String {
 }
 
 fn validate_plan(plan: &Plan) -> Result<()> {
-    ensure!(plan.schema == PLAN_SCHEMA, "plan schema mismatch");
+    ensure!(
+        matches!(plan.schema.as_str(), PLAN_SCHEMA_V1 | PLAN_SCHEMA_V2),
+        "plan schema mismatch"
+    );
     ensure!(
         (203..=212).contains(&plan.epoch),
         "epoch outside approved focused range"
     );
+    match plan.schema.as_str() {
+        PLAN_SCHEMA_V1 => ensure!(
+            plan.capability_receipt.is_none() && plan.capability_receipt_sha256.is_none(),
+            "v1 plan cannot carry external capability evidence"
+        ),
+        PLAN_SCHEMA_V2 => {
+            ensure!(
+                plan.epoch == 203,
+                "external capability evidence is approved only for epoch 203"
+            );
+            let capability = plan
+                .capability_receipt
+                .as_ref()
+                .context("v2 plan lacks capability receipt")?;
+            ensure!(
+                capability
+                    == Path::new(
+                        "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-package-capability-ca2e38b-rust-20261017-v1.json"
+                    ),
+                "unexpected epoch-203 capability receipt"
+            );
+            ensure!(
+                plan.capability_receipt_sha256
+                    .as_deref()
+                    .is_some_and(is_sha256),
+                "invalid capability receipt SHA-256"
+            );
+        }
+        _ => unreachable!(),
+    }
     let expected_package = canonical_package_path(plan.epoch);
     ensure!(
         plan.package.to_str() == Some(&expected_package),
@@ -470,7 +517,11 @@ fn validate_plan(plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-fn validate_manifest(plan: &Plan, manifest: &Manifest) -> Result<()> {
+fn validate_manifest(
+    plan: &Plan,
+    manifest: &Manifest,
+    external_capability_validated: bool,
+) -> Result<()> {
     ensure!(
         manifest.schema == MANIFEST_SCHEMA,
         "manifest schema mismatch"
@@ -532,9 +583,15 @@ fn validate_manifest(plan: &Plan, manifest: &Manifest) -> Result<()> {
         "complete-span gate failed"
     );
     ensure!(
-        gates.exact_node_complete_span_capability_passed,
+        gates.exact_node_complete_span_capability_passed || external_capability_validated,
         "node capability gate failed"
     );
+    if external_capability_validated {
+        ensure!(
+            plan.schema == PLAN_SCHEMA_V2 && plan.epoch == 203,
+            "external capability evidence escaped its narrow exception"
+        );
+    }
     ensure!(
         gates.source_content_revalidated,
         "source revalidation gate failed"
@@ -633,6 +690,273 @@ fn validate_deployment_receipt(
         .collect();
     ensure!(seen == expected, "deployment receipt member set mismatch");
     Ok(())
+}
+
+fn json_at<'a>(value: &'a serde_json::Value, pointer: &str) -> Result<&'a serde_json::Value> {
+    value
+        .pointer(pointer)
+        .with_context(|| format!("capability receipt lacks {pointer}"))
+}
+
+fn json_string<'a>(value: &'a serde_json::Value, pointer: &str) -> Result<&'a str> {
+    json_at(value, pointer)?
+        .as_str()
+        .with_context(|| format!("capability receipt field is not a string: {pointer}"))
+}
+
+fn json_u64(value: &serde_json::Value, pointer: &str) -> Result<u64> {
+    json_at(value, pointer)?
+        .as_u64()
+        .with_context(|| format!("capability receipt field is not an unsigned integer: {pointer}"))
+}
+
+fn json_bool(value: &serde_json::Value, pointer: &str) -> Result<bool> {
+    json_at(value, pointer)?
+        .as_bool()
+        .with_context(|| format!("capability receipt field is not a boolean: {pointer}"))
+}
+
+fn validate_capability_member(
+    receipt: &serde_json::Value,
+    pointer: &str,
+    expected_path: &Path,
+    actual: &FileIdentity,
+) -> Result<()> {
+    ensure!(
+        json_string(receipt, &format!("{pointer}/path"))? == expected_path.to_string_lossy(),
+        "capability member path mismatch: {pointer}"
+    );
+    ensure!(
+        json_string(receipt, &format!("{pointer}/sha256"))? == actual.sha256,
+        "capability member SHA-256 mismatch: {pointer}"
+    );
+    for (name, observed, expected) in [
+        (
+            "bytes",
+            json_u64(receipt, &format!("{pointer}/bytes"))?,
+            actual.bytes,
+        ),
+        (
+            "device",
+            json_u64(receipt, &format!("{pointer}/device"))?,
+            actual.device,
+        ),
+        (
+            "inode",
+            json_u64(receipt, &format!("{pointer}/inode"))?,
+            actual.inode,
+        ),
+        (
+            "links",
+            json_u64(receipt, &format!("{pointer}/links"))?,
+            actual.links,
+        ),
+        (
+            "uid",
+            json_u64(receipt, &format!("{pointer}/uid"))?,
+            actual.uid as u64,
+        ),
+        (
+            "gid",
+            json_u64(receipt, &format!("{pointer}/gid"))?,
+            actual.gid as u64,
+        ),
+    ] {
+        ensure!(
+            observed == expected,
+            "capability member {name} mismatch: {pointer}"
+        );
+    }
+    ensure!(
+        json_string(receipt, &format!("{pointer}/mode"))? == actual.mode,
+        "capability member mode mismatch: {pointer}"
+    );
+    Ok(())
+}
+
+fn validate_external_capability(
+    plan: &Plan,
+    members: &BTreeMap<String, FileIdentity>,
+) -> Result<Option<CapabilityEvidence>> {
+    if plan.schema == PLAN_SCHEMA_V1 {
+        return Ok(None);
+    }
+    ensure!(plan.schema == PLAN_SCHEMA_V2, "plan schema mismatch");
+    let path = plan
+        .capability_receipt
+        .as_ref()
+        .context("v2 plan lacks capability receipt")?;
+    let expected_sha256 = plan
+        .capability_receipt_sha256
+        .as_deref()
+        .context("v2 plan lacks capability receipt SHA-256")?;
+    let identity = exact_file(path, 0, true)?;
+    ensure!(
+        identity.sha256 == expected_sha256,
+        "capability receipt SHA-256 mismatch"
+    );
+    let receipt: serde_json::Value = read_json(path)?;
+    ensure!(
+        json_string(&receipt, "/schema")? == CAPABILITY_RECEIPT_SCHEMA,
+        "capability receipt schema mismatch"
+    );
+    ensure!(
+        json_u64(&receipt, "/epoch")? == plan.epoch,
+        "capability receipt epoch mismatch"
+    );
+    ensure!(
+        json_string(&receipt, "/deployment/path")? == plan.package.to_string_lossy(),
+        "capability deployment path mismatch"
+    );
+    ensure!(
+        json_string(&receipt, "/deployment/sha256sums_sha256")? == plan.sha256sums_sha256,
+        "capability SHA256SUMS mismatch"
+    );
+    ensure!(
+        json_u64(&receipt, "/plan/output_slot_start")? == plan.epoch * EPOCH_SLOTS,
+        "capability output start mismatch"
+    );
+    ensure!(
+        json_u64(&receipt, "/plan/epoch_end_slot")? == plan.epoch_end_slot,
+        "capability epoch end mismatch"
+    );
+    ensure!(
+        json_u64(&receipt, "/plan/terminal_slot")? == plan.terminal_root_slot,
+        "capability terminal mismatch"
+    );
+    ensure!(
+        json_u64(&receipt, "/plan/successor_tail_slots")? == plan.successor_tail_slots,
+        "capability successor tail mismatch"
+    );
+    ensure!(
+        json_bool(&receipt, "/plan/complete_epoch_span_covered")?
+            && json_bool(&receipt, "/plan/private_verification_tail")?,
+        "capability span or private-tail gate failed"
+    );
+
+    let package_receipt_path = Path::new(json_string(&receipt, "/deployment/package_receipt")?);
+    let package_receipt_sha256 = json_string(&receipt, "/deployment/package_receipt_sha256")?;
+    ensure!(
+        is_sha256(package_receipt_sha256),
+        "invalid package receipt SHA-256"
+    );
+    let package_receipt_identity = exact_file(package_receipt_path, 0, true)?;
+    ensure!(
+        package_receipt_identity.sha256 == package_receipt_sha256,
+        "capability package receipt SHA-256 mismatch"
+    );
+    let package_receipt: serde_json::Value = read_json(package_receipt_path)?;
+    ensure!(
+        json_string(&package_receipt, "/schema")? == RECEIPT_SCHEMA,
+        "capability package receipt schema mismatch"
+    );
+    ensure!(
+        json_u64(&package_receipt, "/epoch")? == plan.epoch,
+        "capability package receipt epoch mismatch"
+    );
+    ensure!(
+        json_string(&package_receipt, "/package/path")? == plan.package.to_string_lossy(),
+        "capability package receipt deployment mismatch"
+    );
+
+    let node = members
+        .get("jetstreamer-node")
+        .context("node member missing")?;
+    validate_capability_member(
+        &receipt,
+        "/deployment/node",
+        &plan.package.join("jetstreamer-node"),
+        node,
+    )?;
+    let worker_names: Vec<_> = members
+        .keys()
+        .filter(|name| name.starts_with("jetstreamer-historical-worker-"))
+        .collect();
+    ensure!(
+        worker_names.len() == 1,
+        "capability worker member is ambiguous"
+    );
+    let worker_name = worker_names[0];
+    validate_capability_member(
+        &receipt,
+        "/deployment/worker",
+        &plan.package.join(worker_name),
+        members.get(worker_name).context("worker member missing")?,
+    )?;
+    validate_capability_member(
+        &receipt,
+        "/deployment/snapshot",
+        &plan.package.join(&plan.snapshot_name),
+        members
+            .get(&plan.snapshot_name)
+            .context("snapshot member missing")?,
+    )?;
+    validate_capability_member(
+        &receipt,
+        "/deployment/checkpoint",
+        &plan.package.join(&plan.checkpoint_name),
+        members
+            .get(&plan.checkpoint_name)
+            .context("checkpoint member missing")?,
+    )?;
+    ensure!(
+        json_bool(
+            &receipt,
+            "/deployment/bootstrap_is_direct_singly_linked_member"
+        )?,
+        "capability bootstrap identity gate failed"
+    );
+
+    for pointer in [
+        "/probe/snapshot_intentionally_absent",
+        "/assessment/exact_package_node_complete_span_route_passed",
+        "/assessment/package_member_hashes_passed",
+    ] {
+        ensure!(
+            json_bool(&receipt, pointer)?,
+            "capability gate failed: {pointer}"
+        );
+    }
+    for pointer in [
+        "/probe/worker_spawned",
+        "/probe/replay_started",
+        "/probe/archive_created",
+        "/probe/sidecar_created",
+        "/probe/segment_manifest_created",
+        "/assessment/snapshot_schema_or_contents_tested",
+        "/assessment/fresh_resource_admission_passed",
+        "/assessment/replay_launch_authorized",
+        "/assessment/publication_authorized",
+        "/assessment/r2_upload_authorized",
+        "/mutations/local_archive_mutations",
+        "/mutations/local_cache_deletions",
+        "/mutations/remote_mutations",
+        "/mutations/r2_mutations",
+    ] {
+        ensure!(
+            !json_bool(&receipt, pointer)?,
+            "capability mutation or authority set: {pointer}"
+        );
+    }
+    ensure!(
+        json_u64(&receipt, "/probe/exit_status")? == 1,
+        "capability probe exit status mismatch"
+    );
+    ensure!(
+        json_at(&receipt, "/probe/live_process_references")?
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "capability probe retained live process references"
+    );
+    ensure!(
+        json_bool(&receipt, "/probe/cleanup_pending")?,
+        "capability probe cleanup state mismatch"
+    );
+
+    Ok(Some(CapabilityEvidence {
+        path: path.display().to_string(),
+        sha256: identity.sha256,
+    }))
 }
 
 fn filesystem_free_bytes(path: &Path) -> Result<u64> {
@@ -755,8 +1079,9 @@ fn run() -> Result<()> {
     let deployment: DeploymentReceipt =
         read_json(&plan.package.join("deployment-seal-receipt.json"))?;
     validate_deployment_receipt(&plan, &deployment, &members)?;
+    let capability_evidence = validate_external_capability(&plan, &members)?;
     let manifest: Manifest = read_json(&plan.package.join("deployment-manifest.json"))?;
-    validate_manifest(&plan, &manifest)?;
+    validate_manifest(&plan, &manifest, capability_evidence.is_some())?;
 
     ensure!(
         plan.source_snapshot.canonicalize()? == plan.source_snapshot,
@@ -838,6 +1163,7 @@ fn run() -> Result<()> {
             minimum_free_bytes: MINIMUM_FREE_BYTES,
             passed: true,
         },
+        capability_evidence,
         attestation: Attestation {
             package_ready: true,
             complete_epoch_span_covered: true,
@@ -879,7 +1205,7 @@ mod tests {
     fn valid_plan(epoch: u64) -> Plan {
         let epoch_end_slot = (epoch + 1) * EPOCH_SLOTS - 1;
         Plan {
-            schema: PLAN_SCHEMA.to_string(),
+            schema: PLAN_SCHEMA_V1.to_string(),
             epoch,
             package: canonical_package_path(epoch).into(),
             source_snapshot: format!("/private/snapshot-{epoch}-test.tar.zst").into(),
@@ -897,6 +1223,8 @@ mod tests {
                 "/home/ubuntu/.jetstreamer-private/campaign-state/epoch{epoch}-complete-span-store8-immutable-package-ca2e38b-test.json"
             )
             .into(),
+            capability_receipt: None,
+            capability_receipt_sha256: None,
         }
     }
 
@@ -937,5 +1265,28 @@ mod tests {
         unapproved_205.package =
             "/var/lib/jetstreamer/horizon-focused-205-complete-span-store8-ca2e38b-v2".into();
         assert!(validate_plan(&unapproved_205).is_err());
+    }
+
+    #[test]
+    fn external_capability_plan_is_narrowly_limited_to_epoch_203() {
+        let mut current = valid_plan(203);
+        current.schema = PLAN_SCHEMA_V2.to_string();
+        current.capability_receipt = Some(
+            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-package-capability-ca2e38b-rust-20261017-v1.json".into(),
+        );
+        current.capability_receipt_sha256 = Some("f".repeat(64));
+        assert!(validate_plan(&current).is_ok());
+
+        let mut missing = current;
+        missing.capability_receipt_sha256 = None;
+        assert!(validate_plan(&missing).is_err());
+
+        let mut wrong_epoch = valid_plan(204);
+        wrong_epoch.schema = PLAN_SCHEMA_V2.to_string();
+        wrong_epoch.capability_receipt = Some(
+            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-package-capability-ca2e38b-rust-20261017-v1.json".into(),
+        );
+        wrong_epoch.capability_receipt_sha256 = Some("f".repeat(64));
+        assert!(validate_plan(&wrong_epoch).is_err());
     }
 }
