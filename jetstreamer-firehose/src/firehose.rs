@@ -44,7 +44,8 @@ use crate::{
         fetch_epoch_stream_with_options, slot_to_epoch,
     },
     index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
-    node_reader::NodeReader,
+    node_reader::{NodeReader, wait_for_request_slot},
+    pace::pace,
     transaction_status_meta::decode_transaction_status_meta,
     utils,
 };
@@ -59,11 +60,6 @@ pub use crate::transaction_status_meta::{
 /// aggressiveness. Public so frontends (e.g. the TUI) can derive staleness thresholds from it.
 pub const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const OP_TIMEOUT_SEQUENTIAL: std::time::Duration = std::time::Duration::from_secs(180);
-// Backoff between restarts of a failed firehose thread. An immediate reconnect after a stall
-// tends to re-trigger the CDN throttling that caused it; repeated failures on the same slot
-// double the wait up to the cap, and any forward progress resets it.
-const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
-const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(32);
 fn poll_shutdown(
     flag: &Arc<std::sync::atomic::AtomicBool>,
     receiver: &mut Option<broadcast::Receiver<()>>,
@@ -264,13 +260,13 @@ fn recycle_threshold_pct() -> u64 {
 
 /// Maximum number of running-but-not-yet-green threads the launch gate allows before pausing
 /// the ramp. Override with `JETSTREAMER_SPAWN_PENDING`; `1` reproduces the strict
-/// one-at-a-time ramp.
+/// one-at-a-time ramp. The default comes from the [`pace`].
 fn spawn_pending_max() -> usize {
     std::env::var("JETSTREAMER_SPAWN_PENDING")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|&pending| pending > 0)
-        .unwrap_or(24)
+        .unwrap_or_else(|| pace().default_spawn_pending())
 }
 
 fn spawn_grace_from_env() -> Option<std::time::Duration> {
@@ -595,9 +591,8 @@ fn slot_should_emit(slot: u64, last_emitted_slot: u64, has_emitted_slot: bool) -
     !has_emitted_slot || slot > last_emitted_slot
 }
 
-/// Per-thread restart pacing: consecutive failures on the same slot double the delay up to
-/// [`RETRY_BACKOFF_MAX`]; a failure on a different slot means forward progress was made and
-/// resets the sequence.
+/// Per-thread restart pacing: repeated failures on one slot double the [`pace`] delay up to its
+/// cap, and a failure on a new slot (forward progress) resets it.
 struct RetryBackoff {
     last_slot: Option<u64>,
     consecutive: u32,
@@ -618,9 +613,10 @@ impl RetryBackoff {
             self.last_slot = Some(slot);
             self.consecutive = 0;
         }
-        RETRY_BACKOFF_BASE
-            .saturating_mul(1u32 << self.consecutive.min(5))
-            .min(RETRY_BACKOFF_MAX)
+        let pace = pace();
+        pace.retry_backoff_base()
+            .saturating_mul(1u32 << self.consecutive.min(10))
+            .min(pace.retry_backoff_max())
     }
 }
 
@@ -1601,7 +1597,7 @@ where
     let recycle_monitor = (recycle_pct > 0 && !sequential && thread_total > 1).then(|| {
         let shutdown_flag = shutdown_flag.clone();
         tokio::spawn(async move {
-            const SWEEP: std::time::Duration = std::time::Duration::from_secs(15);
+            let sweep = pace().recycle_interval();
             const MIN_STREAM_AGE_MS: u64 = 30_000;
             /// Rolling rotation, not a storm: a uniform clamp puts most of the fleet under
             /// the threshold at once, and recycling everyone simultaneously would zero
@@ -1615,7 +1611,7 @@ where
             // the bar — one anomalously fast thread can't set it.
             let mut reference: u64 = 0;
             loop {
-                sleep(SWEEP).await;
+                sleep(sweep).await;
                 if shutdown_flag.load(Ordering::SeqCst) {
                     return;
                 }
@@ -1893,6 +1889,8 @@ where
                         continue;
                     }
                     let use_sequential_stream = sequential_mode && local_start == epoch_start;
+                    // Pace the open outside the op timeout: queueing for the permit is not a stall.
+                    wait_for_request_slot().await;
                     let stream = match timeout(op_timeout, async {
                         if use_sequential_stream {
                             fetch_epoch_stream_with_options(
@@ -1963,7 +1961,7 @@ where
                         // the byte range containing all of its nodes (transactions, entries,
                         // rewards, block), and the seek skips forward over missing slots. Errors
                         // are attributed to `local_start` so retries invalidate and resume the
-                        // epoch actually being sought. Acquire the global seek-spacing permit
+                        // epoch actually being sought. Acquire the global request-spacing permit
                         // before starting the timeout clock: with hundreds of threads the permit
                         // queue alone can exceed the op timeout, and that wait is pacing, not a
                         // stall.
@@ -3375,6 +3373,7 @@ async fn firehose_geyser_thread(
                     continue;
                 }
                 let use_sequential_stream = sequential_mode && local_start == epoch_start;
+                wait_for_request_slot().await;
                 let stream = match timeout(op_timeout, async {
                     if use_sequential_stream {
                         fetch_epoch_stream_with_options(
@@ -3427,7 +3426,7 @@ async fn firehose_geyser_thread(
                     // the byte range containing all of its nodes (transactions, entries,
                     // rewards, block), and the seek skips forward over missing slots. Errors
                     // are attributed to `local_start` so retries invalidate and resume the
-                    // epoch actually being sought. Acquire the global seek-spacing permit
+                    // epoch actually being sought. Acquire the global request-spacing permit
                     // before starting the timeout clock: with hundreds of threads the permit
                     // queue alone can exceed the op timeout, and that wait is pacing, not a
                     // stall.
