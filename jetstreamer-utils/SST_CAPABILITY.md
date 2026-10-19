@@ -23,6 +23,20 @@ even a complete scan of every SST followed by greatest-point-sequence selection
 can incorrectly resurrect deleted data. A prefix iterator alone cannot establish
 the full set of covering range tombstones.
 
+The `native_readonly_resolves_manifest_and_wal` test separately exercises native
+read-only logical resolution of a deliberately crash-shaped LZ4 database. Its
+fixture process syncs unflushed WAL writes and exits without database destruction.
+It requires the complete CF set and checks an outside-prefix range deletion,
+point deletion, updated WAL value and WAL-only key. A second disposable copy omits
+WALs: even when native open succeeds, that copy must not be treated as a complete
+backup. This qualifies fixture behavior only, not an archived ledger or a shred
+decoder. Run it with the same explicit feature and `--ignored` test flags above.
+With the pinned native decoder, the omitted-WAL copy does open and resurrects old
+SST values; a read-only subset-CF open also succeeds. Therefore authenticate the
+complete generation-bound manifest/WAL/live-file census independently of native
+open success. The test also rehashes CURRENT, MANIFEST, WAL and SST inputs after
+the complete logical read to detect input mutation.
+
 An archival recovery must either preserve CURRENT/MANIFEST, relevant WALs, and
 the complete live file set for native read-only logical resolution, or use an
 independently qualified range-aware reader that accounts for every covering
