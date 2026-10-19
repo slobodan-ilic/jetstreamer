@@ -11,6 +11,15 @@ immutable parent's progress reaches slot `97,202,500`; the underlying focused
 plan retains the independently specified canonical root at `97,631,459`.
 Stopping at the measurement target does not prove that root.
 
+The bounded runner enables the unchanged worker's historical trace. If a
+transaction returns `Custom(2)`, preserve the voted slot/hash, parent Bank
+slot/hash, and `SlotHashes` sysvar from the same invocation. This is diagnostic
+instrumentation only; it must not normalize a canonical-success/replay-failure
+mismatch. The first real run failed during warmup at slot `97,199,878`, entry
+165, transaction 189. Its failure and journal remain evidence, not a resource
+qualification. Any traced reproduction needs a new sealed runner/plan, fresh
+admission, isolated output, and a proven invocation-bound guard.
+
 ## Interface and scope
 
 ```text

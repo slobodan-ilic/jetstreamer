@@ -207,6 +207,9 @@ fn command(p: &Plan) -> Command {
             p.run_root.join("scratch").display()
         ))
         .env("JETSTREAMER_ALLOW_CANDIDATE_RUNTIME", "1")
+        // Private diagnostic only: preserve voted/parent/SlotHashes evidence
+        // on Custom(2), without changing runtime or transaction semantics.
+        .env("JETSTREAMER_HISTORICAL_TRACE", "1")
         .env("RUST_LOG", "info")
         .env("SOLANA_RAYON_THREADS", "16")
         .env("JETSTREAMER_HISTORICAL_WORKER_V1_6_20", &p.worker)
@@ -774,6 +777,7 @@ mod tests {
             Some("/sealed/worker")
         );
         assert_eq!(env["SOLANA_RAYON_THREADS"], Some("16"));
+        assert_eq!(env["JETSTREAMER_HISTORICAL_TRACE"], Some("1"));
         assert_eq!(env["HORIZON_SECRET_ACCESS_KEY"], None);
     }
     #[test]
