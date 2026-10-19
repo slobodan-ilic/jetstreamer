@@ -612,6 +612,27 @@ impl RawNode {
         RawNode { cid, data }
     }
 
+    /// Returns the node's content identifier without parsing its payload.
+    pub const fn get_cid(&self) -> &Cid {
+        &self.cid
+    }
+
+    /// Independently verifies a DAG-CBOR/SHA-256 node for diagnostic evidence.
+    /// This explicit check does not change the normal reader's parsing policy.
+    pub fn verify_sha256_cid(&self) -> Result<(), SharedError> {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(&self.data);
+        if self.cid.codec() != 0x71
+            || self.cid.hash().code() != 0x12
+            || self.cid.hash().digest() != &digest[..]
+        {
+            return Err(Box::new(io::Error::other(
+                "unsupported or mismatched DAG-CBOR SHA-256 CID",
+            )));
+        }
+        Ok(())
+    }
+
     /// Parses the node into a typed [`Node`].
     pub fn parse(&self) -> Result<Node, SharedError> {
         let parsed = parse_any_from_cbordata(self.data.clone());
@@ -670,6 +691,36 @@ impl RawNode {
                 "Unknown CID version".to_owned(),
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_cid_diagnostic_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn diagnostic_cid_check_rejects_changed_payload_and_unsupported_codec() {
+        let data = vec![0x81, 0x01];
+        let multihash = multihash::Multihash::wrap(0x12, &Sha256::digest(&data)).unwrap();
+        let cid = Cid::new_v1(0x71, multihash);
+        RawNode::new(cid, data.clone()).verify_sha256_cid().unwrap();
+        assert!(
+            RawNode::new(cid, vec![0x81, 0x02])
+                .verify_sha256_cid()
+                .is_err()
+        );
+        assert!(
+            RawNode::new(Cid::new_v1(0x55, multihash), data.clone())
+                .verify_sha256_cid()
+                .is_err()
+        );
+        let identity = multihash::Multihash::wrap(0x00, &data).unwrap();
+        assert!(
+            RawNode::new(Cid::new_v1(0x71, identity), data)
+                .verify_sha256_cid()
+                .is_err()
+        );
     }
 }
 
