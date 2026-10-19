@@ -34,6 +34,9 @@ struct Plan {
     expected_controller_invocation_id: String,
     expected_producer_invocation_id: String,
     observations: Vec<Evidence>,
+    /// Explicit, hash-bound links in the same chain; never count as routine windows.
+    #[serde(default)]
+    user_requested_bridges: Vec<Evidence>,
     century_floor_evidence: Evidence,
     scratch_multiplier: u64,
     max_jet_multiplier: u64,
@@ -77,6 +80,15 @@ struct ObservationReceipt {
 }
 
 #[derive(Debug, Serialize)]
+struct BridgeReceipt {
+    path: String,
+    sha256: String,
+    recorded_at_utc: String,
+    scratch_bytes: u64,
+    counts_as_routine_growth_window: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct Receipt {
     schema: &'static str,
     recorded_at_unix_seconds: u64,
@@ -87,6 +99,7 @@ struct Receipt {
     controller_invocation_id: String,
     producer_invocation_id: String,
     observations: Vec<ObservationReceipt>,
+    user_requested_bridges: Vec<BridgeReceipt>,
     maximum_observed_scratch_bytes: u64,
     maximum_verified_jet_bytes: u64,
     scratch_multiplier: u64,
@@ -318,24 +331,111 @@ fn validate_unit_binding(
     Ok(())
 }
 
-fn validate_observations(plan: &Plan) -> Result<(Vec<ObservationReceipt>, u64), String> {
+fn utc_seconds(value: &str) -> Result<i64, String> {
+    if value.len() != 20 {
+        return Err("observer timestamp must be canonical UTC".to_string());
+    }
+    let input = std::ffi::CString::new(value).map_err(|error| error.to_string())?;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let format = c"%Y-%m-%dT%H:%M:%SZ";
+    let end = unsafe { libc::strptime(input.as_ptr(), format.as_ptr(), &mut tm) };
+    if end.is_null() || unsafe { *end } != 0 {
+        return Err("observer timestamp is invalid".to_string());
+    }
+    let seconds = unsafe { libc::timegm(&mut tm) };
+    let mut rendered = [0_i8; 32];
+    let count =
+        unsafe { libc::strftime(rendered.as_mut_ptr(), rendered.len(), format.as_ptr(), &tm) };
+    let canonical = unsafe { std::ffi::CStr::from_ptr(rendered.as_ptr()) };
+    if seconds < 0 || count != 20 || canonical.to_bytes() != value.as_bytes() {
+        return Err("observer timestamp is noncanonical or out of range".to_string());
+    }
+    Ok(seconds)
+}
+
+type ValidatedObservations = (Vec<ObservationReceipt>, Vec<BridgeReceipt>, u64);
+
+fn validate_observations(plan: &Plan) -> Result<ValidatedObservations, String> {
     if plan.observations.len() < 6 {
         return Err("at least six contiguous routine observations are required".to_string());
     }
+    if plan.user_requested_bridges.len() > 32 || plan.observations.len() > 256 {
+        return Err("too many growth observations or user-requested bridges".to_string());
+    }
+    let mut values = Vec::new();
+    for (evidences, routine) in [
+        (&plan.observations, true),
+        (&plan.user_requested_bridges, false),
+    ] {
+        for evidence in evidences {
+            values.push((
+                evidence,
+                read_json(&evidence.path, &evidence.sha256)?,
+                routine,
+            ));
+        }
+    }
+    validate_observation_values(plan, values)
+}
+
+fn validate_observation_values(
+    plan: &Plan,
+    mut values: Vec<(&Evidence, Value, bool)>,
+) -> Result<ValidatedObservations, String> {
+    if values.iter().filter(|(_, _, routine)| *routine).count() < 6 {
+        return Err(
+            "at least six routine observations are required; bridges do not count".to_string(),
+        );
+    }
+    // Sort only after authenticating the complete declared file set. Never discover,
+    // skip or invent an intervening receipt to repair a broken chain.
+    let mut paths = BTreeSet::new();
+    let mut group_times = [None, None];
+    for (evidence, value, routine) in &values {
+        if !paths.insert(&evidence.path) {
+            return Err("duplicate routine/bridge evidence path".to_string());
+        }
+        let timestamp = utc_seconds(value_str(value, "/recorded_at_utc")?)?;
+        let group = usize::from(*routine);
+        if group_times[group].is_some_and(|prior| timestamp <= prior) {
+            return Err("each declared observation list must be chronological".to_string());
+        }
+        group_times[group] = Some(timestamp);
+    }
+    values.sort_by(|(_, a, _), (_, b, _)| {
+        a["recorded_at_utc"]
+            .as_str()
+            .cmp(&b["recorded_at_utc"].as_str())
+    });
+    if values.first().is_none_or(|(_, _, routine)| !routine)
+        || values.last().is_none_or(|(_, _, routine)| !routine)
+    {
+        return Err(
+            "user-requested bridges must lie between selected routine observations".to_string(),
+        );
+    }
     let mut receipts = Vec::with_capacity(plan.observations.len());
+    let mut bridges = Vec::new();
     let mut maximum_scratch = 0_u64;
     let mut prior_path: Option<&Path> = None;
     let mut prior_sha: Option<&str> = None;
     let mut prior_recorded: Option<String> = None;
+    let mut prior_unix = None;
+    let mut prior_routine_unix = None;
     let mut prior_slot: Option<u64> = None;
     let mut terminal_slot: Option<u64> = None;
-    for evidence in &plan.observations {
-        let value = read_json(&evidence.path, &evidence.sha256)?;
+    for (evidence, value, routine) in values {
+        let reason = if routine {
+            "routine"
+        } else {
+            "user-requested-status"
+        };
+        let declared_interval = value_u64(&value, "/cadence/observed_interval_seconds")?;
         if value_str(&value, "/schema")? != OBSERVER_SCHEMA
-            || value_str(&value, "/cadence/observation_reason")? != "routine"
+            || value_str(&value, "/cadence/observation_reason")? != reason
             || value_u64(&value, "/cadence/minimum_interval_seconds")? != 1800
-            || value_u64(&value, "/cadence/observed_interval_seconds")? < 1800
-            || !value_bool(&value, "/cadence/routine_minimum_interval_enforced")?
+            || (routine && declared_interval < 1800)
+            || value_bool(&value, "/cadence/routine_minimum_interval_enforced")? != routine
             || value_bool(&value, "/mutation/producer_or_controller_signals_sent")?
             || value_bool(&value, "/mutation/service_state_changed")?
             || value_bool(&value, "/mutation/remote_mutations")?
@@ -350,14 +450,30 @@ fn validate_observations(plan: &Plan) -> Result<(Vec<ObservationReceipt>, u64), 
             && (value_str(&value, "/cadence/previous_sample")? != path.to_string_lossy()
                 || value_str(&value, "/cadence/previous_sample_sha256")? != sha)
         {
-            return Err("observer evidence is not one contiguous routine chain".to_string());
+            return Err("observer evidence is not one complete routine/bridge chain".to_string());
         }
         let recorded = value_str(&value, "/recorded_at_utc")?.to_string();
+        let unix = utc_seconds(&recorded)?;
         if prior_recorded
             .as_ref()
             .is_some_and(|prior| recorded <= *prior)
         {
             return Err("observer timestamps are not strictly increasing".to_string());
+        }
+        if let Some(prior) = prior_unix
+            && (u64::try_from(unix - prior).map_err(|_| "negative observer interval")?
+                != declared_interval
+                || value_str(&value, "/cadence/previous_sample_recorded_at_utc")?
+                    != prior_recorded
+                        .as_deref()
+                        .expect("prior timestamp accompanies prior unix"))
+        {
+            return Err("observer timestamp/interval binding mismatch".to_string());
+        }
+        if routine && prior_routine_unix.is_some_and(|prior| unix - prior < 1800) {
+            return Err(
+                "routine growth windows must remain at least 1800 seconds apart".to_string(),
+            );
         }
         let replays = value
             .pointer("/replays")
@@ -383,36 +499,53 @@ fn validate_observations(plan: &Plan) -> Result<(Vec<ObservationReceipt>, u64), 
             &plan.expected_controller_invocation_id,
         )?;
         validate_unit_binding(replay, "producer", &plan.expected_producer_invocation_id)?;
-        if !value_bool(replay, "/useful_work/sufficient_for_rates")? {
+        if routine && !value_bool(replay, "/useful_work/sufficient_for_rates")? {
             return Err("observer lacks sufficient useful-work rates".to_string());
         }
         let scratch = value_u64(replay, "/conservative_observed_physical_bytes")?;
-        let slot = value_u64(replay, "/useful_work/last/slot")?;
-        let observed_terminal = value_u64(replay, "/useful_work/last/terminal_slot")?;
-        let rate = value_f64(replay, "/useful_work/slots_per_second")?;
-        if slot > observed_terminal
-            || prior_slot.is_some_and(|prior| slot <= prior)
-            || terminal_slot.is_some_and(|prior| observed_terminal != prior)
-        {
-            return Err("observer slot sequence or terminal slot is invalid".to_string());
-        }
         maximum_scratch = maximum_scratch.max(scratch);
-        receipts.push(ObservationReceipt {
-            path: evidence.path.display().to_string(),
-            sha256: evidence.sha256.clone(),
-            recorded_at_utc: recorded.clone(),
-            scratch_bytes: scratch,
-            slot,
-            terminal_slot: observed_terminal,
-            slots_per_second: rate,
-        });
+        let last = replay.pointer("/useful_work/last");
+        if routine || last.is_some_and(|last| !last.is_null()) {
+            let slot = value_u64(replay, "/useful_work/last/slot")?;
+            let observed_terminal = value_u64(replay, "/useful_work/last/terminal_slot")?;
+            if slot > observed_terminal
+                || prior_slot
+                    .is_some_and(|prior| if routine { slot <= prior } else { slot < prior })
+                || terminal_slot.is_some_and(|prior| observed_terminal != prior)
+            {
+                return Err("observer slot sequence or terminal slot is invalid".to_string());
+            }
+            if routine {
+                receipts.push(ObservationReceipt {
+                    path: evidence.path.display().to_string(),
+                    sha256: evidence.sha256.clone(),
+                    recorded_at_utc: recorded.clone(),
+                    scratch_bytes: scratch,
+                    slot,
+                    terminal_slot: observed_terminal,
+                    slots_per_second: value_f64(replay, "/useful_work/slots_per_second")?,
+                });
+            }
+            prior_slot = Some(slot);
+            terminal_slot = Some(observed_terminal);
+        }
+        if routine {
+            prior_routine_unix = Some(unix);
+        } else {
+            bridges.push(BridgeReceipt {
+                path: evidence.path.display().to_string(),
+                sha256: evidence.sha256.clone(),
+                recorded_at_utc: recorded.clone(),
+                scratch_bytes: scratch,
+                counts_as_routine_growth_window: false,
+            });
+        }
         prior_path = Some(&evidence.path);
         prior_sha = Some(&evidence.sha256);
         prior_recorded = Some(recorded);
-        prior_slot = Some(slot);
-        terminal_slot = Some(observed_terminal);
+        prior_unix = Some(unix);
     }
-    Ok((receipts, maximum_scratch))
+    Ok((receipts, bridges, maximum_scratch))
 }
 
 fn maximum_verified_jet(plan: &Plan) -> Result<u64, String> {
@@ -678,7 +811,7 @@ fn run(arguments: &Arguments) -> Result<Receipt, String> {
         "producer invocation ID",
     )?;
     let verifier_sha256 = verify_running_executable(&arguments.self_sha256)?;
-    let (observations, maximum_scratch) = validate_observations(&plan)?;
+    let (observations, user_requested_bridges, maximum_scratch) = validate_observations(&plan)?;
     let maximum_jet = maximum_verified_jet(&plan)?;
     let formula_minimum = compute_formula_minimum(
         maximum_scratch,
@@ -710,6 +843,7 @@ fn run(arguments: &Arguments) -> Result<Receipt, String> {
         controller_invocation_id: plan.expected_controller_invocation_id,
         producer_invocation_id: plan.expected_producer_invocation_id,
         observations,
+        user_requested_bridges,
         maximum_observed_scratch_bytes: maximum_scratch,
         maximum_verified_jet_bytes: maximum_jet,
         scratch_multiplier: plan.scratch_multiplier,
@@ -747,13 +881,286 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn fixture(bridge: bool) -> (Plan, Vec<(Value, bool)>) {
+        let routine_times = [0, 30, 60, 90, 120, 153];
+        let mut times: Vec<(u64, bool)> = routine_times.into_iter().map(|t| (t, true)).collect();
+        if bridge {
+            times.insert(5, (123, false));
+        }
+        let mut observations = Vec::new();
+        let mut bridges = Vec::new();
+        let mut values = Vec::new();
+        for (index, (minutes, routine)) in times.iter().enumerate() {
+            let stamp = |m: u64| format!("2026-10-19T{:02}:{:02}:00Z", m / 60, m % 60);
+            let evidence = Evidence {
+                path: PathBuf::from(format!("/evidence/sample-{index}.json")),
+                sha256: format!("{index:064x}"),
+            };
+            let unit = serde_json::json!({"invocation_id":"a".repeat(32),
+                "restarts":0,"load_state":"loaded","active_state":"active","result":"success"});
+            let mut value = serde_json::json!({
+                "schema":OBSERVER_SCHEMA,"recorded_at_utc":stamp(*minutes),
+                "cadence":{"observation_reason":if *routine {"routine"} else {"user-requested-status"},
+                    "minimum_interval_seconds":1800,"routine_minimum_interval_enforced":routine,
+                    "observed_interval_seconds":if index==0 {1800} else {(minutes-times[index-1].0)*60}},
+                "mutation":{"producer_or_controller_signals_sent":false,"service_state_changed":false,
+                    "remote_mutations":false,"r2_mutations":false},
+                "replays":[{"range":"154","invocation_binding_stable":true,
+                    "controller_before":unit,"controller_after":unit,"producer_before":unit,"producer_after":unit,
+                    "conservative_observed_physical_bytes":if *routine {100} else {900},
+                    "useful_work":{"sufficient_for_rates":true,"slots_per_second":1.0,
+                        "last":{"slot":100+minutes,"terminal_slot":1000}}}]
+            });
+            if index > 0 {
+                value["cadence"]["previous_sample"] =
+                    serde_json::json!(format!("/evidence/sample-{}.json", index - 1));
+                value["cadence"]["previous_sample_sha256"] =
+                    serde_json::json!(format!("{:064x}", index - 1));
+                value["cadence"]["previous_sample_recorded_at_utc"] =
+                    serde_json::json!(stamp(times[index - 1].0));
+            }
+            if *routine {
+                observations.push(evidence);
+            } else {
+                bridges.push(evidence);
+            }
+            values.push((value, *routine));
+        }
+        let plan = Plan {
+            schema: PLAN_SCHEMA.into(),
+            range: "154".into(),
+            expected_controller_invocation_id: "a".repeat(32),
+            expected_producer_invocation_id: "a".repeat(32),
+            observations,
+            user_requested_bridges: bridges,
+            century_floor_evidence: Evidence {
+                path: "/floor.json".into(),
+                sha256: "b".repeat(64),
+            },
+            scratch_multiplier: 2,
+            max_jet_multiplier: 2,
+            requested_claim_gib: 512,
+            output_receipt: "/receipt.json".into(),
+            authority: Authority {
+                replay_launch_authorized: false,
+                local_deletion_authorized: false,
+                remote_mutations: false,
+                r2_mutations: false,
+            },
+        };
+        (plan, values)
+    }
+
+    fn check_fixture(
+        plan: &Plan,
+        values: &[(Value, bool)],
+    ) -> Result<ValidatedObservations, String> {
+        let mut routine_index = 0;
+        let mut bridge_index = 0;
+        let inputs = values
+            .iter()
+            .map(|(value, routine)| {
+                let evidence = if *routine {
+                    let evidence = &plan.observations[routine_index];
+                    routine_index += 1;
+                    evidence
+                } else {
+                    let evidence = &plan.user_requested_bridges[bridge_index];
+                    bridge_index += 1;
+                    evidence
+                };
+                (evidence, value.clone(), *routine)
+            })
+            .collect();
+        validate_observation_values(plan, inputs)
+    }
+
+    #[test]
+    fn six_routine_windows_with_optional_noncounting_bridge() {
+        for bridge in [false, true] {
+            let (plan, values) = fixture(bridge);
+            let (routine, bridges, peak) = check_fixture(&plan, &values).unwrap();
+            assert_eq!(routine.len(), 6);
+            assert_eq!(bridges.len(), usize::from(bridge));
+            assert_eq!(peak, if bridge { 900 } else { 100 });
+            assert!(bridges.iter().all(|b| !b.counts_as_routine_growth_window));
+        }
+        let (plan, mut values) = fixture(true);
+        values[5].0["replays"][0]["useful_work"] =
+            serde_json::json!({"sufficient_for_rates":false});
+        assert_eq!(check_fixture(&plan, &values).unwrap().0.len(), 6);
+        values.pop();
+        assert!(check_fixture(&plan, &values).is_err());
+    }
+
+    #[test]
+    fn rejects_broken_bridge_chain_and_unsafe_evidence() {
+        let (plan, values) = fixture(true);
+        for (index, pointer, replacement) in [
+            (
+                6,
+                "/cadence/previous_sample",
+                serde_json::json!("/wrong.json"),
+            ),
+            (
+                6,
+                "/cadence/previous_sample_sha256",
+                serde_json::json!("f".repeat(64)),
+            ),
+            (
+                5,
+                "/cadence/observation_reason",
+                serde_json::json!("routine"),
+            ),
+            (
+                5,
+                "/cadence/routine_minimum_interval_enforced",
+                serde_json::json!(true),
+            ),
+            (5, "/mutation/r2_mutations", serde_json::json!(true)),
+            (
+                5,
+                "/mutation/service_state_changed",
+                serde_json::json!(true),
+            ),
+            (
+                5,
+                "/replays/0/producer_after/invocation_id",
+                serde_json::json!("c".repeat(32)),
+            ),
+            (
+                5,
+                "/replays/0/controller_before/restarts",
+                serde_json::json!(1),
+            ),
+            (
+                5,
+                "/replays/0/invocation_binding_stable",
+                serde_json::json!(false),
+            ),
+            (
+                6,
+                "/cadence/observed_interval_seconds",
+                serde_json::json!(1799),
+            ),
+            (
+                6,
+                "/cadence/previous_sample_recorded_at_utc",
+                serde_json::json!("2026-10-19T02:00:00Z"),
+            ),
+            (
+                5,
+                "/replays/0/useful_work/last/terminal_slot",
+                serde_json::json!(1001),
+            ),
+            (5, "/replays/0/useful_work/last/slot", serde_json::json!(1)),
+            (
+                6,
+                "/replays/0/useful_work/last/slot",
+                serde_json::json!(223),
+            ),
+            (
+                6,
+                "/replays/0/useful_work/slots_per_second",
+                serde_json::json!(0),
+            ),
+            (
+                6,
+                "/recorded_at_utc",
+                serde_json::json!("2026-10-19T02:32:00Z"),
+            ),
+        ] {
+            let mut bad = values.clone();
+            *bad[index].0.pointer_mut(pointer).unwrap() = replacement;
+            assert!(check_fixture(&plan, &bad).is_err(), "accepted {pointer}");
+        }
+        let mut inputs: Vec<_> = plan
+            .observations
+            .iter()
+            .zip(values.iter().filter(|(_, r)| *r))
+            .map(|(e, (v, r))| (e, v.clone(), *r))
+            .collect();
+        // Omitting the declared bridge cannot silently repair the chain.
+        assert!(validate_observation_values(&plan, inputs.clone()).is_err());
+        inputs.swap(0, 1);
+        assert!(validate_observation_values(&plan, inputs).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_and_leading_or_trailing_bridges() {
+        let (plan, values) = fixture(true);
+        let mut inputs: Vec<_> = plan
+            .observations
+            .iter()
+            .zip(values.iter().filter(|(_, r)| *r))
+            .map(|(e, (v, r))| (e, v.clone(), *r))
+            .collect();
+        inputs.push((&plan.observations[0], values[5].0.clone(), false));
+        assert!(validate_observation_values(&plan, inputs).is_err());
+        for timestamp in ["2026-10-18T23:59:00Z", "2026-10-19T03:00:00Z"] {
+            let mut bad = values.clone();
+            bad[5].0["recorded_at_utc"] = serde_json::json!(timestamp);
+            assert!(check_fixture(&plan, &bad).is_err());
+        }
+    }
+
+    #[test]
+    fn utc_dates_are_canonical_and_real() {
+        assert!(utc_seconds("2024-02-29T00:00:00Z").is_ok());
+        for value in [
+            "2026-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-10-19T24:00:00Z",
+            "2026-10-19T00:00:60Z",
+            "2026-10-19T0:00:00Z",
+        ] {
+            assert!(utc_seconds(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn rejects_reordered_routine_list_even_if_chain_could_be_sorted() {
+        let (plan, values) = fixture(false);
+        let mut inputs: Vec<_> = plan
+            .observations
+            .iter()
+            .zip(values)
+            .map(|(e, (v, r))| (e, v, r))
+            .collect();
+        inputs.swap(1, 2);
+        assert!(
+            validate_observation_values(&plan, inputs)
+                .unwrap_err()
+                .contains("chronological")
+        );
+    }
+
+    #[test]
+    fn declared_file_digest_is_actually_authenticated() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-growth-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("sample.json");
+        let bytes = b"{\"schema\":\"test\"}";
+        fs::write(&path, bytes).unwrap();
+        let sha = hex(&Sha256::digest(bytes));
+        assert!(read_json(&path, &sha).is_ok());
+        assert!(read_json(&path, &"0".repeat(64)).is_err());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn formula_is_checked_and_conservative() {
-        assert_eq!(
-            compute_formula_minimum(90_878_533_632, 128_820_081_409, 2, 2).unwrap(),
-            439_397_230_082
-        );
-        assert!(512_u64 * GIB > 439_397_230_082);
+        let minimum = compute_formula_minimum(90_878_533_632, 128_820_081_409, 2, 2).unwrap();
+        assert_eq!(minimum, 439_397_230_082);
+        assert!(512_u64 * GIB > minimum);
     }
 
     #[test]
