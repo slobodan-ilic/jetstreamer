@@ -52,8 +52,11 @@ struct Plan {
 fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Result<()> {
     let continuation =
         receipt["schema"] == "jetstreamer-private-epoch213-checkpoint-continuation-launch-v1";
+    let bootstrap_resource =
+        receipt["schema"] == "jetstreamer-private-epoch225-bootstrap-resource-launch-v1";
     ensure!(
         (continuation
+            || bootstrap_resource
             || receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1")
             && receipt["launched"] == true
             && receipt["remote_mutations"] == false
@@ -70,6 +73,23 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
             && receipt["replay_slot_start"] == 92_447_543u64
             && receipt["replay_slot_end_inclusive"] == 92_447_999u64
+            && receipt["canonical_sidecar_authorized"] == false
+            && receipt["publication_authorized"] == false
+    } else if bootstrap_resource {
+        claim.epoch == 225
+            && claim
+                .unit
+                .starts_with("horizon-qualify-225-bootstrap-resource-")
+            && claim.unit.ends_with(".service")
+            && receipt["epoch"] == 225
+            && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+            && receipt["snapshot_slot"] == 97_199_617u64
+            && receipt["snapshot_sha256"]
+                == "094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d"
+            && receipt["worker_sha256"]
+                == "f39140b9a9659e7c6e8207076a2d0c560a6b69df42cc92e19a421cf46c2b761c"
+            && receipt["replay_entries_authorized"] == false
+            && receipt["full_cold_epoch_peak_qualified"] == false
             && receipt["canonical_sidecar_authorized"] == false
             && receipt["publication_authorized"] == false
     } else {
@@ -603,6 +623,45 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bootstrap_resource_claim_is_exact_and_cannot_authorize_replay_or_publication() {
+        let claim = DiagnosticClaim {
+            epoch: 225,
+            unit: "horizon-qualify-225-bootstrap-resource-test.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/private/resource-225".into(),
+            launch_receipt: BoundFile {
+                path: "/private/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let receipt = json!({"schema":"jetstreamer-private-epoch225-bootstrap-resource-launch-v1",
+            "launched":true,"epoch":225,"private_run_root":claim.scratch_path,
+            "snapshot_slot":97199617u64,
+            "snapshot_sha256":"094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d",
+            "worker_sha256":"f39140b9a9659e7c6e8207076a2d0c560a6b69df42cc92e19a421cf46c2b761c",
+            "replay_entries_authorized":false,"full_cold_epoch_peak_qualified":false,
+            "canonical_sidecar_authorized":false,"publication_authorized":false,
+            "remote_mutations":false,"r2_mutations":false,
+            "evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,
+                "restarts":0,"load_state":"loaded","result":"success","main_pid":1,
+                "active_state":"active","sub_state":"running"}]}});
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        for (field, value) in [
+            ("epoch", json!(226)),
+            ("snapshot_slot", json!(97199618u64)),
+            ("worker_sha256", json!("c".repeat(64))),
+            ("snapshot_sha256", json!("d".repeat(64))),
+            ("private_run_root", json!("/elsewhere")),
+            ("replay_entries_authorized", json!(true)),
+            ("full_cold_epoch_peak_qualified", json!(true)),
+            ("publication_authorized", json!(true)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[field] = value;
+            assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{field}");
+        }
+    }
     #[test]
     fn private_continuation_is_exact_scoped_and_never_publication_authority() {
         let mut claim = DiagnosticClaim {

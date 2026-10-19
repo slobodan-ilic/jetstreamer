@@ -696,6 +696,15 @@ restart snapshot, canonical terminal and raw-cursor mappings cannot admit anothe
 The receipt proves source-manifest scope only, not source archive hashes, final PoH, current-plugin
 output, runtime promotion or publication. Keep all those gates independent.
 
+The separate `jetstreamer-epoch225-bootstrap-resource` tool is a private restore-only resource
+measurement for the exact retained slot-97,199,617 snapshot and unchanged v1.6.20 worker. Its
+hash-bound `jetstreamer-private-epoch225-bootstrap-resource-plan-v1` plan fixes the service,
+private run root, empty scratch, immutable ledger, snapshot and no-clobber resource receipt.
+It sends no replay entries and captures cgroup and scratch measurements before worker shutdown.
+Fresh whole-host admission and a proven invocation-bound guard remain mandatory. Success checks
+the snapshot's accounts commitment and frozen-slot shape, not an external Bank hash or a complete
+cold-epoch peak; it grants no replay, runtime promotion, canonical sidecar or publication authority.
+
 The dedicated `epoch213-checkpoint-continuation-diagnostic` node build exposes only the private
 epoch-213 continuation experiment. Invoke it with `213 /PRIVATE_RUN_ROOT/ledger --verify
 --checkpoint-continuation-plan=/SEALED/plan.json --checkpoint-continuation-plan-sha256=HEX`.
