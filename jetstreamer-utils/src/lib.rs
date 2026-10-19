@@ -10,6 +10,9 @@ pub mod clickhouse;
 /// Bounded diagnostic assembly of pinned Solana v1.4.25 data shreds.
 pub mod horizon_legacy_shred;
 
+/// Bounded diagnostic decoding of pinned Solana v1.4.25 entry batches.
+pub mod horizon_legacy_entry;
+
 /// Re-exported ClickHouse utility types and functions.
 pub use clickhouse::{
     ClickhouseError, ClickhouseStartResult, start, start_client, stop, stop_sync,
