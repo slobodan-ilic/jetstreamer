@@ -9,7 +9,7 @@ use {
     serde::{Deserialize, Serialize},
     sha2::{Digest as _, Sha256},
     std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         env,
         ffi::OsStr,
         fs::{self, File, OpenOptions},
@@ -134,9 +134,56 @@ struct ReceiptEvidence<'a> {
 struct ReceiptUnit<'a> {
     name: &'a str,
     invocation_id: &'a str,
+    current_invocation_id: &'a str,
+    identity_source: &'static str,
     result: &'static str,
     exec_main_status: u64,
     restarts: u64,
+    journal_records: u64,
+    journal_pid: u64,
+    journal_first_realtime_timestamp_us: u64,
+    journal_last_realtime_timestamp_us: u64,
+    deactivated_realtime_timestamp_us: u64,
+    finished_realtime_timestamp_us: u64,
+}
+
+#[derive(Debug)]
+struct SystemdState {
+    exec_status: u64,
+    restarts: u64,
+    current_invocation_id: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct InvocationJournalAudit {
+    records: u64,
+    pid: u64,
+    first_realtime_timestamp_us: u64,
+    last_realtime_timestamp_us: u64,
+    deactivated_realtime_timestamp_us: u64,
+    finished_realtime_timestamp_us: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct JournalRecord {
+    #[serde(rename = "__REALTIME_TIMESTAMP")]
+    realtime_timestamp: Option<String>,
+    #[serde(rename = "MESSAGE")]
+    message: Option<String>,
+    #[serde(rename = "_SYSTEMD_UNIT")]
+    systemd_unit: Option<String>,
+    #[serde(rename = "UNIT")]
+    unit: Option<String>,
+    #[serde(rename = "_SYSTEMD_INVOCATION_ID")]
+    invocation_id: Option<String>,
+    #[serde(rename = "_EXE")]
+    executable: Option<String>,
+    #[serde(rename = "_CMDLINE")]
+    command_line: Option<String>,
+    #[serde(rename = "_PID")]
+    pid: Option<String>,
+    #[serde(rename = "JOB_RESULT")]
+    job_result: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -378,7 +425,7 @@ fn parse_u64_field(fields: &BTreeMap<String, String>, name: &str) -> Result<u64,
         .map_err(|_| format!("systemctl {name} is not a u64"))
 }
 
-fn systemd_state(plan: &Plan) -> Result<(u64, u64), String> {
+fn systemd_state(plan: &Plan) -> Result<SystemdState, String> {
     let output = Command::new("/usr/bin/systemctl")
         .args([
             "show",
@@ -403,11 +450,12 @@ fn systemd_state(plan: &Plan) -> Result<(u64, u64), String> {
     }
     let fields = parse_systemctl_show(&output.stdout)?;
     let expected_fragment = plan.unit.installed_file.path.to_string_lossy();
+    let current_invocation_id = field(&fields, "InvocationID")?;
     if field(&fields, "LoadState")? != "loaded"
         || field(&fields, "ActiveState")? != "inactive"
         || field(&fields, "SubState")? != "dead"
         || field(&fields, "Result")? != "success"
-        || field(&fields, "InvocationID")? != plan.unit.invocation_id
+        || (!current_invocation_id.is_empty() && current_invocation_id != plan.unit.invocation_id)
         || field(&fields, "FragmentPath")? != expected_fragment
     {
         return Err("systemd unit is not the exact clean terminal invocation".to_string());
@@ -417,16 +465,24 @@ fn systemd_state(plan: &Plan) -> Result<(u64, u64), String> {
     if status != 0 || restarts != 0 {
         return Err("systemd unit did not terminate successfully without restarts".to_string());
     }
-    Ok((status, restarts))
+    Ok(SystemdState {
+        exec_status: status,
+        restarts,
+        current_invocation_id: current_invocation_id.to_string(),
+    })
 }
 
-fn exact_exec_start_line(plan: &Plan) -> String {
+fn exact_command_line(plan: &Plan) -> String {
     format!(
-        "ExecStart={} {} --full --internal-full --threads {}",
+        "{} {} --full --internal-full --threads {}",
         plan.verifier.path.display(),
         plan.archive.path.display(),
         plan.unit.threads
     )
+}
+
+fn exact_exec_start_line(plan: &Plan) -> String {
+    format!("ExecStart={}", exact_command_line(plan))
 }
 
 fn validate_unit_file(plan: &Plan, bytes: &[u8]) -> Result<(), String> {
@@ -443,6 +499,128 @@ fn validate_unit_file(plan: &Plan, bytes: &[u8]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn required_journal_u64(value: Option<&str>, field_name: &str) -> Result<u64, String> {
+    value
+        .ok_or_else(|| format!("journal record is missing {field_name}"))?
+        .parse()
+        .map_err(|_| format!("journal {field_name} is not a u64"))
+}
+
+fn validate_invocation_journal_metadata(
+    plan: &Plan,
+    bytes: &[u8],
+) -> Result<InvocationJournalAudit, String> {
+    let expected_command = exact_command_line(plan);
+    let deactivated_message = format!("{}: Deactivated successfully.", plan.unit.name);
+    let finished_prefix = format!("Finished {} - ", plan.unit.name);
+    let mut records = 0_u64;
+    let mut pids = BTreeSet::new();
+    let mut first_timestamp = u64::MAX;
+    let mut last_timestamp = 0_u64;
+    let mut deactivated_timestamps = Vec::new();
+    let mut finished_timestamps = Vec::new();
+
+    for (index, line) in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        let record: JournalRecord = serde_json::from_slice(line)
+            .map_err(|error| format!("invalid unit journal JSON record {index}: {error}"))?;
+        if record.systemd_unit.as_deref() == Some(plan.unit.name.as_str()) {
+            if record.invocation_id.as_deref() != Some(plan.unit.invocation_id.as_str()) {
+                return Err(
+                    "unit journal contains a different or unbound service invocation".to_string(),
+                );
+            }
+            if record.executable.as_deref() != Some(plan.verifier.path.to_string_lossy().as_ref())
+                || record.command_line.as_deref() != Some(expected_command.as_str())
+            {
+                return Err(
+                    "exact invocation journal executable or command line is not sealed".to_string(),
+                );
+            }
+            let timestamp =
+                required_journal_u64(record.realtime_timestamp.as_deref(), "__REALTIME_TIMESTAMP")?;
+            let pid = required_journal_u64(record.pid.as_deref(), "_PID")?;
+            records = records
+                .checked_add(1)
+                .ok_or_else(|| "unit journal record count overflowed".to_string())?;
+            pids.insert(pid);
+            first_timestamp = first_timestamp.min(timestamp);
+            last_timestamp = last_timestamp.max(timestamp);
+        }
+
+        if record.unit.as_deref() == Some(plan.unit.name.as_str())
+            && record.pid.as_deref() == Some("1")
+            && record.executable.as_deref() == Some("/usr/lib/systemd/systemd")
+        {
+            let timestamp =
+                required_journal_u64(record.realtime_timestamp.as_deref(), "__REALTIME_TIMESTAMP")?;
+            if record.message.as_deref() == Some(deactivated_message.as_str()) {
+                deactivated_timestamps.push(timestamp);
+            }
+            if record
+                .message
+                .as_deref()
+                .is_some_and(|message| message.starts_with(&finished_prefix))
+                && record.job_result.as_deref() == Some("done")
+            {
+                finished_timestamps.push(timestamp);
+            }
+        }
+    }
+
+    if records == 0 || pids.len() != 1 {
+        return Err(
+            "unit journal does not bind exactly one nonempty verifier process identity".to_string(),
+        );
+    }
+    if deactivated_timestamps.len() != 1 || finished_timestamps.len() != 1 {
+        return Err(
+            "unit journal lacks exactly one clean deactivation and successful finish event"
+                .to_string(),
+        );
+    }
+    let deactivated_timestamp = deactivated_timestamps[0];
+    let finished_timestamp = finished_timestamps[0];
+    if last_timestamp > deactivated_timestamp || deactivated_timestamp > finished_timestamp {
+        return Err("unit journal terminal events are out of order".to_string());
+    }
+
+    Ok(InvocationJournalAudit {
+        records,
+        pid: *pids.iter().next().expect("validated singleton PID"),
+        first_realtime_timestamp_us: first_timestamp,
+        last_realtime_timestamp_us: last_timestamp,
+        deactivated_realtime_timestamp_us: deactivated_timestamp,
+        finished_realtime_timestamp_us: finished_timestamp,
+    })
+}
+
+fn collect_invocation_journal_metadata(plan: &Plan) -> Result<InvocationJournalAudit, String> {
+    let output = Command::new("/usr/bin/journalctl")
+        .args([
+            "--no-pager",
+            "--output=json",
+            "--all",
+            "--unit",
+            plan.unit.name.as_str(),
+        ])
+        .output()
+        .map_err(|error| format!("execute journalctl unit metadata query: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "journalctl unit metadata query failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if output.stdout.is_empty() || output.stdout.len() > MAX_JOURNAL_BYTES {
+        return Err("unit journal metadata is empty or exceeds the sealed bound".to_string());
+    }
+    validate_invocation_journal_metadata(plan, &output.stdout)
 }
 
 fn collect_journal(invocation_id: &str) -> Result<Vec<u8>, String> {
@@ -645,7 +823,13 @@ fn run() -> Result<(), String> {
         return Err("canonical checksum sidecar must remain absent".to_string());
     }
 
-    let (exec_status, restarts) = systemd_state(&plan)?;
+    let systemd = systemd_state(&plan)?;
+    let journal_audit = collect_invocation_journal_metadata(&plan)?;
+    let identity_source = if systemd.current_invocation_id == plan.unit.invocation_id {
+        "systemd-current-and-terminal-journal"
+    } else {
+        "systemd-cleared-after-terminal-journal"
+    };
     let journal = collect_journal(&plan.unit.invocation_id)?;
     let result = result_line(&journal)?.to_string();
     write_new(&plan.output_log, &journal)?;
@@ -681,9 +865,17 @@ fn run() -> Result<(), String> {
         unit: ReceiptUnit {
             name: &plan.unit.name,
             invocation_id: &plan.unit.invocation_id,
+            current_invocation_id: &systemd.current_invocation_id,
+            identity_source,
             result: "success",
-            exec_main_status: exec_status,
-            restarts,
+            exec_main_status: systemd.exec_status,
+            restarts: systemd.restarts,
+            journal_records: journal_audit.records,
+            journal_pid: journal_audit.pid,
+            journal_first_realtime_timestamp_us: journal_audit.first_realtime_timestamp_us,
+            journal_last_realtime_timestamp_us: journal_audit.last_realtime_timestamp_us,
+            deactivated_realtime_timestamp_us: journal_audit.deactivated_realtime_timestamp_us,
+            finished_realtime_timestamp_us: journal_audit.finished_realtime_timestamp_us,
         },
         command: ReceiptCommand {
             full: true,
@@ -744,6 +936,75 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn test_plan() -> Plan {
+        Plan {
+            schema: PLAN_SCHEMA.to_string(),
+            epoch: 140,
+            archive: ArchivePlan {
+                path: PathBuf::from("/private/epoch-140.jet"),
+                bytes: 1,
+                uid: 1,
+                gid: 1,
+                mode: "0440".to_string(),
+            },
+            verifier: Evidence {
+                path: PathBuf::from("/opt/verify_archive"),
+                sha256: "00".repeat(32),
+            },
+            unit: UnitPlan {
+                name: "example.service".to_string(),
+                invocation_id: "0123456789abcdef0123456789abcdef".to_string(),
+                installed_file: Evidence {
+                    path: PathBuf::from("/etc/systemd/system/example.service"),
+                    sha256: "11".repeat(32),
+                },
+                threads: 8,
+            },
+            deployment_seal_receipt: Evidence {
+                path: PathBuf::from("/opt/deployment-seal-receipt.json"),
+                sha256: "22".repeat(32),
+            },
+            output_log: PathBuf::from("/private/full-verification.log"),
+            output_receipt: PathBuf::from("/private/full-verification.json"),
+            authority: Authority {
+                archive_mutations: false,
+                sidecar_created: false,
+                replay_launch_authorized: false,
+                publication_authorized: false,
+                remote_mutations: false,
+                r2_mutations: false,
+            },
+        }
+    }
+
+    fn terminal_unit_journal(invocation_id: &str) -> Vec<u8> {
+        format!(
+            concat!(
+                "{{\"__REALTIME_TIMESTAMP\":\"100\",\"MESSAGE\":\"start\",",
+                "\"_SYSTEMD_UNIT\":\"example.service\",",
+                "\"_SYSTEMD_INVOCATION_ID\":\"{}\",",
+                "\"_EXE\":\"/opt/verify_archive\",",
+                "\"_CMDLINE\":\"/opt/verify_archive /private/epoch-140.jet --full --internal-full --threads 8\",",
+                "\"_PID\":\"42\"}}\n",
+                "{{\"__REALTIME_TIMESTAMP\":\"200\",\"MESSAGE\":\"RESULT: OK (internal only): verified\",",
+                "\"_SYSTEMD_UNIT\":\"example.service\",",
+                "\"_SYSTEMD_INVOCATION_ID\":\"{}\",",
+                "\"_EXE\":\"/opt/verify_archive\",",
+                "\"_CMDLINE\":\"/opt/verify_archive /private/epoch-140.jet --full --internal-full --threads 8\",",
+                "\"_PID\":\"42\"}}\n",
+                "{{\"__REALTIME_TIMESTAMP\":\"201\",",
+                "\"MESSAGE\":\"example.service: Deactivated successfully.\",",
+                "\"UNIT\":\"example.service\",\"_EXE\":\"/usr/lib/systemd/systemd\",\"_PID\":\"1\"}}\n",
+                "{{\"__REALTIME_TIMESTAMP\":\"202\",",
+                "\"MESSAGE\":\"Finished example.service - example.\",",
+                "\"UNIT\":\"example.service\",\"_EXE\":\"/usr/lib/systemd/systemd\",",
+                "\"_PID\":\"1\",\"JOB_RESULT\":\"done\"}}\n"
+            ),
+            invocation_id, invocation_id
+        )
+        .into_bytes()
+    }
+
     #[test]
     fn parses_terminal_systemctl_properties() {
         let fields = parse_systemctl_show(
@@ -767,5 +1028,49 @@ mod tests {
     fn rejects_ambiguous_result_lines() {
         let journal = b"=== verify summary (1.0s, 8 threads) ===\n=== full PoH verification ===\nRESULT: OK (internal only): one\nRESULT: OK (internal only): two\n";
         assert!(result_line(journal).is_err());
+    }
+
+    #[test]
+    fn binds_cleared_terminal_invocation_to_exact_journal_and_manager_success() {
+        let audit = validate_invocation_journal_metadata(
+            &test_plan(),
+            &terminal_unit_journal("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        assert_eq!(
+            audit,
+            InvocationJournalAudit {
+                records: 2,
+                pid: 42,
+                first_realtime_timestamp_us: 100,
+                last_realtime_timestamp_us: 200,
+                deactivated_realtime_timestamp_us: 201,
+                finished_realtime_timestamp_us: 202,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unit_journal_from_a_different_invocation() {
+        let error = validate_invocation_journal_metadata(
+            &test_plan(),
+            &terminal_unit_journal("ffffffffffffffffffffffffffffffff"),
+        )
+        .unwrap_err();
+        assert!(error.contains("different or unbound service invocation"));
+    }
+
+    #[test]
+    fn rejects_terminal_journal_without_successful_manager_finish() {
+        let bytes = terminal_unit_journal("0123456789abcdef0123456789abcdef");
+        let text = String::from_utf8(bytes).unwrap();
+        let truncated = text
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        let error = validate_invocation_journal_metadata(&test_plan(), &truncated).unwrap_err();
+        assert!(error.contains("successful finish event"));
     }
 }
