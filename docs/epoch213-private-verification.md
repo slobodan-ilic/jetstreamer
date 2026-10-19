@@ -57,8 +57,11 @@ explicit fresh CPU/memory/task/runtime bounds, and the minimum capability needed
 to traverse retained user-private evidence. `ProtectHome=read-only` is compatible
 with the original input; `ProtectHome=yes` is not. Grant writes only to the new
 private scan directory. Preserve the producer's terminal identity until the
-runner's second check; a collected unit fails closed and needs separately reviewed
-journal evidence, not a guessed success. Invoke:
+runner's second check. A cleared inactive `InvocationID` is accepted only with
+the exact original producer's assembly-completion journal and subsequent clean
+manager deactivation, alongside unchanged terminal service properties. Foreign
+invocations, missing/ambiguous journal evidence, and collected units fail closed.
+Invoke:
 
 ```text
 jetstreamer-epoch213-private-verify /absolute/sealed/plan.json --plan-sha256 HEX --self-sha256 HEX

@@ -249,7 +249,6 @@ fn validate_terminal(text: &str) -> Result<()> {
         );
     }
     for (key, expected) in [
-        ("InvocationID", INVOCATION),
         ("MainPID", "0"),
         ("NRestarts", "0"),
         ("Restart", "no"),
@@ -263,6 +262,10 @@ fn validate_terminal(text: &str) -> Result<()> {
         );
     }
     ensure!(
+        matches!(fields.get("InvocationID"), Some(&"") | Some(&INVOCATION)),
+        "foreign producer invocation"
+    );
+    ensure!(
         matches!(
             fields.get("ActiveState"),
             Some(&"inactive") | Some(&"active")
@@ -272,12 +275,88 @@ fn validate_terminal(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn terminal() -> Result<String> {
+fn validate_terminal_journal(bytes: &[u8]) -> Result<Value> {
+    let mut completion = None;
+    let mut deactivation = None;
+    let mut records = 0u64;
+    for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+        let record: Value = serde_json::from_slice(line)?;
+        if record["_SYSTEMD_UNIT"] == UNIT {
+            ensure!(
+                record["_SYSTEMD_INVOCATION_ID"] == INVOCATION,
+                "foreign or unbound producer journal"
+            );
+            records += 1;
+            if record["MESSAGE"].as_str().is_some_and(|m| m.contains("private epoch213 checkpoint continuation assembled; independent final/plugin verification and publication gates remain closed")) {
+                ensure!(record["_EXE"] == "/var/lib/jetstreamer/horizon-213-checkpoint-continuation-ae43646-v1/jetstreamer-node" && record["_PID"] == "847475", "completion is not from the exact producer");
+                ensure!(completion.replace(record["__REALTIME_TIMESTAMP"].as_str().context("missing completion time")?.parse::<u64>()?).is_none(), "duplicate producer completion");
+            }
+        }
+        if record["UNIT"] == UNIT
+            && record["_PID"] == "1"
+            && record["_EXE"] == "/usr/lib/systemd/systemd"
+            && record["MESSAGE"] == format!("{UNIT}: Deactivated successfully.")
+        {
+            ensure!(
+                deactivation
+                    .replace(
+                        record["__REALTIME_TIMESTAMP"]
+                            .as_str()
+                            .context("missing deactivation time")?
+                            .parse::<u64>()?
+                    )
+                    .is_none(),
+                "duplicate producer deactivation"
+            );
+        }
+    }
+    let completed = completion.context("no bound assembly completion journal")?;
+    let deactivated = deactivation.context("no clean manager deactivation journal")?;
+    ensure!(
+        records > 0 && completed <= deactivated,
+        "invalid terminal journal order"
+    );
+    Ok(
+        json!({"journal_sha256":format!("{:x}",Sha256::digest(bytes)),"producer_records":records,"completion_timestamp_us":completed,"deactivation_timestamp_us":deactivated,"invocation_id":INVOCATION}),
+    )
+}
+
+fn terminal() -> Result<Value> {
     let output = Command::new("/usr/bin/systemctl").args(["show", UNIT, "--property=InvocationID,MainPID,NRestarts,Restart,Result,ExecMainStatus,ExecMainCode,ActiveState,SubState"]).output()?;
     ensure!(output.status.success(), "service observation failed");
     let text = String::from_utf8(output.stdout)?;
     validate_terminal(&text)?;
-    Ok(text)
+    // Inactive services commonly clear InvocationID. Bind their retained clean
+    // terminal properties to the original process and manager journal instead
+    // of treating an empty ID as either success or a replay failure.
+    let mut child = Command::new("/usr/bin/journalctl")
+        .args([
+            "--unit",
+            UNIT,
+            "--output=json",
+            "--no-pager",
+            "--lines=100000",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .context("no journal pipe")?
+        .take(64 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() > 64 * 1024 * 1024 {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!("terminal journal read failed or exceeded bound");
+    }
+    ensure!(
+        child.wait()?.success(),
+        "terminal journal observation failed"
+    );
+    let journal = validate_terminal_journal(&bytes)?;
+    Ok(json!({"systemctl":text,"journal":journal}))
 }
 
 fn require_absent(path: &Path) -> Result<()> {
@@ -497,12 +576,12 @@ fn run(plan_binding: Evidence, self_sha256: &str) -> Result<()> {
     unchanged(source_path, &source, &source_identity)?;
     require_absent(&archive.with_extension("jet.sha256"))?;
     require_absent(&source_path.with_extension("jet.sha256"))?;
-    terminal()?;
+    let after_terminal = terminal()?;
     checked(&plan.producer_outcome)?;
     checked(&plan.provenance_expectation)?;
     write_new(
         &dir.join("verification.json"),
-        &json!({"schema":"jetstreamer-private-epoch213-verification-v1","epoch":213,"plan":plan_binding,"runner_sha256":self_sha256,"producer_outcome":plan.producer_outcome,"provenance_expectation":plan.provenance_expectation,"expected_provenance_sha256":PROVENANCE,"source_path":source_path,"source_identity":source_identity,"archive_path":archive,"archive_sha256":digest,"archive_identity":stage_identity,"copy_and_hash_millis":copy_millis,"full":full,"plugin":plugin,"independent_final_archive_verification_passed":true,"current_plugin_verification_passed":true,"runtime_admission_authorized":false,"canonical_sidecar_authorized":false,"publication_authorized":false,"retirement_authorized":false,"r2_mutations":false}),
+        &json!({"schema":"jetstreamer-private-epoch213-verification-v1","epoch":213,"plan":plan_binding,"runner_sha256":self_sha256,"producer_outcome":plan.producer_outcome,"producer_terminal":after_terminal,"provenance_expectation":plan.provenance_expectation,"expected_provenance_sha256":PROVENANCE,"source_path":source_path,"source_identity":source_identity,"archive_path":archive,"archive_sha256":digest,"archive_identity":stage_identity,"copy_and_hash_millis":copy_millis,"full":full,"plugin":plugin,"independent_final_archive_verification_passed":true,"current_plugin_verification_passed":true,"runtime_admission_authorized":false,"canonical_sidecar_authorized":false,"publication_authorized":false,"retirement_authorized":false,"r2_mutations":false}),
     )?;
     Ok(())
 }
@@ -566,6 +645,36 @@ mod tests {
             assert!(validate_terminal(&good.replace(old, new)).is_err());
         }
         assert!(validate_terminal(&(good + "Result=success\n")).is_err());
+    }
+
+    #[test]
+    fn terminal_journal_requires_exact_process_and_ordered_manager_success() {
+        let completion = json!({"_SYSTEMD_UNIT":UNIT,"_SYSTEMD_INVOCATION_ID":INVOCATION,"_EXE":"/var/lib/jetstreamer/horizon-213-checkpoint-continuation-ae43646-v1/jetstreamer-node","_PID":"847475","__REALTIME_TIMESTAMP":"100","MESSAGE":"private epoch213 checkpoint continuation assembled; independent final/plugin verification and publication gates remain closed"});
+        let manager = json!({"UNIT":UNIT,"_PID":"1","_EXE":"/usr/lib/systemd/systemd","__REALTIME_TIMESTAMP":"101","MESSAGE":format!("{UNIT}: Deactivated successfully.")});
+        let encode =
+            |records: &[Value]| records.iter().map(|v| format!("{v}\n")).collect::<String>();
+        validate_terminal_journal(encode(&[completion.clone(), manager.clone()]).as_bytes())
+            .unwrap();
+        for (pointer, value) in [
+            ("/_PID", json!("999")),
+            ("/_SYSTEMD_INVOCATION_ID", json!("foreign")),
+            ("/_EXE", json!("/tmp/node")),
+            ("/__REALTIME_TIMESTAMP", json!("102")),
+        ] {
+            let mut changed = completion.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                validate_terminal_journal(encode(&[changed, manager.clone()]).as_bytes()).is_err()
+            );
+        }
+        for records in [
+            vec![completion.clone()],
+            vec![manager.clone()],
+            vec![completion.clone(), completion.clone(), manager.clone()],
+            vec![completion, manager.clone(), manager],
+        ] {
+            assert!(validate_terminal_journal(encode(&records).as_bytes()).is_err());
+        }
     }
 
     #[test]
