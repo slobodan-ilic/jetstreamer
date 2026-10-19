@@ -42,3 +42,20 @@ Independent full and current-plugin checks remain mandatory before using the
 archive length as a canonical century-floor sample. Those checks and the
 resource-audit receipt must be bound explicitly in the floor evidence. No receipt
 from another host is copied into this host's producer completion ledger.
+
+`private-resource-audit-verify PLAN --plan-sha256 HEX --self-sha256 HEX`
+provides that separate verification stage. Its immutable plan binds the audit
+receipt's digest, exact immutable full-verifier and current-plugin executables,
+thread count (1–32), epoch, and an existing root-private output directory. It
+hashes the archive before and after each independent full-PoH, ordered-coverage,
+and `--verify-only` plugin scan, requires successful exit codes and exact
+nonpartial success summaries, and preserves no-clobber logs and a private
+verification receipt. No child receives R2 credentials.
+
+Only after all three scans pass does it write a single-sample century-floor
+receipt, with checked arithmetic and digest-bound references to both the private
+remote readback audit and independent verification. The growth-claim consumer
+accepts this separate audit schema only with that additional full/ordered/plugin
+proof and all completion/publication/mutation authority explicitly false. The
+ordinary R2 restore, controller completion, delivery and retirement gates continue
+to reject the resource-audit receipt as production completion evidence.

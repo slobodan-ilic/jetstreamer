@@ -28,7 +28,7 @@ struct Plan {
     r2_mutations: bool,
 }
 
-fn private_directory(path: &Path) -> Result<()> {
+pub(super) fn private_directory(path: &Path) -> Result<()> {
     ensure!(
         path.is_absolute() && fs::canonicalize(path)? == path,
         "noncanonical private directory"

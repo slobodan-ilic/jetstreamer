@@ -454,8 +454,26 @@ fn maximum_verified_jet(plan: &Plan) -> Result<u64, String> {
         let receipt_sha = value_str(sample, "/r2_receipt_sha256")?;
         lowercase_sha256(receipt_sha, "R2 receipt SHA-256")?;
         let receipt = read_json(&receipt_path, receipt_sha)?;
-        if value_str(&receipt, "/schema")? != "jetstreamer-horizon-r2-receipt-v1"
-            || value_u64(&receipt, "/epoch")? != epoch
+        let receipt_schema = value_str(&receipt, "/schema")?;
+        if receipt_schema == "jetstreamer-horizon-private-resource-audit-receipt-v1" {
+            let verification_path =
+                PathBuf::from(value_str(sample, "/private_resource_verification")?);
+            let verification_sha = value_str(sample, "/private_resource_verification_sha256")?;
+            lowercase_sha256(verification_sha, "private full/plugin verification SHA-256")?;
+            let verification = read_json(&verification_path, verification_sha)?;
+            validate_private_floor_verification(
+                &receipt,
+                &verification,
+                epoch,
+                size,
+                archive_sha,
+                &receipt_path,
+                receipt_sha,
+            )?;
+        } else if receipt_schema != "jetstreamer-horizon-r2-receipt-v1" {
+            return Err("unsupported century-floor ready-pair receipt schema".to_string());
+        }
+        if value_u64(&receipt, "/epoch")? != epoch
             || value_str(&receipt, "/archive_key")? != format!("epoch-{epoch}.jet")
             || value_str(&receipt, "/checksum_key")? != format!("epoch-{epoch}.jet.sha256")
             || value_u64(&receipt, "/archive_length")? != size
@@ -482,6 +500,64 @@ fn maximum_verified_jet(plan: &Plan) -> Result<u64, String> {
         return Err("century floor arithmetic does not reproduce".to_string());
     }
     Ok(maximum)
+}
+
+fn validate_private_floor_verification(
+    audit: &Value,
+    verification: &Value,
+    epoch: u64,
+    size: u64,
+    archive_sha: &str,
+    receipt_path: &Path,
+    receipt_sha: &str,
+) -> Result<(), String> {
+    if value_str(audit, "/purpose")? != "century-floor-resource-audit-only"
+        || !value_bool(audit, "/local_sha256_and_etag_verified")?
+        || !value_bool(audit, "/authenticated_ready_pair_revalidated")?
+        || value_str(verification, "/schema")?
+            != "jetstreamer-horizon-private-resource-verification-v1"
+        || value_str(verification, "/status")? != "passed"
+        || value_u64(verification, "/epoch")? != epoch
+        || value_u64(verification, "/archive_length")? != size
+        || value_str(verification, "/archive_sha256")? != archive_sha
+        || value_str(verification, "/resource_audit")? != receipt_path.to_string_lossy()
+        || value_str(verification, "/resource_audit_sha256")? != receipt_sha
+        || !value_bool(verification, "/archive_sha256_before_after_verified")?
+        || value_str(verification, "/archive_path")? != value_str(audit, "/archive_path")?
+        || value_u64(verification, "/archive_device")? != value_u64(audit, "/archive_device")?
+        || value_u64(verification, "/archive_inode")? != value_u64(audit, "/archive_inode")?
+    {
+        return Err("private century-floor audit/full/plugin binding mismatch".to_string());
+    }
+    for value in [audit, verification] {
+        for field in [
+            "/production_completion_authorized",
+            "/publication_authorized",
+            "/local_retirement_authorized",
+            "/remote_mutations",
+            "/r2_mutations",
+        ] {
+            if value_bool(value, field)? {
+                return Err("private century-floor evidence grants forbidden authority".to_string());
+            }
+        }
+    }
+    for field in ["/full_verifier", "/ordered_verifier", "/current_plugin"] {
+        if value_str(verification, &format!("{field}/status"))? != "passed"
+            || value_u64(verification, &format!("{field}/exit_code"))? != 0
+        {
+            return Err("private century-floor verification stage failed".to_string());
+        }
+        lowercase_sha256(
+            value_str(verification, &format!("{field}/sha256"))?,
+            "verifier SHA-256",
+        )?;
+        lowercase_sha256(
+            value_str(verification, &format!("{field}/log_sha256"))?,
+            "verification log SHA-256",
+        )?;
+    }
+    Ok(())
 }
 
 fn compute_formula_minimum(
@@ -683,6 +759,61 @@ mod tests {
     #[test]
     fn rejects_overflow() {
         assert!(compute_formula_minimum(u64::MAX, 1, 2, 2).is_err());
+    }
+
+    #[test]
+    fn private_floor_requires_separate_full_ordered_and_plugin_proof() {
+        let sha = "a".repeat(64);
+        let receipt_sha = "b".repeat(64);
+        let audit = serde_json::json!({"purpose":"century-floor-resource-audit-only",
+            "local_sha256_and_etag_verified":true,"authenticated_ready_pair_revalidated":true,
+            "archive_path":"/private/epoch-201.jet","archive_device":1,"archive_inode":2,
+            "production_completion_authorized":false,"publication_authorized":false,
+            "local_retirement_authorized":false,"remote_mutations":false,"r2_mutations":false});
+        let stage =
+            serde_json::json!({"status":"passed","exit_code":0,"sha256":sha,"log_sha256":sha});
+        let verification = serde_json::json!({"schema":"jetstreamer-horizon-private-resource-verification-v1",
+            "status":"passed","epoch":201,"archive_length":10,"archive_sha256":sha,
+            "archive_path":"/private/epoch-201.jet","archive_device":1,"archive_inode":2,
+            "resource_audit":"/private/resource-audit.json","resource_audit_sha256":receipt_sha,
+            "archive_sha256_before_after_verified":true,"full_verifier":stage,
+            "ordered_verifier":stage,"current_plugin":stage,
+            "production_completion_authorized":false,"publication_authorized":false,
+            "local_retirement_authorized":false,"remote_mutations":false,"r2_mutations":false});
+        let check = |a: &Value, v: &Value| {
+            validate_private_floor_verification(
+                a,
+                v,
+                201,
+                10,
+                &sha,
+                Path::new("/private/resource-audit.json"),
+                &receipt_sha,
+            )
+        };
+        check(&audit, &verification).unwrap();
+        for key in ["full_verifier", "ordered_verifier", "current_plugin"] {
+            let mut bad = verification.clone();
+            bad[key]["status"] = serde_json::json!("failed");
+            assert!(check(&audit, &bad).is_err());
+        }
+        for key in [
+            "production_completion_authorized",
+            "publication_authorized",
+            "local_retirement_authorized",
+            "r2_mutations",
+            "remote_mutations",
+        ] {
+            let mut bad = verification.clone();
+            bad[key] = serde_json::json!(true);
+            assert!(check(&audit, &bad).is_err());
+        }
+        let mut bad = verification.clone();
+        bad["archive_inode"] = serde_json::json!(3);
+        assert!(check(&audit, &bad).is_err());
+        let mut bad = audit.clone();
+        bad["authenticated_ready_pair_revalidated"] = serde_json::json!(false);
+        assert!(check(&bad, &verification).is_err());
     }
 
     #[test]
