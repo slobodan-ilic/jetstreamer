@@ -60,6 +60,10 @@ path = "src/horizon_growth_claim_bin.rs"
 name = "jetstreamer-horizon-retire-failed-diagnostic"
 path = "src/horizon_retire_failed_diagnostic_bin.rs"
 
+[[bin]]
+name = "jetstreamer-horizon-full-verification-evidence"
+path = "src/horizon_full_verification_evidence_bin.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
 log.workspace = true
