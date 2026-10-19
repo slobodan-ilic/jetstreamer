@@ -4861,6 +4861,7 @@ name = "jetstreamer-node"
 version = "0.9.0"
 dependencies = [
  "agave-snapshots",
+ "anyhow",
  "base64 0.23.1",
  "bincode",
  "bs58",

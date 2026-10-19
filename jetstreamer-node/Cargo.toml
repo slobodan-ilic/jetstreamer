@@ -25,6 +25,7 @@ epoch224-v1-6-25-diagnostic = []
 epoch224-v1-6-25-qualification = []
 
 [dependencies]
+anyhow.workspace = true
 agave-snapshots.workspace = true
 base64.workspace = true
 bincode.workspace = true

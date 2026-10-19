@@ -95,3 +95,8 @@ transactional if-absent publication with checksum last. Only after that separate
 reviewed gate may digest-bound full/plugin receipts be materialized for the
 progressive uploader. Adjacent-boundary checks remain independently required for
 local retirement, not for initial R2 upload.
+
+The separately scoped `jetstreamer-epoch213-publish` implementation is documented
+in [epoch213-v4-artifact-publication.md](epoch213-v4-artifact-publication.md).
+Its own sealed exact-artifact plan and capability proof remain required; this
+private verifier does not launch or authorize it.
