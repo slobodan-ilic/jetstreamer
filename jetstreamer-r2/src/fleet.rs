@@ -319,14 +319,29 @@ fn status_matches(
         && producer["NRestarts"] == "0"
 }
 
-pub(super) fn persist(path: &Path, value: &Value) -> Result<()> {
+fn validate_output_destination(path: &Path) -> Result<&Path> {
     ensure!(path.is_absolute(), "fleet output must be absolute");
     let parent = path.parent().context("fleet output has no parent")?;
     let meta = fs::symlink_metadata(parent)?;
     ensure!(
-        meta.is_dir() && meta.uid() == 0 && meta.mode() & 0o077 == 0,
+        meta.is_dir()
+            && parent.canonicalize()? == parent
+            && meta.uid() == 0
+            && meta.mode() & 0o077 == 0,
         "fleet output directory must be root-owned and owner-only"
     );
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!("fleet output already exists"),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(parent)
+}
+
+pub(super) fn persist(path: &Path, value: &Value) -> Result<()> {
+    // Repeat the preflight at publication; no-clobber rename remains the final
+    // race-safe boundary if another writer appears after this check.
+    let parent = validate_output_destination(path)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(temporary.as_file_mut(), value)?;
     temporary.as_file_mut().write_all(b"\n")?;
@@ -396,6 +411,10 @@ pub(super) async fn run() -> Result<()> {
         "fleet plan must be a root-owned non-writable regular file"
     );
     let plan: Plan = serde_json::from_value(bound_json(&plan_bound)?)?;
+    // Fail before any service census or remote inventory when the final receipt
+    // cannot be published. In particular, a missing parent must not spend a
+    // complete campaign inventory before discovering this local setup error.
+    validate_output_destination(&plan.output)?;
     ensure!(
         plan.schema == "jetstreamer-horizon-campaign-fleet-plan-v1",
         "unsupported fleet plan"
@@ -881,5 +900,30 @@ mod tests {
         persist(&path, &json!({"test":1})).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o077, 0);
         assert!(persist(&path, &json!({"test":2})).is_err());
+    }
+
+    #[test]
+    fn output_preflight_rejects_missing_unsafe_and_occupied_destinations() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("fleet.json");
+        assert!(validate_output_destination(&path).is_ok());
+        assert!(validate_output_destination(&root.path().join("missing/fleet.json")).is_err());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(validate_output_destination(&path).is_err());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&path, b"retained receipt").unwrap();
+        assert!(validate_output_destination(&path).is_err());
+        let link = root.path().join("dangling.json");
+        symlink(root.path().join("absent"), &link).unwrap();
+        assert!(validate_output_destination(&link).is_err());
+        let parent_link = root.path().join("alias");
+        symlink(root.path(), &parent_link).unwrap();
+        assert!(validate_output_destination(&parent_link.join("new.json")).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"retained receipt");
     }
 }
