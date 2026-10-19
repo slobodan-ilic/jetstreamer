@@ -339,40 +339,42 @@ fn execute(plan_path: &Path, plan_sha: &str, self_sha: &str) -> Result<(), Strin
         "fresh free-space admission failed",
     )?;
     let before = cgroup_metrics(&cgroup)?;
+    let before_failure = before.clone();
     let started = Instant::now();
-    let mut client = HistoricalRuntimeClient::spawn(
-        SOLANA_V1_6_20_CANDIDATE,
-        WorkerSpawn {
-            executable: plan.worker.clone(),
-            initialization: HistoricalInitialization::SnapshotArchive(SnapshotInitialization {
-                ledger_path: plan.ledger_directory.clone(),
-                archive_path: plan.snapshot.clone(),
-                expected_slot: SLOT,
-                expected_accounts_hash: Hash::from_str(ACCOUNTS)
-                    .map_err(|e| e.to_string())?
-                    .to_bytes(),
-                expected_archive_sha256: Some(digest(SNAPSHOT)?),
-                expected_archive_size: Some(SNAPSHOT_SIZE),
-                scratch_parent: Some(plan.scratch_directory.clone()),
-            }),
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    require(
-        client.executable_sha256() == digest(WORKER)?,
-        "executed worker mismatch",
-    )?;
-    let initial_cursor = client.initialized().next_write_version;
-    let checkpoint = client.freeze_checkpoint(SLOT).map_err(|e| e.to_string())?;
-    validate_checkpoint(&checkpoint, initial_cursor)?;
-    // The child has no replay entries and waits on IPC. Capture before shutdown
-    // can retire its temporary AccountsDb. No pause/replay authority is added.
-    let scratch = scratch_metrics(&plan.scratch_directory)?;
-    let loaded = cgroup_metrics(&cgroup)?;
-    let restore_millis = started.elapsed().as_millis();
-    client.shutdown().map_err(|e| e.to_string())?;
-    bound_bytes(&genesis, GENESIS, 10 << 20, true)?;
-    let receipt = json!({"schema":"jetstreamer-private-epoch225-bootstrap-resource-v1",
+    let outcome = (|| -> Result<serde_json::Value, String> {
+        let mut client = HistoricalRuntimeClient::spawn(
+            SOLANA_V1_6_20_CANDIDATE,
+            WorkerSpawn {
+                executable: plan.worker.clone(),
+                initialization: HistoricalInitialization::SnapshotArchive(SnapshotInitialization {
+                    ledger_path: plan.ledger_directory.clone(),
+                    archive_path: plan.snapshot.clone(),
+                    expected_slot: SLOT,
+                    expected_accounts_hash: Hash::from_str(ACCOUNTS)
+                        .map_err(|e| e.to_string())?
+                        .to_bytes(),
+                    expected_archive_sha256: Some(digest(SNAPSHOT)?),
+                    expected_archive_size: Some(SNAPSHOT_SIZE),
+                    scratch_parent: Some(plan.scratch_directory.clone()),
+                }),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        require(
+            client.executable_sha256() == digest(WORKER)?,
+            "executed worker mismatch",
+        )?;
+        let initial_cursor = client.initialized().next_write_version;
+        let checkpoint = client.freeze_checkpoint(SLOT).map_err(|e| e.to_string())?;
+        validate_checkpoint(&checkpoint, initial_cursor)?;
+        // The child has no replay entries and waits on IPC. Capture before shutdown
+        // can retire its temporary AccountsDb. No pause/replay authority is added.
+        let scratch = scratch_metrics(&plan.scratch_directory)?;
+        let loaded = cgroup_metrics(&cgroup)?;
+        let restore_millis = started.elapsed().as_millis();
+        client.shutdown().map_err(|e| e.to_string())?;
+        bound_bytes(&genesis, GENESIS, 10 << 20, true)?;
+        let receipt = json!({"schema":"jetstreamer-private-epoch225-bootstrap-resource-v1",
         "recorded_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e|e.to_string())?.as_secs(),
         "unit":plan.unit,"invocation_id":invocation,"probe_sha256":self_sha,
         "plan":{"path":plan_path,"sha256":plan_sha},"worker":{"path":plan.worker,"sha256":WORKER},
@@ -391,26 +393,57 @@ fn execute(plan_path: &Path, plan_sha: &str, self_sha: &str) -> Result<(), Strin
         "authority":{"ordinary_replay_authorized":false,"canonical_sidecar_authorized":false,
             "runtime_promotion_authorized":false,"publication_authorized":false,
             "local_retirement_authorized":false,"remote_mutations":false,"r2_mutations":false}});
-    let mut bytes = serde_json::to_vec_pretty(&receipt).map_err(|e| e.to_string())?;
+        Ok(receipt)
+    })();
+    let receipt = match outcome {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            // Capture counters while this persistent parent/cgroup still
+            // exists. Never give a failed restore the success receipt name.
+            let failure = json!({"schema":"jetstreamer-private-epoch225-bootstrap-resource-failure-v1",
+                "unit":plan.unit,"invocation_id":invocation,"probe_sha256":self_sha,
+                "plan":{"path":plan_path,"sha256":plan_sha},"error":error,
+                "elapsed_millis":started.elapsed().as_millis(),"before":before_failure,
+                "after_failure":cgroup_metrics(&cgroup).map_err(|e|e.to_string()),
+                "scratch_after_child_cleanup":scratch_metrics(&plan.scratch_directory).map_err(|e|e.to_string()),
+                "ordinary_replay_authorized":false,"full_cold_epoch_peak_qualified":false,
+                "publication_authorized":false,"remote_mutations":false,"r2_mutations":false});
+            if let Err(preserve_error) = write_receipt(
+                &plan.output.parent().unwrap().join("failure.json"),
+                &failure,
+            ) {
+                return Err(format!(
+                    "{error}; failure receipt could not be preserved: {preserve_error}"
+                ));
+            }
+            return Err(error);
+        }
+    };
+    write_receipt(&plan.output, &receipt)?;
+    println!(
+        "private225bootstrap resource measurement passed: {}",
+        plan.output.display()
+    );
+    Ok(())
+}
+
+fn write_receipt(path: &Path, receipt: &serde_json::Value) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec_pretty(receipt).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o400)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&plan.output)
+        .open(path)
         .map_err(|e| e.to_string())?;
     output
         .write_all(&bytes)
         .and_then(|_| output.sync_all())
         .map_err(|e| e.to_string())?;
-    File::open(plan.output.parent().unwrap())
+    File::open(path.parent().ok_or("receipt parent missing")?)
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())?;
-    println!(
-        "private225bootstrap resource measurement passed: {}",
-        plan.output.display()
-    );
     Ok(())
 }
 fn main() {
@@ -428,6 +461,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failure_evidence_is_private_and_never_clobbered() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("failure.json");
+        let value = json!({"publication_authorized":false,"full_cold_epoch_peak_qualified":false});
+        write_receipt(&path, &value).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o400);
+        assert!(write_receipt(&path, &json!({"changed":true})).is_err());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap(),
+            value
+        );
+    }
     #[test]
     fn plan_cannot_expand_scope_or_reduce_reserve() {
         let root = PathBuf::from("/home/ubuntu/.jetstreamer-private/bootstrap-resource-225-test");

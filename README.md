@@ -704,6 +704,8 @@ It sends no replay entries and captures cgroup and scratch measurements before w
 Fresh whole-host admission and a proven invocation-bound guard remain mandatory. Success checks
 the snapshot's accounts commitment and frozen-slot shape, not an external Bank hash or a complete
 cold-epoch peak; it grants no replay, runtime promotion, canonical sidecar or publication authority.
+If restoration or measurement fails while the parent is alive, it captures private cgroup and
+cleanup diagnostics in a separate no-clobber `failure.json`; that never substitutes for success.
 
 The dedicated `epoch213-checkpoint-continuation-diagnostic` node build exposes only the private
 epoch-213 continuation experiment. Invoke it with `213 /PRIVATE_RUN_ROOT/ledger --verify
