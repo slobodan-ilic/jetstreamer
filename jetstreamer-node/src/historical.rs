@@ -4637,6 +4637,7 @@ mod tests {
             .unwrap();
         let child_id = child.id();
         let stdin = child.stdin.take().unwrap();
+        let input_fd = std::os::fd::AsRawFd::as_raw_fd(&stdin);
         let stdout = child.stdout.take().unwrap();
         let transport = IpcTransport::spawn(stdin, stdout).unwrap();
         let mut client = HistoricalRuntimeClient {
@@ -4668,6 +4669,23 @@ mod tests {
             closed: false,
         };
         let status = client.child.as_mut().unwrap().wait().unwrap();
+        // Parallel test spawns can briefly inherit the pipe's read end across
+        // fork until exec closes it. Reaping our worker alone does not prove
+        // that a write must fail yet. Wait for the kernel's no-reader state
+        // before testing the BrokenPipe diagnostic, rather than racing EOF.
+        let mut readiness = libc::pollfd {
+            fd: input_fd,
+            events: 0,
+            revents: 0,
+        };
+        // SAFETY: the transport still owns this open descriptor and waits for
+        // its first call. poll receives one initialized writable pollfd.
+        let ready = unsafe { libc::poll(&mut readiness, 1, 2000) };
+        assert!(
+            ready == 1 && readiness.revents & libc::POLLERR != 0,
+            "exited-worker fixture still has a pipe reader: ready={ready}, events={}",
+            readiness.revents
+        );
         (client, child_id, status)
     }
 
@@ -4889,17 +4907,20 @@ mod tests {
         assert_eq!(expected_status.signal(), Some(libc::SIGTERM));
 
         let error = client.ping().unwrap_err();
-        assert!(matches!(
-            error,
-            HistoricalRuntimeError::WriteAfterExit {
-                operation: "ping",
-                request_id: 1,
-                status,
-                source,
-            } if status == expected_status
-                && status.signal() == Some(libc::SIGTERM)
-                && source.kind() == io::ErrorKind::BrokenPipe
-        ));
+        assert!(
+            matches!(
+                &error,
+                HistoricalRuntimeError::WriteAfterExit {
+                    operation: "ping",
+                    request_id: 1,
+                    status,
+                    source,
+                } if *status == expected_status
+                    && status.signal() == Some(libc::SIGTERM)
+                    && source.kind() == io::ErrorKind::BrokenPipe
+            ),
+            "unexpected exited-worker diagnostic: {error:?}"
+        );
         assert_client_poisoned_and_worker_reaped(&mut client, child_id);
     }
 
