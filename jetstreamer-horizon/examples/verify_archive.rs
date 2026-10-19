@@ -25,11 +25,14 @@
 //! verifies all within-archive structure and PoH while the former independently
 //! proves the boundaries that individual jobs cannot share.
 
-use std::io::{BufReader, Cursor};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Cursor, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use jetstreamer_horizon::account_updates::AccountUpdateView;
 use jetstreamer_horizon::archive::{
@@ -38,6 +41,7 @@ use jetstreamer_horizon::archive::{
 };
 use jetstreamer_horizon::block_metas::BlockMeta;
 use jetstreamer_horizon::transactions::Transaction;
+use sha2::{Digest, Sha256};
 use solana_address::Address;
 use solana_hash::Hash;
 
@@ -1039,6 +1043,9 @@ fn usage() -> ! {
         "       verify_archive --chain <path>... [--segment] [--full] [--anchor SLOT HASH] [--threads N]"
     );
     eprintln!("       verify_archive --capacity-probe");
+    eprintln!(
+        "       verify_archive --capacity-probe --receipt PATH --source-commit HEX --self-sha256 HEX --producer-node-sha256 HEX --producer-worker-sha256 HEX --producer-manifest-sha256 HEX --producer-manifest-fingerprint sha256:HEX"
+    );
     eprintln!("  --full              recompute every block's PoH hash");
     eprintln!(
         "  --internal-full     with --full, verify all within-archive invariants without requiring an external boundary anchor; requires a separate successful --chain pass"
@@ -1114,6 +1121,157 @@ fn run_capacity_probe() -> i32 {
     }
     println!("CAPACITY PROBE OK: decoded {OBSERVED_PRE_UPDATES} pre updates (old limit 131072)");
     0
+}
+
+fn require_hex(value: &str, lengths: &[usize], name: &str) -> Result<(), String> {
+    if !lengths.contains(&value.len())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{name} must be canonical lowercase hex"));
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn option_value(args: &[String], name: &str) -> Result<String, String> {
+    let index = args
+        .iter()
+        .position(|argument| argument == name)
+        .ok_or_else(|| format!("missing {name}"))?;
+    args.get(index + 1)
+        .cloned()
+        .ok_or_else(|| format!("missing value for {name}"))
+}
+
+fn write_capacity_probe_receipt(args: &[String]) -> Result<(), String> {
+    const OBSERVED_PRE_UPDATES: u64 = 131_073;
+    const OLD_INLINE_LIMIT: u64 = 131_072;
+    const PROBE_SLOT: u64 = 88_560_000;
+    const OUTPUT: &str = "CAPACITY PROBE OK: decoded 131073 pre updates (old limit 131072)";
+
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("capacity-probe receipt must be written as root".to_owned());
+    }
+    let receipt = PathBuf::from(option_value(args, "--receipt")?);
+    if !receipt.is_absolute() {
+        return Err("--receipt must be absolute".to_owned());
+    }
+    let source_commit = option_value(args, "--source-commit")?;
+    let expected_self_sha256 = option_value(args, "--self-sha256")?;
+    let producer_node_sha256 = option_value(args, "--producer-node-sha256")?;
+    let producer_worker_sha256 = option_value(args, "--producer-worker-sha256")?;
+    let producer_manifest_sha256 = option_value(args, "--producer-manifest-sha256")?;
+    let producer_manifest_fingerprint = option_value(args, "--producer-manifest-fingerprint")?;
+    require_hex(&source_commit, &[40, 64], "--source-commit")?;
+    for (name, value) in [
+        ("--self-sha256", expected_self_sha256.as_str()),
+        ("--producer-node-sha256", producer_node_sha256.as_str()),
+        ("--producer-worker-sha256", producer_worker_sha256.as_str()),
+        (
+            "--producer-manifest-sha256",
+            producer_manifest_sha256.as_str(),
+        ),
+    ] {
+        require_hex(value, &[64], name)?;
+    }
+    let fingerprint_hex = producer_manifest_fingerprint
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "--producer-manifest-fingerprint must start with sha256:".to_owned())?;
+    require_hex(fingerprint_hex, &[64], "--producer-manifest-fingerprint")?;
+
+    let executable =
+        std::env::current_exe().map_err(|error| format!("resolve current executable: {error}"))?;
+    let actual_self_sha256 = sha256_file(&executable)?;
+    if actual_self_sha256 != expected_self_sha256 {
+        return Err(format!(
+            "running verifier SHA-256 mismatch: expected {expected_self_sha256}, got {actual_self_sha256}"
+        ));
+    }
+    let parent = receipt
+        .parent()
+        .ok_or_else(|| "receipt has no parent".to_owned())?;
+    let parent_metadata = parent
+        .metadata()
+        .map_err(|error| format!("stat receipt parent {}: {error}", parent.display()))?;
+    if !parent_metadata.is_dir() || parent_metadata.uid() != 0 {
+        return Err("receipt parent must be a root-owned directory".to_owned());
+    }
+
+    let recorded_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system time before Unix epoch: {error}"))?
+        .as_secs();
+    let document = serde_json::json!({
+        "schema": "jetstreamer-horizon-verifier-capacity-probe-v1",
+        "recorded_unix_seconds": recorded_unix_seconds,
+        "source_commit": source_commit,
+        "verifier_path": executable,
+        "verifier_sha256": actual_self_sha256,
+        "probe": {
+            "slot": PROBE_SLOT,
+            "phase": "pre-account-updates",
+            "decoded_records": OBSERVED_PRE_UPDATES,
+            "old_inline_limit": OLD_INLINE_LIMIT,
+            "output": OUTPUT,
+            "result": "pass"
+        },
+        "producer": {
+            "node_sha256": producer_node_sha256,
+            "worker_sha256": producer_worker_sha256,
+            "manifest_sha256": producer_manifest_sha256,
+            "manifest_fingerprint": producer_manifest_fingerprint
+        },
+        "authority": {
+            "production_archive_reread_authorized": false,
+            "replay_launch_authorized": false,
+            "publication_authorized": false,
+            "remote_mutations": false,
+            "r2_mutations": false
+        }
+    });
+    let mut bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|error| format!("serialize receipt: {error}"))?;
+    bytes.push(b'\n');
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&receipt)
+        .map_err(|error| format!("create receipt {}: {error}", receipt.display()))?;
+    output
+        .write_all(&bytes)
+        .map_err(|error| format!("write receipt {}: {error}", receipt.display()))?;
+    output
+        .sync_all()
+        .map_err(|error| format!("fsync receipt {}: {error}", receipt.display()))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("fsync receipt parent {}: {error}", parent.display()))?;
+    let metadata = receipt
+        .metadata()
+        .map_err(|error| format!("stat receipt {}: {error}", receipt.display()))?;
+    if metadata.uid() != 0 || metadata.mode() & 0o777 != 0o600 || metadata.nlink() != 1 {
+        return Err("receipt ownership, mode, or link count changed after fsync".to_owned());
+    }
+    println!("CAPACITY PROBE RECEIPT: {}", receipt.display());
+    Ok(())
 }
 
 fn parse_anchor(args: &[String], index: &mut usize) -> ChainPoint {
@@ -1217,8 +1375,15 @@ fn main() {
     if args.is_empty() {
         usage();
     }
-    if args.as_slice() == ["--capacity-probe"] {
-        std::process::exit(run_capacity_probe());
+    if args.first().map(String::as_str) == Some("--capacity-probe") {
+        let result = run_capacity_probe();
+        if result == 0 && args.len() > 1 {
+            if let Err(error) = write_capacity_probe_receipt(&args[1..]) {
+                eprintln!("CAPACITY PROBE RECEIPT FAIL: {error}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(result);
     }
     let mut full = false;
     let mut internal_full = false;

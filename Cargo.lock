@@ -4812,6 +4812,7 @@ dependencies = [
  "futures-util",
  "jetstreamer-firehose",
  "lencode",
+ "libc",
  "lz4",
  "once_cell",
  "rayon",
