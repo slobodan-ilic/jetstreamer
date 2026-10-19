@@ -50,19 +50,36 @@ struct Plan {
 }
 
 fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Result<()> {
+    let continuation =
+        receipt["schema"] == "jetstreamer-private-epoch213-checkpoint-continuation-launch-v1";
     ensure!(
-        receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1"
+        (continuation
+            || receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1")
             && receipt["launched"] == true
             && receipt["remote_mutations"] == false
             && receipt["r2_mutations"] == false,
         "invalid diagnostic launch receipt"
     );
-    ensure!(
+    let scope_valid = if continuation {
+        claim.epoch == 213
+            && claim
+                .unit
+                .starts_with("horizon-qualify-213-checkpoint-continuation-")
+            && claim.unit.ends_with(".service")
+            && receipt["epoch"] == 213
+            && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+            && receipt["replay_slot_start"] == 92_447_543u64
+            && receipt["replay_slot_end_inclusive"] == 92_447_999u64
+            && receipt["canonical_sidecar_authorized"] == false
+            && receipt["publication_authorized"] == false
+    } else {
         claim
             .unit
             .starts_with(&format!("horizon-perf-epoch{}-", claim.epoch))
             && claim.unit.contains('@')
-            && claim.scratch_path.is_absolute(),
+    };
+    ensure!(
+        scope_valid && claim.scratch_path.is_absolute(),
         "diagnostic scope or scratch binding is invalid"
     );
     let matching: Vec<_> = receipt["evidence"]["units"]
@@ -480,7 +497,7 @@ pub(super) async fn run() -> Result<()> {
             active.push(json!({"epoch":claim.epoch,"phase":"diagnostic-qualification","producer":current,
                 "scratch_path":claim.scratch_path,"launch_receipt":claim.launch_receipt.path,
                 "launch_receipt_sha256":claim.launch_receipt.sha256,"sampled_at_utc":sample,
-                "resource_basis":"bounded runner captures invocation-bound in-run cgroup and target-stop metrics",
+                "resource_basis":"hash-bound private diagnostic launch and invocation identity; consult bound admission, guard and terminal evidence",
                 "ordinary_replay_claim":false,"current_sidecar_eta_valid":false}));
         }
         diagnostics.push(json!({"epoch":claim.epoch,"unit":current,"live":is_active,
@@ -503,6 +520,12 @@ pub(super) async fn run() -> Result<()> {
         let gate = &plan.gates[&epoch];
         let mut state = gate.state.as_str();
         let mut next = gate.next_action.as_str();
+        if diagnostics
+            .iter()
+            .any(|claim| claim["epoch"] == epoch && claim["live"] == true)
+        {
+            state = "blocked-qualification";
+        }
         let mut live = None;
         for replay in replays {
             let range = parse_observer_claim_range(observer_string(replay, &["range"])?)?;
@@ -580,6 +603,48 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn private_continuation_is_exact_scoped_and_never_publication_authority() {
+        let mut claim = DiagnosticClaim {
+            epoch: 213,
+            unit: "horizon-qualify-213-checkpoint-continuation-test-v1.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/private/continuation-213".into(),
+            launch_receipt: BoundFile {
+                path: "/private/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let receipt = json!({"schema":"jetstreamer-private-epoch213-checkpoint-continuation-launch-v1",
+            "launched":true,"epoch":213,"remote_mutations":false,"r2_mutations":false,
+            "private_run_root":claim.scratch_path,"replay_slot_start":92447543u64,
+            "replay_slot_end_inclusive":92447999u64,"canonical_sidecar_authorized":false,
+            "publication_authorized":false,
+            "evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,
+                "restarts":0,"load_state":"loaded","result":"success","main_pid":1,
+                "active_state":"active","sub_state":"running"}]}});
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        for (field, value) in [
+            ("epoch", json!(214)),
+            ("private_run_root", json!("/another/root")),
+            ("replay_slot_start", json!(92447542u64)),
+            ("replay_slot_end_inclusive", json!(92448000u64)),
+            ("canonical_sidecar_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+            ("remote_mutations", json!(true)),
+            ("r2_mutations", json!(true)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[field] = value;
+            assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{field}");
+        }
+        let mut bad = receipt.clone();
+        bad["evidence"]["units"][0]["restarts"] = json!(1);
+        assert!(validate_diagnostic_launch(&bad, &claim).is_err());
+        claim.epoch = 214;
+        assert!(validate_diagnostic_launch(&receipt, &claim).is_err());
+    }
+
     #[test]
     fn diagnostic_launch_binds_epoch_unit_and_exact_zero_restart_invocation() {
         let mut claim = DiagnosticClaim {
