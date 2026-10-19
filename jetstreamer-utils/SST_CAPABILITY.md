@@ -50,3 +50,19 @@ Even correctly resolved shred records remain diagnostic inputs until the exact
 pinned historical layout, complete ordered entry/tick chain, independently
 finalized parent and final PoH hashes, and ordinary checkpoint/plugin/publication
 gates have all passed. Do not equate PoH hashes with Bank or SlotHashes hashes.
+
+`horizon_legacy_shred::assemble_v1_4_25_padded_batches` provides bounded,
+diagnostic-only data-shred assembly for revision
+`893cc7647248a3536fb6e6d0b5e51c71446b862d`. It requires a complete contiguous
+slot starting at shred zero, the independently resolved SlotMeta last index,
+consistent parent/version metadata and the last-in-slot flag. Missing/coding
+shards, ordering errors and oversized output fail closed; there is no FEC repair.
+
+The pinned `Shredder::deshred` concatenates payload bytes 88 through 1138 of
+every 1228-byte data shred, including padding. It does **not** clip each fragment
+to `DataShredHeader.size`. The unit tests encode the fixed-int header layout and
+protect this historical behavior, batch boundaries and allocation/identity gates.
+They are not an upstream-runtime differential or real-ledger qualification.
+Entry-vector decoding, padding checks, complete tick/PoH verification and all
+canonical boundary gates still follow; no source completeness, runtime route,
+publication or R2 authority is conferred by assembled bytes.

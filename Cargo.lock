@@ -4978,6 +4978,7 @@ name = "jetstreamer-utils"
 version = "0.9.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "bs58",
  "ctrlc",
  "libc",
