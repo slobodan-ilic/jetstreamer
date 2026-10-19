@@ -328,7 +328,9 @@ fn validate_plan(plan: &Plan) -> Result<()> {
     for item in bound_evidence(plan) {
         ensure!(
             item.path.is_absolute()
-                && item.path.starts_with(&plan.private_root)
+                && (item.path.starts_with(&plan.private_root)
+                    || (plan.restore_only_probe
+                        && item.path.starts_with(Path::new("/var/lib/jetstreamer"))))
                 && valid_sha256(&item.sha256),
             "invalid evidence binding"
         );
@@ -1034,6 +1036,24 @@ mod tests {
         let mut plan = restore_plan();
         plan.run_root = plan.private_root.join("production-213-singleton");
         plan.targets = vec![plan.run_root.join("scratch")];
+        assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn sealed_restore_evidence_may_live_in_the_root_deployment_tree() {
+        let mut plan = restore_plan();
+        plan.outcome.path = "/var/lib/jetstreamer/restore-evidence/outcome.json".into();
+        validate_plan(&plan).unwrap();
+        plan.outcome.path = "/tmp/restore-evidence/outcome.json".into();
+        assert!(validate_plan(&plan).is_err());
+        plan.restore_only_probe = false;
+        plan.guard_stop_intent = None;
+        plan.guard_stop_completion = None;
+        plan.targets = vec![
+            plan.run_root.join("output/compact-indexes"),
+            plan.run_root.join("replay-state"),
+        ];
+        plan.outcome.path = "/var/lib/jetstreamer/restore-evidence/outcome.json".into();
         assert!(validate_plan(&plan).is_err());
     }
 
