@@ -18,13 +18,18 @@ use {
 
 const PLAN_SCHEMA_V1: &str = "jetstreamer-focused-package-attestation-plan-v1";
 const PLAN_SCHEMA_V2: &str = "jetstreamer-focused-package-attestation-plan-v2";
+const PLAN_SCHEMA_V3: &str = "jetstreamer-focused-package-attestation-plan-v3";
 const RECEIPT_SCHEMA: &str = "jetstreamer-private-configured-immutable-complete-span-package-v1";
+const RECEIPT_SCHEMA_V2: &str = "jetstreamer-private-configured-immutable-complete-span-package-v2";
 const CAPABILITY_RECEIPT_SCHEMA: &str = "jetstreamer-private-focused-package-capability-v1";
 const DEPLOYMENT_RECEIPT_SCHEMA: &str = "jetstreamer-sealed-deployment-receipt-v1";
 const MANIFEST_SCHEMA: &str = "jetstreamer-private-focused-qualification-deployment-v5";
+const CENTURY_FLOOR_SCHEMA: &str = "jetstreamer-horizon-century-jet-floor-v2";
+const R2_RECEIPT_SCHEMA: &str = "jetstreamer-horizon-r2-receipt-v1";
+const HORIZON_R2_BUCKET: &str = "solana-archive-with-accounts-data";
 const MAX_PLAN_BYTES: u64 = 1024 * 1024;
 const MAX_JSON_BYTES: u64 = 4 * 1024 * 1024;
-const MINIMUM_FREE_BYTES: u64 = 4_700_000_000_000;
+const LEGACY_MINIMUM_FREE_BYTES: u64 = 4_700_000_000_000;
 const EPOCH_SLOTS: u64 = 432_000;
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +54,10 @@ struct Plan {
     capability_receipt: Option<PathBuf>,
     #[serde(default)]
     capability_receipt_sha256: Option<String>,
+    #[serde(default)]
+    century_floor_evidence: Option<PathBuf>,
+    #[serde(default)]
+    century_floor_evidence_sha256: Option<String>,
 }
 
 #[derive(Debug)]
@@ -213,6 +222,74 @@ struct ResourceCheck {
     filesystem_free_bytes: u64,
     minimum_free_bytes: u64,
     passed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    century_floor_evidence: Option<CenturyFloorEvidenceReceipt>,
+}
+
+#[derive(Debug, Serialize)]
+struct CenturyFloorEvidenceReceipt {
+    path: String,
+    sha256: String,
+    first_epoch: u64,
+    last_epoch: u64,
+    sample_count: u64,
+    sum_jet_size_bytes: u64,
+    floor_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CenturyFloorEvidence {
+    schema: String,
+    century: Century,
+    samples: Vec<CenturyFloorSample>,
+    arithmetic: CenturyFloorArithmetic,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Century {
+    first_epoch: u64,
+    last_epoch: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CenturyFloorSample {
+    epoch: u64,
+    jet_size_bytes: u64,
+    archive_sha256: String,
+    r2_receipt_name: String,
+    r2_receipt_sha256: String,
+    full_receipt_name: String,
+    full_receipt_sha256: String,
+    plugin_receipt_name: String,
+    plugin_receipt_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CenturyFloorArithmetic {
+    sample_count: u64,
+    sum_jet_size_bytes: u64,
+    floor_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct R2Receipt {
+    schema: String,
+    bucket: String,
+    epoch: u64,
+    archive_key: String,
+    checksum_key: String,
+    archive_length: u64,
+    archive_sha256: String,
+    archive_etag: String,
+    r2_composite_sha256: Option<String>,
+    remote_sha256_readback: bool,
+    multipart_part_size: u64,
+    verified_unix_seconds: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -396,6 +473,222 @@ fn parse_sha256sums(path: &Path) -> Result<BTreeMap<String, String>> {
     Ok(entries)
 }
 
+fn safe_member_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && name != "." && name != ".."
+}
+
+fn validate_attester_bundle(directory: &Path) -> Result<BTreeMap<String, FileIdentity>> {
+    ensure!(
+        directory.canonicalize()? == directory,
+        "attester deployment path is not exact"
+    );
+    let directory_metadata = fs::symlink_metadata(directory)?;
+    ensure!(
+        directory_metadata.is_dir()
+            && directory_metadata.uid() == 0
+            && directory_metadata.gid() == 0
+            && directory_metadata.mode() & 0o7777 == 0o555,
+        "attester deployment identity or mode mismatch"
+    );
+
+    let sums_path = directory.join("SHA256SUMS");
+    let sums_identity = exact_file(&sums_path, 0, true)?;
+    let sums = parse_sha256sums(&sums_path)?;
+    let actual_names: BTreeSet<String> = fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    let mut expected_names: BTreeSet<String> = sums.keys().cloned().collect();
+    expected_names.insert("SHA256SUMS".to_string());
+    ensure!(
+        actual_names == expected_names,
+        "attester deployment member set does not match SHA256SUMS"
+    );
+
+    let mut members = BTreeMap::new();
+    members.insert("SHA256SUMS".to_string(), sums_identity);
+    for (name, expected_sha256) in &sums {
+        let identity = exact_file(&directory.join(name), 0, true)?;
+        ensure!(
+            identity.sha256 == *expected_sha256,
+            "attester deployment member hash mismatch: {name}"
+        );
+        members.insert(name.clone(), identity);
+    }
+
+    let receipt: DeploymentReceipt = read_json(&directory.join("deployment-seal-receipt.json"))?;
+    ensure!(
+        receipt.schema == DEPLOYMENT_RECEIPT_SCHEMA,
+        "attester deployment receipt schema mismatch"
+    );
+    ensure!(
+        receipt.destination == directory.to_string_lossy(),
+        "attester deployment receipt destination mismatch"
+    );
+    ensure!(
+        !receipt.publication_authorized
+            && !receipt.replay_launch_authorized
+            && !receipt.remote_mutations
+            && !receipt.r2_mutations,
+        "attester deployment receipt grants unexpected authority"
+    );
+    let mut receipt_names = BTreeSet::new();
+    for member in &receipt.members {
+        ensure!(
+            receipt_names.insert(member.name.clone()),
+            "duplicate attester deployment receipt member"
+        );
+        let actual = members
+            .get(&member.name)
+            .with_context(|| format!("attester deployment member absent: {}", member.name))?;
+        ensure!(
+            actual.sha256 == member.sha256
+                && actual.bytes == member.bytes
+                && actual.mode == member.mode,
+            "attester deployment receipt member mismatch: {}",
+            member.name
+        );
+    }
+    let expected_receipt_names: BTreeSet<_> = members
+        .keys()
+        .filter(|name| !matches!(name.as_str(), "SHA256SUMS" | "deployment-seal-receipt.json"))
+        .cloned()
+        .collect();
+    ensure!(
+        receipt_names == expected_receipt_names,
+        "attester deployment receipt member set mismatch"
+    );
+    Ok(members)
+}
+
+fn validate_century_floor_document(evidence: &CenturyFloorEvidence) -> Result<(u64, u64, u64)> {
+    ensure!(
+        evidence.schema == CENTURY_FLOOR_SCHEMA,
+        "century-floor evidence schema mismatch"
+    );
+    ensure!(
+        evidence.century.first_epoch == 200 && evidence.century.last_epoch == 300,
+        "century-floor range mismatch"
+    );
+    ensure!(!evidence.samples.is_empty(), "empty century-floor census");
+
+    let mut prior_epoch = None;
+    let mut sum = 0u128;
+    let mut receipt_names = BTreeSet::new();
+    for sample in &evidence.samples {
+        ensure!(
+            (evidence.century.first_epoch..=evidence.century.last_epoch).contains(&sample.epoch),
+            "century-floor sample epoch outside century"
+        );
+        if let Some(prior) = prior_epoch {
+            ensure!(
+                sample.epoch > prior,
+                "century-floor sample epochs are duplicate or unsorted"
+            );
+        }
+        prior_epoch = Some(sample.epoch);
+        ensure!(
+            sample.jet_size_bytes > 0,
+            "zero-length century-floor sample"
+        );
+        ensure!(
+            is_sha256(&sample.archive_sha256)
+                && is_sha256(&sample.r2_receipt_sha256)
+                && is_sha256(&sample.full_receipt_sha256)
+                && is_sha256(&sample.plugin_receipt_sha256),
+            "invalid century-floor sample SHA-256"
+        );
+        for name in [
+            &sample.r2_receipt_name,
+            &sample.full_receipt_name,
+            &sample.plugin_receipt_name,
+        ] {
+            ensure!(safe_member_name(name), "unsafe century-floor receipt name");
+            ensure!(
+                receipt_names.insert(name.clone()),
+                "duplicate century-floor receipt member"
+            );
+        }
+        sum = sum
+            .checked_add(sample.jet_size_bytes as u128)
+            .context("century-floor sum overflow")?;
+    }
+
+    let count = u64::try_from(evidence.samples.len()).context("century-floor count overflow")?;
+    let numerator = sum
+        .checked_mul(2)
+        .context("century-floor multiply overflow")?;
+    let floor = numerator
+        .checked_add(count as u128 - 1)
+        .context("century-floor rounding overflow")?
+        / count as u128;
+    let sum_u64 = u64::try_from(sum).context("century-floor sum exceeds u64")?;
+    let floor_u64 = u64::try_from(floor).context("century-floor result exceeds u64")?;
+    ensure!(
+        evidence.arithmetic.sample_count == count
+            && evidence.arithmetic.sum_jet_size_bytes == sum_u64
+            && evidence.arithmetic.floor_bytes == floor_u64,
+        "century-floor arithmetic mismatch"
+    );
+    Ok((count, sum_u64, floor_u64))
+}
+
+fn validate_r2_receipt(sample: &CenturyFloorSample, receipt: &R2Receipt) -> Result<()> {
+    ensure!(
+        receipt.schema == R2_RECEIPT_SCHEMA,
+        "R2 receipt schema mismatch"
+    );
+    ensure!(
+        receipt.bucket == HORIZON_R2_BUCKET,
+        "R2 receipt bucket mismatch"
+    );
+    ensure!(receipt.epoch == sample.epoch, "R2 receipt epoch mismatch");
+    ensure!(
+        receipt.archive_key == format!("epoch-{}.jet", sample.epoch)
+            && receipt.checksum_key == format!("epoch-{}.jet.sha256", sample.epoch),
+        "R2 receipt object key mismatch"
+    );
+    ensure!(
+        receipt.archive_length == sample.jet_size_bytes,
+        "R2 receipt archive length mismatch"
+    );
+    ensure!(
+        receipt.archive_sha256 == sample.archive_sha256,
+        "R2 receipt archive SHA-256 mismatch"
+    );
+    ensure!(
+        !receipt.archive_etag.is_empty()
+            && receipt.multipart_part_size > 0
+            && receipt.verified_unix_seconds > 0,
+        "R2 receipt lacks durable object evidence"
+    );
+    ensure!(
+        receipt.remote_sha256_readback,
+        "R2 receipt lacks authenticated whole-object readback"
+    );
+    if let Some(composite) = receipt.r2_composite_sha256.as_deref() {
+        ensure!(is_sha256(composite), "invalid R2 composite SHA-256");
+    }
+    Ok(())
+}
+
+fn validate_text_receipt(bytes: &[u8], expected_archive_sha256: &str) -> Result<()> {
+    let text = std::str::from_utf8(bytes).context("receipt is not UTF-8")?;
+    let fields: Vec<_> = text.split_whitespace().collect();
+    ensure!(
+        fields.len() == 3,
+        "receipt must contain exactly three digests"
+    );
+    ensure!(
+        fields.iter().all(|field| is_sha256(field)),
+        "invalid receipt digest"
+    );
+    ensure!(
+        fields[0] == expected_archive_sha256,
+        "receipt archive SHA-256 mismatch"
+    );
+    Ok(())
+}
+
 fn validate_receipt_path(path: &Path, epoch: u64) -> Result<()> {
     ensure!(
         path.parent()
@@ -438,7 +731,10 @@ fn canonical_package_path(epoch: u64) -> String {
 
 fn validate_plan(plan: &Plan) -> Result<()> {
     ensure!(
-        matches!(plan.schema.as_str(), PLAN_SCHEMA_V1 | PLAN_SCHEMA_V2),
+        matches!(
+            plan.schema.as_str(),
+            PLAN_SCHEMA_V1 | PLAN_SCHEMA_V2 | PLAN_SCHEMA_V3
+        ),
         "plan schema mismatch"
     );
     ensure!(
@@ -446,10 +742,17 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         "epoch outside approved focused range"
     );
     match plan.schema.as_str() {
-        PLAN_SCHEMA_V1 => ensure!(
-            plan.capability_receipt.is_none() && plan.capability_receipt_sha256.is_none(),
-            "v1 plan cannot carry external capability evidence"
-        ),
+        PLAN_SCHEMA_V1 => {
+            ensure!(
+                plan.capability_receipt.is_none() && plan.capability_receipt_sha256.is_none(),
+                "v1 plan cannot carry external capability evidence"
+            );
+            ensure!(
+                plan.century_floor_evidence.is_none()
+                    && plan.century_floor_evidence_sha256.is_none(),
+                "v1 plan cannot carry century-floor evidence"
+            );
+        }
         PLAN_SCHEMA_V2 => {
             ensure!(
                 plan.epoch == 203,
@@ -471,6 +774,51 @@ fn validate_plan(plan: &Plan) -> Result<()> {
                     .as_deref()
                     .is_some_and(is_sha256),
                 "invalid capability receipt SHA-256"
+            );
+            ensure!(
+                plan.century_floor_evidence.is_none()
+                    && plan.century_floor_evidence_sha256.is_none(),
+                "v2 plan cannot carry century-floor evidence"
+            );
+        }
+        PLAN_SCHEMA_V3 => {
+            if plan.epoch == 203 {
+                let capability = plan
+                    .capability_receipt
+                    .as_ref()
+                    .context("epoch-203 v3 plan lacks capability receipt")?;
+                ensure!(
+                    capability
+                        == Path::new(
+                            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-package-capability-ca2e38b-rust-20261017-v1.json"
+                        ),
+                    "unexpected epoch-203 capability receipt"
+                );
+                ensure!(
+                    plan.capability_receipt_sha256
+                        .as_deref()
+                        .is_some_and(is_sha256),
+                    "invalid capability receipt SHA-256"
+                );
+            } else {
+                ensure!(
+                    plan.capability_receipt.is_none() && plan.capability_receipt_sha256.is_none(),
+                    "external capability evidence is approved only for epoch 203"
+                );
+            }
+            let evidence = plan
+                .century_floor_evidence
+                .as_ref()
+                .context("v3 plan lacks century-floor evidence")?;
+            ensure!(
+                evidence.is_absolute(),
+                "v3 century-floor evidence path is not absolute"
+            );
+            ensure!(
+                plan.century_floor_evidence_sha256
+                    .as_deref()
+                    .is_some_and(is_sha256),
+                "invalid century-floor evidence SHA-256"
             );
         }
         _ => unreachable!(),
@@ -588,7 +936,7 @@ fn validate_manifest(
     );
     if external_capability_validated {
         ensure!(
-            plan.schema == PLAN_SCHEMA_V2 && plan.epoch == 203,
+            matches!(plan.schema.as_str(), PLAN_SCHEMA_V2 | PLAN_SCHEMA_V3) && plan.epoch == 203,
             "external capability evidence escaped its narrow exception"
         );
     }
@@ -778,10 +1126,13 @@ fn validate_external_capability(
     plan: &Plan,
     members: &BTreeMap<String, FileIdentity>,
 ) -> Result<Option<CapabilityEvidence>> {
-    if plan.schema == PLAN_SCHEMA_V1 {
+    if plan.schema == PLAN_SCHEMA_V1 || (plan.schema == PLAN_SCHEMA_V3 && plan.epoch != 203) {
         return Ok(None);
     }
-    ensure!(plan.schema == PLAN_SCHEMA_V2, "plan schema mismatch");
+    ensure!(
+        matches!(plan.schema.as_str(), PLAN_SCHEMA_V2 | PLAN_SCHEMA_V3) && plan.epoch == 203,
+        "plan schema mismatch"
+    );
     let path = plan
         .capability_receipt
         .as_ref()
@@ -959,6 +1310,114 @@ fn validate_external_capability(
     }))
 }
 
+fn validate_century_floor_evidence(
+    plan: &Plan,
+    plan_path: &Path,
+    plan_identity: &FileIdentity,
+    executable: &Path,
+    self_identity: &FileIdentity,
+) -> Result<(u64, Option<CenturyFloorEvidenceReceipt>)> {
+    if plan.schema != PLAN_SCHEMA_V3 {
+        return Ok((LEGACY_MINIMUM_FREE_BYTES, None));
+    }
+
+    let deployment = executable
+        .parent()
+        .context("running executable has no parent")?;
+    ensure!(
+        plan_path.parent() == Some(deployment),
+        "v3 plan is not a direct member of the attester deployment"
+    );
+    let evidence_path = plan
+        .century_floor_evidence
+        .as_ref()
+        .context("v3 plan lacks century-floor evidence")?;
+    ensure!(
+        evidence_path.parent() == Some(deployment),
+        "century-floor evidence is not a direct member of the attester deployment"
+    );
+    let evidence_sha256 = plan
+        .century_floor_evidence_sha256
+        .as_deref()
+        .context("v3 plan lacks century-floor evidence SHA-256")?;
+
+    let members = validate_attester_bundle(deployment)?;
+    let executable_name = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid attester executable name")?;
+    ensure!(
+        members
+            .get(executable_name)
+            .is_some_and(|identity| identity.sha256 == self_identity.sha256),
+        "running attester is not bound by its deployment"
+    );
+    let plan_name = plan_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid v3 plan member name")?;
+    ensure!(
+        members
+            .get(plan_name)
+            .is_some_and(|identity| identity.sha256 == plan_identity.sha256),
+        "v3 plan is not hash-bound by the attester deployment"
+    );
+    let evidence_name = evidence_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid century-floor evidence member name")?;
+    let evidence_identity = members
+        .get(evidence_name)
+        .context("century-floor evidence is absent from attester deployment")?;
+    ensure!(
+        evidence_identity.sha256 == evidence_sha256,
+        "century-floor evidence SHA-256 mismatch"
+    );
+
+    let evidence: CenturyFloorEvidence = read_json(evidence_path)?;
+    let (sample_count, sum_jet_size_bytes, floor_bytes) =
+        validate_century_floor_document(&evidence)?;
+    for sample in &evidence.samples {
+        for (name, expected_sha256) in [
+            (&sample.r2_receipt_name, &sample.r2_receipt_sha256),
+            (&sample.full_receipt_name, &sample.full_receipt_sha256),
+            (&sample.plugin_receipt_name, &sample.plugin_receipt_sha256),
+        ] {
+            let member = members
+                .get(name)
+                .with_context(|| format!("century-floor receipt member absent: {name}"))?;
+            ensure!(
+                member.sha256 == *expected_sha256,
+                "century-floor receipt member SHA-256 mismatch: {name}"
+            );
+        }
+
+        let r2_receipt: R2Receipt = read_json(&deployment.join(&sample.r2_receipt_name))?;
+        validate_r2_receipt(sample, &r2_receipt)?;
+        validate_text_receipt(
+            &fs::read(deployment.join(&sample.full_receipt_name))?,
+            &sample.archive_sha256,
+        )?;
+        validate_text_receipt(
+            &fs::read(deployment.join(&sample.plugin_receipt_name))?,
+            &sample.archive_sha256,
+        )?;
+    }
+
+    Ok((
+        floor_bytes,
+        Some(CenturyFloorEvidenceReceipt {
+            path: evidence_path.display().to_string(),
+            sha256: evidence_identity.sha256.clone(),
+            first_epoch: evidence.century.first_epoch,
+            last_epoch: evidence.century.last_epoch,
+            sample_count,
+            sum_jet_size_bytes,
+            floor_bytes,
+        }),
+    ))
+}
+
 fn filesystem_free_bytes(path: &Path) -> Result<u64> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let mut value = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -1016,6 +1475,13 @@ fn run() -> Result<()> {
     let plan: Plan = read_json(&arguments.plan)?;
     validate_plan(&plan)?;
     ensure!(!plan.receipt.exists(), "fresh receipt path required");
+    let (minimum_free_bytes, century_floor_evidence) = validate_century_floor_evidence(
+        &plan,
+        &arguments.plan,
+        &plan_identity,
+        &executable,
+        &self_identity,
+    )?;
 
     ensure!(
         plan.package.canonicalize()? == plan.package,
@@ -1117,12 +1583,16 @@ fn run() -> Result<()> {
     );
     let free = filesystem_free_bytes(&plan.package)?;
     ensure!(
-        free >= MINIMUM_FREE_BYTES,
+        free >= minimum_free_bytes,
         "package attestation no longer leaves protected free space"
     );
 
     let receipt = Receipt {
-        schema: RECEIPT_SCHEMA,
+        schema: if plan.schema == PLAN_SCHEMA_V3 {
+            RECEIPT_SCHEMA_V2
+        } else {
+            RECEIPT_SCHEMA
+        },
         recorded_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         epoch: plan.epoch,
         configuration: ConfigurationReceipt {
@@ -1160,8 +1630,9 @@ fn run() -> Result<()> {
         },
         resource_check: ResourceCheck {
             filesystem_free_bytes: free,
-            minimum_free_bytes: MINIMUM_FREE_BYTES,
+            minimum_free_bytes,
             passed: true,
+            century_floor_evidence,
         },
         capability_evidence,
         attestation: Attestation {
@@ -1225,6 +1696,38 @@ mod tests {
             .into(),
             capability_receipt: None,
             capability_receipt_sha256: None,
+            century_floor_evidence: None,
+            century_floor_evidence_sha256: None,
+        }
+    }
+
+    fn floor_sample(epoch: u64, jet_size_bytes: u64) -> CenturyFloorSample {
+        CenturyFloorSample {
+            epoch,
+            jet_size_bytes,
+            archive_sha256: format!("{:064x}", epoch),
+            r2_receipt_name: format!("epoch-{epoch}.r2.json"),
+            r2_receipt_sha256: "a".repeat(64),
+            full_receipt_name: format!("epoch-{epoch}.full.ok"),
+            full_receipt_sha256: "b".repeat(64),
+            plugin_receipt_name: format!("epoch-{epoch}.plugin.ok"),
+            plugin_receipt_sha256: "c".repeat(64),
+        }
+    }
+
+    fn valid_floor_evidence() -> CenturyFloorEvidence {
+        CenturyFloorEvidence {
+            schema: CENTURY_FLOOR_SCHEMA.to_string(),
+            century: Century {
+                first_epoch: 200,
+                last_epoch: 300,
+            },
+            samples: vec![floor_sample(201, 100), floor_sample(202, 101)],
+            arithmetic: CenturyFloorArithmetic {
+                sample_count: 2,
+                sum_jet_size_bytes: 201,
+                floor_bytes: 201,
+            },
         }
     }
 
@@ -1288,5 +1791,133 @@ mod tests {
         );
         wrong_epoch.capability_receipt_sha256 = Some("f".repeat(64));
         assert!(validate_plan(&wrong_epoch).is_err());
+    }
+
+    #[test]
+    fn v3_plan_requires_both_floor_evidence_fields() {
+        let mut current = valid_plan(203);
+        current.schema = PLAN_SCHEMA_V3.to_string();
+        current.capability_receipt = Some(
+            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-package-capability-ca2e38b-rust-20261017-v1.json".into(),
+        );
+        current.capability_receipt_sha256 = Some("f".repeat(64));
+        current.century_floor_evidence =
+            Some("/var/lib/jetstreamer/focused-attester/century-floor.json".into());
+        current.century_floor_evidence_sha256 = Some("1".repeat(64));
+        assert!(validate_plan(&current).is_ok());
+
+        let mut missing_hash = current;
+        missing_hash.century_floor_evidence_sha256 = None;
+        assert!(validate_plan(&missing_hash).is_err());
+
+        let mut legacy = valid_plan(203);
+        legacy.schema = PLAN_SCHEMA_V2.to_string();
+        legacy.capability_receipt = Some(
+            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-package-capability-ca2e38b-rust-20261017-v1.json".into(),
+        );
+        legacy.capability_receipt_sha256 = Some("f".repeat(64));
+        legacy.century_floor_evidence =
+            Some("/var/lib/jetstreamer/focused-attester/century-floor.json".into());
+        legacy.century_floor_evidence_sha256 = Some("1".repeat(64));
+        assert!(validate_plan(&legacy).is_err());
+
+        let mut ordinary = valid_plan(210);
+        ordinary.schema = PLAN_SCHEMA_V3.to_string();
+        ordinary.century_floor_evidence =
+            Some("/var/lib/jetstreamer/focused-attester/century-floor.json".into());
+        ordinary.century_floor_evidence_sha256 = Some("1".repeat(64));
+        assert!(validate_plan(&ordinary).is_ok());
+
+        ordinary.capability_receipt = Some(
+            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-package-capability-ca2e38b-rust-20261017-v1.json".into(),
+        );
+        ordinary.capability_receipt_sha256 = Some("f".repeat(64));
+        assert!(validate_plan(&ordinary).is_err());
+    }
+
+    #[test]
+    fn century_floor_recomputes_ceil_two_times_mean() {
+        let evidence = valid_floor_evidence();
+        assert_eq!(
+            validate_century_floor_document(&evidence).unwrap(),
+            (2, 201, 201)
+        );
+    }
+
+    #[test]
+    fn century_floor_rejects_malformed_or_duplicate_census() {
+        let mut empty = valid_floor_evidence();
+        empty.samples.clear();
+        empty.arithmetic.sample_count = 0;
+        empty.arithmetic.sum_jet_size_bytes = 0;
+        empty.arithmetic.floor_bytes = 0;
+        assert!(validate_century_floor_document(&empty).is_err());
+
+        let mut duplicate = valid_floor_evidence();
+        duplicate.samples[1].epoch = duplicate.samples[0].epoch;
+        assert!(validate_century_floor_document(&duplicate).is_err());
+
+        let mut outside = valid_floor_evidence();
+        outside.samples[0].epoch = 199;
+        assert!(validate_century_floor_document(&outside).is_err());
+    }
+
+    #[test]
+    fn century_floor_rejects_bad_arithmetic_and_u64_overflow() {
+        let mut bad = valid_floor_evidence();
+        bad.arithmetic.floor_bytes += 1;
+        assert!(validate_century_floor_document(&bad).is_err());
+
+        let mut overflow = valid_floor_evidence();
+        overflow.samples[0].jet_size_bytes = u64::MAX;
+        overflow.samples[1].jet_size_bytes = u64::MAX;
+        assert!(validate_century_floor_document(&overflow).is_err());
+    }
+
+    #[test]
+    fn century_floor_receipts_must_match_archive_identity() {
+        let sample = floor_sample(201, 100);
+        let mut r2 = R2Receipt {
+            schema: R2_RECEIPT_SCHEMA.to_string(),
+            bucket: HORIZON_R2_BUCKET.to_string(),
+            epoch: 201,
+            archive_key: "epoch-201.jet".to_string(),
+            checksum_key: "epoch-201.jet.sha256".to_string(),
+            archive_length: 100,
+            archive_sha256: sample.archive_sha256.clone(),
+            archive_etag: "etag".to_string(),
+            r2_composite_sha256: None,
+            remote_sha256_readback: true,
+            multipart_part_size: 5,
+            verified_unix_seconds: 1,
+        };
+        assert!(validate_r2_receipt(&sample, &r2).is_ok());
+        r2.archive_length += 1;
+        assert!(validate_r2_receipt(&sample, &r2).is_err());
+
+        let valid_text = format!(
+            "{} {} {}\n",
+            sample.archive_sha256,
+            "d".repeat(64),
+            "e".repeat(64)
+        );
+        assert!(validate_text_receipt(valid_text.as_bytes(), &sample.archive_sha256).is_ok());
+        let mismatch = format!("{} {} {}\n", "f".repeat(64), "d".repeat(64), "e".repeat(64));
+        assert!(validate_text_receipt(mismatch.as_bytes(), &sample.archive_sha256).is_err());
+    }
+
+    #[test]
+    fn ordinary_v3_plan_uses_internal_manifest_capability() {
+        let mut plan = valid_plan(210);
+        plan.schema = PLAN_SCHEMA_V3.to_string();
+        plan.century_floor_evidence =
+            Some("/var/lib/jetstreamer/focused-attester/century-floor.json".into());
+        plan.century_floor_evidence_sha256 = Some("1".repeat(64));
+        assert!(validate_plan(&plan).is_ok());
+        assert!(
+            validate_external_capability(&plan, &BTreeMap::new())
+                .unwrap()
+                .is_none()
+        );
     }
 }
