@@ -1,3 +1,4 @@
+mod checkpoint_continuation;
 mod epoch224_qualification;
 
 use std::{
@@ -11418,7 +11419,19 @@ async fn run_geyser_replay(
     // qualification child obtains this from its sealed environment.
     handoff_export_directory: Option<&Path>,
     retain_runtime_state: bool,
+    // Only the build-bound private epoch213 runner can supply this proof.
+    checkpoint_restart: Option<&checkpoint_continuation::ValidatedPrefix>,
 ) -> Result<ReplayRunResult, String> {
+    if let Some(prefix) = checkpoint_restart {
+        prefix.validate_invocation(
+            epoch,
+            bootstrap,
+            qualification,
+            carried_state.is_some(),
+            audited_cohort_bootstrap.is_some(),
+            retain_runtime_state,
+        )?;
+    }
     if qualification.is_some() && carried_state.is_some() {
         return Err("focused qualification cannot reuse carried runtime state".to_string());
     }
@@ -11506,7 +11519,11 @@ async fn run_geyser_replay(
             ));
         }
         let checkpoint_count = verifier.checkpoint_count_in_range(replay_start, verification_end);
-        if checkpoint_count == 0 {
+        if checkpoint_count == 0
+            && !checkpoint_restart.is_some_and(|prefix| {
+                prefix.covers_trusted_root(epoch, bootstrap_slot, output_slot_start, end_inclusive)
+            })
+        {
             return Err(format!(
                 "runtime profile {} requires at least one trusted post-bootstrap checkpoint in verification range {}..={}; the supplied checkpoint set is empty for that range",
                 execution.backend, replay_start, verification_end
@@ -11826,12 +11843,20 @@ async fn run_geyser_replay(
                                             expected_archive_sha256: audited_cohort_bootstrap
                                                 .map(|binding| binding.evidence.sha256)
                                                 .or_else(|| {
+                                                    checkpoint_restart
+                                                        .map(|prefix| prefix.snapshot_sha256())
+                                                })
+                                                .or_else(|| {
                                                     bootstrap_handoff_manifest
                                                         .as_ref()
                                                         .map(|manifest| manifest.archive_sha256)
                                                 }),
                                             expected_archive_size: audited_cohort_bootstrap
                                                 .map(|binding| binding.size)
+                                                .or_else(|| {
+                                                    checkpoint_restart
+                                                        .map(|prefix| prefix.snapshot_size())
+                                                })
                                                 .or_else(|| {
                                                     bootstrap_handoff_manifest
                                                         .as_ref()
@@ -11849,13 +11874,23 @@ async fn run_geyser_replay(
                         executable,
                         initialization,
                     };
-                    let client = tokio::task::spawn_blocking(move || {
+                    let mut client = tokio::task::spawn_blocking(move || {
                         historical::HistoricalRuntimeClient::spawn(worker_profile, spawn)
                     })
                     .await
                     .map_err(|err| format!("historical worker startup task failed: {err}"))?
                     .map_err(|err| format!("historical worker startup failed: {err}"))?;
                     let slot = client.initialized().slot;
+                    let restored_checkpoint = if let Some(prefix) = checkpoint_restart {
+                        let checkpoint =
+                            client.freeze_checkpoint(slot).map_err(|e| e.to_string())?;
+                        prefix.verify_native_checkpoint(&checkpoint, client.executable_sha256())?;
+                        Some(historical_replay::HistoricalCheckpointSummary::try_from(
+                            &checkpoint,
+                        )?)
+                    } else {
+                        None
+                    };
                     info!(
                         "historical worker initialized at slot {} (last_blockhash={}, ticks_per_slot={}, next_write_version={})",
                         slot,
@@ -11866,7 +11901,7 @@ async fn run_geyser_replay(
                     (
                         ReplaySource::Historical {
                             client: Box::new(client),
-                            bootstrap_checkpoint: None,
+                            bootstrap_checkpoint: restored_checkpoint,
                         },
                         slot,
                         bootstrap_state_kind,
@@ -12046,6 +12081,19 @@ async fn run_geyser_replay(
             client,
             bootstrap_checkpoint,
         } => Arc::new(match bootstrap_checkpoint {
+            Some(checkpoint) if checkpoint_restart.is_some() => {
+                historical_replay::HistoricalReplay::from_restored_checkpoint(
+                    *client,
+                    checkpoint,
+                    snapshot_verifier.clone().ok_or_else(|| {
+                        "checkpoint continuation requires its canonical root verifier".to_string()
+                    })?,
+                    failure.clone(),
+                    cursor.clone(),
+                    progress.clone(),
+                    output_slot_start,
+                )?
+            }
             Some(checkpoint) => historical_replay::HistoricalReplay::from_carried(
                 *client,
                 checkpoint,
@@ -13112,7 +13160,8 @@ async fn run_geyser_replay(
         historical_evidence,
         historical_worker_executable_sha256: worker_executable_sha256,
         bootstrap_handoff_archive_sha256: bootstrap_handoff_manifest
-            .map(|manifest| manifest.archive_sha256),
+            .map(|manifest| manifest.archive_sha256)
+            .or_else(|| checkpoint_restart.map(|prefix| prefix.snapshot_sha256())),
     })
 }
 
@@ -15862,6 +15911,7 @@ async fn run_mixed_runtime_root_cohort_first_epoch(
             }),
             (!is_terminal).then_some(handoff_dir.as_path()),
             is_terminal,
+            None,
         )
         .await?;
         publish_historical_segment_manifest(
@@ -18779,8 +18829,20 @@ async fn main() {
     let mut source_cohort_receipt: Option<PathBuf> = None;
     let mut unreceipted_recovery_evidence: Option<PathBuf> = None;
     let mut publish_through_epoch: Option<u64> = None;
+    let mut continuation_plan: Option<PathBuf> = None;
+    let mut continuation_plan_sha256: Option<String> = None;
     for arg in args {
-        if arg == "--verify" {
+        if let Some(path) = arg.strip_prefix("--checkpoint-continuation-plan=") {
+            if continuation_plan.replace(PathBuf::from(path)).is_some() {
+                eprintln!("duplicate --checkpoint-continuation-plan");
+                exit(2);
+            }
+        } else if let Some(hash) = arg.strip_prefix("--checkpoint-continuation-plan-sha256=") {
+            if continuation_plan_sha256.replace(hash.to_owned()).is_some() {
+                eprintln!("duplicate --checkpoint-continuation-plan-sha256");
+                exit(2);
+            }
+        } else if arg == "--verify" {
             verify_snapshots = true;
             explicit_verify = Some(true);
             verify_option_count = verify_option_count.saturating_add(1);
@@ -18891,6 +18953,7 @@ async fn main() {
         }
     }
 
+    let explicit_destination = dest_dir_arg.is_some();
     let dest_dir = match dest_dir_arg {
         Some(path) => path,
         None => match env::current_dir() {
@@ -18902,6 +18965,56 @@ async fn main() {
         },
     };
     let inherited_epoch_lease = inherited_epoch_lease_authorized();
+
+    // A continuation build never reaches ordinary replay, recovery, or any
+    // public destination/sidecar setup. A default build rejects its new flags.
+    if cfg!(feature = "epoch213-checkpoint-continuation-diagnostic")
+        || continuation_plan.is_some()
+        || continuation_plan_sha256.is_some()
+    {
+        let forbidden = horizon_output.is_some()
+            || qualification_end_slot.is_some()
+            || epoch_hashes.is_some()
+            || snapshot_archive_override.is_some()
+            || range_info.is_some()
+            || replay_scratch.is_some()
+            || root_checkpoint_cohort
+            || recover_staged_only
+            || recover_staged_cohort_only
+            || recover_unreceipted_root_cohort_only
+            || cohort_manifest.is_some()
+            || cohort_manifest_fingerprint.is_some()
+            || source_cohort_receipt.is_some()
+            || unreceipted_recovery_evidence.is_some()
+            || publish_through_epoch.is_some()
+            || inherited_epoch_lease
+            || cfg!(feature = "epoch224-v1-6-25-qualification")
+            || cfg!(feature = "epoch224-v1-6-25-diagnostic")
+            || cfg!(feature = "epoch224-account-delta-diagnostic");
+        if let Err(error) = checkpoint_continuation::validate_cli(
+            cfg!(feature = "epoch213-checkpoint-continuation-diagnostic"),
+            (start_epoch, end_epoch),
+            explicit_verify,
+            verify_option_count,
+            explicit_destination,
+            forbidden,
+        ) {
+            eprintln!("error: {error}");
+            exit(2);
+        }
+        let (Some(plan), Some(hash)) = (continuation_plan, continuation_plan_sha256) else {
+            eprintln!("private continuation requires both plan and SHA-256 options");
+            exit(2);
+        };
+        if let Err(error) =
+            checkpoint_continuation::run(plan, hash, dest_dir, shutdown, cursor, restart_tracker)
+                .await
+        {
+            eprintln!("private checkpoint continuation failed: {error}");
+            exit(1);
+        }
+        return;
+    }
 
     if horizon_output.is_some() && start_epoch != end_epoch {
         eprintln!(
@@ -20560,6 +20673,7 @@ async fn main() {
                 .as_deref()
                 .map(Path::new),
             epoch < end_epoch,
+            None,
         )
         .await;
         match result {

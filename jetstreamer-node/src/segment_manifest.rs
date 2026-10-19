@@ -326,6 +326,18 @@ pub fn read_and_validate_segment_manifest(
 ) -> Result<HistoricalSegmentManifest, SegmentManifestError> {
     let archive_path = archive_path.as_ref();
     let sidecar_path = segment_manifest_path(archive_path)?;
+    read_and_validate_segment_manifest_from(archive_path, sidecar_path)
+}
+
+/// Uses an explicit manifest path while retaining the same complete source
+/// digest and deep decode checks. Callers using sealed, separately deployed
+/// manifests must additionally authenticate that manifest's exact bytes.
+pub fn read_and_validate_segment_manifest_from(
+    archive_path: impl AsRef<Path>,
+    manifest_path: impl AsRef<Path>,
+) -> Result<HistoricalSegmentManifest, SegmentManifestError> {
+    let archive_path = archive_path.as_ref();
+    let sidecar_path = manifest_path.as_ref();
     let bytes = read_bounded_manifest(&sidecar_path)?;
     let manifest: HistoricalSegmentManifest =
         serde_json::from_slice(&bytes).map_err(SegmentManifestError::JsonDecode)?;
@@ -1195,6 +1207,38 @@ mod tests {
         let json = fs::read_to_string(sidecar).unwrap();
         assert!(json.contains(&format!("\"{}\"", sha256_hex_string(&WORKER_DIGEST))));
         assert!(json.ends_with('\n'));
+    }
+
+    #[test]
+    fn explicit_manifest_path_preserves_digest_and_deep_validation() {
+        let directory = TempDir::new().unwrap();
+        let archive = write_archive(&directory);
+        let (adjacent, written) = write_segment_manifest(&archive, manifest()).unwrap();
+        let separate = directory.path().join("sealed-manifest.json");
+        fs::rename(adjacent, &separate).unwrap();
+        assert_eq!(
+            read_and_validate_segment_manifest_from(&archive, &separate).unwrap(),
+            written
+        );
+        assert!(read_and_validate_segment_manifest(&archive).is_err());
+        let mut wrong_runtime = written.clone();
+        wrong_runtime.runtime.runtime_revision = "different-revision".into();
+        fs::write(&separate, serde_json::to_vec(&wrong_runtime).unwrap()).unwrap();
+        assert!(matches!(
+            read_and_validate_segment_manifest_from(&archive, &separate),
+            Err(SegmentManifestError::Invalid(_))
+        ));
+        fs::write(&separate, serde_json::to_vec(&written).unwrap()).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&archive)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(matches!(
+            read_and_validate_segment_manifest_from(&archive, &separate),
+            Err(SegmentManifestError::ArchiveDigestMismatch { .. })
+        ));
     }
 
     #[test]

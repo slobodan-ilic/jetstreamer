@@ -673,10 +673,23 @@ independent raw write-version namespaces while verifying complete source hashes,
 metadata and update ordering. A worker/runtime change, carried-state restart, bootstrap writes,
 coverage gap, missing snapshot digest or inconsistent write mapping fails closed. Existing V3
 cross-runtime behavior is unchanged, and V4 cannot be silently projected into uninterrupted V2
-provenance. This is low-level assembly support, not a replay or publication route: no continuation
-CLI or ordinary V4 archive-reuse admission is enabled by it. Epoch 213 still requires its reviewed
-checkpoint-bound suffix path, independent complete-prefix verification, current-plugin validation,
-and the normal authenticated archive/sidecar publication gates.
+provenance. Ordinary V4 archive-reuse and publication admission remain disabled.
+
+The dedicated `epoch213-checkpoint-continuation-diagnostic` node build exposes only the private
+epoch-213 continuation experiment. Invoke it with `213 /PRIVATE_RUN_ROOT/ledger --verify
+--checkpoint-continuation-plan=/SEALED/plan.json --checkpoint-continuation-plan-sha256=HEX`.
+Default builds reject these flags; the diagnostic build rejects ordinary replay, ranges, recovery,
+and qualification overrides. Its immutable plan uses schema
+`jetstreamer-private-epoch213-checkpoint-continuation-plan-v1` and binds `epoch`, `producer_unit`,
+`node_sha256`, `run_root`, `minimum_free_bytes`, and `{path, sha256}` inputs named `prefix_archive`,
+`prefix_manifest`, `native_probe`, `restart_snapshot`, `worker`, and `genesis_archive`.
+The runner independently rereads the exact retained prefix, authenticates its own sealed binary
+and zero-restart persistent service, and rechecks the full native snapshot checkpoint in the actual
+worker before replaying the final 457 slots. It preserves independent raw write cursors and assembles
+only a private V4 archive. Fresh fleet admission and an invocation-bound guard remain prerequisites.
+The result has no canonical sidecar and grants no publication, retirement, or R2 authority.
+Independent final verification, current-plugin validation, initial adjacent-boundary evidence,
+and a reviewed V4 admission path remain required before normal publication gates can open.
 
 The final sealed root cohort replays epochs 298-301 in a private lane. A fresh campaign manifest
 must bind `--last-epoch=301 --publish-through-epoch=300`; after all four archives and the epoch-301

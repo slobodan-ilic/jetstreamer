@@ -355,6 +355,42 @@ impl HistoricalReplay {
         Ok(replay)
     }
 
+    /// Starts from an independently frozen snapshot checkpoint. The caller
+    /// must already have compared the complete native tuple with its retained
+    /// prefix; this constructor additionally consumes the exact canonical
+    /// root expectation before accepting an entry. Archive bootstrap provenance
+    /// remains SnapshotArchive, never CarriedBank.
+    pub(crate) fn from_restored_checkpoint(
+        client: HistoricalRuntimeClient,
+        checkpoint: HistoricalCheckpointSummary,
+        verifier: Arc<SnapshotVerifier>,
+        failure: Arc<ReplayFailure>,
+        cursor: Arc<ReplayCursor>,
+        progress: Arc<ReplayProgress>,
+        live_start_slot: Slot,
+    ) -> Result<Self, String> {
+        validate_restored_bootstrap(
+            client.initialized(),
+            &checkpoint,
+            live_start_slot,
+            verifier.checkpoint_count_in_range(checkpoint.slot, checkpoint.slot) == 1,
+        )?;
+        verifier.verify_legacy_accounts_hash(
+            checkpoint.slot,
+            Hash::new_from_array(checkpoint.accounts_hash),
+        );
+        verifier.finish()?;
+        Self::from_carried(
+            client,
+            checkpoint,
+            Some(verifier),
+            failure,
+            cursor,
+            progress,
+            live_start_slot,
+        )
+    }
+
     /// Resumes an already authenticated worker at an epoch boundary.
     ///
     /// The checkpoint is copied into the new segment as its bootstrap
@@ -1207,6 +1243,30 @@ fn validate_carried_bootstrap(
     Ok(())
 }
 
+fn validate_restored_bootstrap(
+    initialized: &crate::historical::HistoricalInitialized,
+    checkpoint: &HistoricalCheckpointSummary,
+    live_start_slot: Slot,
+    exact_root_present: bool,
+) -> Result<(), String> {
+    if initialized.source != HistoricalInitializedSource::SnapshotArchive
+        || initialized.slot != checkpoint.slot
+        || initialized.last_blockhash != checkpoint.last_blockhash
+        || initialized.next_write_version != checkpoint.next_write_version
+        || checkpoint.write_count != 0
+        || !checkpoint.slot_complete
+        || live_start_slot
+            != checkpoint
+                .slot
+                .checked_add(1)
+                .ok_or("checkpoint slot overflow")?
+        || !exact_root_present
+    {
+        return Err("restored checkpoint must be an untouched complete snapshot with its exact canonical root".into());
+    }
+    Ok(())
+}
+
 fn consume_checkpoint_export_seal(last_checkpoint_slot: &mut Option<Slot>) {
     *last_checkpoint_slot = None;
 }
@@ -1519,6 +1579,52 @@ mod tests {
             write_count: 0,
             next_write_version,
         }
+    }
+
+    #[test]
+    fn restored_bootstrap_requires_exact_unmodified_snapshot_and_real_root() {
+        let checkpoint = checkpoint_summary(92_447_542, 94_273_483_349);
+        let initialized = crate::historical::HistoricalInitialized {
+            genesis_hash: jetstreamer_historical_protocol::MAINNET_GENESIS_HASH.into(),
+            source: HistoricalInitializedSource::SnapshotArchive,
+            slot: checkpoint.slot,
+            last_blockhash: checkpoint.last_blockhash,
+            ticks_per_slot: 64,
+            next_write_version: checkpoint.next_write_version,
+        };
+        validate_restored_bootstrap(&initialized, &checkpoint, checkpoint.slot + 1, true).unwrap();
+        assert!(
+            validate_restored_bootstrap(&initialized, &checkpoint, checkpoint.slot + 1, false)
+                .is_err()
+        );
+        assert!(
+            validate_restored_bootstrap(&initialized, &checkpoint, checkpoint.slot + 2, true)
+                .is_err()
+        );
+        for mutate in [
+            |v: &mut crate::historical::HistoricalInitialized| {
+                v.source = HistoricalInitializedSource::Genesis
+            },
+            |v: &mut crate::historical::HistoricalInitialized| v.slot -= 1,
+            |v: &mut crate::historical::HistoricalInitialized| v.last_blockhash[0] ^= 1,
+            |v: &mut crate::historical::HistoricalInitialized| v.next_write_version += 1,
+        ] {
+            let mut bad = initialized.clone();
+            mutate(&mut bad);
+            assert!(
+                validate_restored_bootstrap(&bad, &checkpoint, checkpoint.slot + 1, true).is_err()
+            );
+        }
+        let mut bad = checkpoint.clone();
+        bad.write_count = 1;
+        assert!(
+            validate_restored_bootstrap(&initialized, &bad, checkpoint.slot + 1, true).is_err()
+        );
+        bad = checkpoint.clone();
+        bad.slot_complete = false;
+        assert!(
+            validate_restored_bootstrap(&initialized, &bad, checkpoint.slot + 1, true).is_err()
+        );
     }
 
     #[test]

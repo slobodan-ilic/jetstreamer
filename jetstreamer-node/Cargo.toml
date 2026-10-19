@@ -10,6 +10,9 @@ keywords.workspace = true
 
 [features]
 default = []
+# Private epoch213 prefix/checkpoint continuation. Never creates a canonical
+# checksum or enables ordinary archive reuse/publication.
+epoch213-checkpoint-continuation-diagnostic = []
 # Build-bound, non-production epoch-224 diagnostic. It compares the historical
 # worker's transaction-attributed lamport writes with canonical source metadata
 # and records the exact freeze-time writes at the first divergent boundary.
