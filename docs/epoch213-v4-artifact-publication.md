@@ -118,6 +118,15 @@ promotion, and R2 mutation. This is filesystem capability evidence only; it
 cannot replace actual full/plugin verification. Preserve its private fixture
 and receipt for audit, outside all campaign scanners.
 
+Probe-only setup also needs `CAP_FSETID` to set mode 3770 on its newly created
+fixture destination after assigning group 1000. Without it, Linux can silently
+strip the setgid bit to 1770 and the correct destination-policy check rejects
+the probe. Preserve that failed attempt and retry in a new empty probe namespace
+with this additional setup capability. Production does not create or chmod the
+existing public directory and does not need that extra capability. The actual
+permanent-drop check must still prove all permitted/effective/ambient
+capabilities are zero before the transaction.
+
 ## Fail closed and recover explicitly
 
 An existing archive, checksum, segment manifest, receipt, handoff stage, changed
