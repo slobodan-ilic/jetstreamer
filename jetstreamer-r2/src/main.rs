@@ -59,6 +59,8 @@ const STATUS_DELETION_RECEIPT_SCHEMA: &str =
     "jetstreamer-horizon-r2-status-authenticated-deletion-receipt-v1";
 
 mod fleet;
+mod resource_audit;
+mod resource_verify;
 
 #[derive(Debug)]
 struct Config {
@@ -3061,6 +3063,12 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().nth(1).as_deref() == Some("private-resource-audit-verify") {
+        return resource_verify::run();
+    }
+    if env::args().nth(1).as_deref() == Some("private-resource-audit") {
+        return resource_audit::run().await;
+    }
     if env::args().nth(1).as_deref() == Some("fleet-reconcile") {
         return fleet::run().await;
     }

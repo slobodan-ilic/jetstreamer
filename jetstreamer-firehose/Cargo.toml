@@ -72,6 +72,7 @@ dashmap.workspace = true
 once_cell.workspace = true
 url.workspace = true
 libc.workspace = true
+sha2.workspace = true
 
 aws-credential-types = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
@@ -79,7 +80,6 @@ aws-smithy-types = { workspace = true, optional = true }
 aws-types = { workspace = true, optional = true }
 
 [dev-dependencies]
-sha2.workspace = true
 tempfile.workspace = true
 serial_test = "4"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

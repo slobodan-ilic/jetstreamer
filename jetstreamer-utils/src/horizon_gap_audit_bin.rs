@@ -1,0 +1,512 @@
+//! Read-only finalized parent-gap census. Never supplies hidden PoH hashes.
+use {
+    anyhow::{Context, Result, ensure},
+    serde::{Deserialize, Serialize},
+    serde_json::{Value, json},
+    sha2::{Digest, Sha256},
+    std::{
+        collections::{BTreeMap, BTreeSet},
+        env,
+        fs::{self, File, OpenOptions},
+        io::{Read, Write},
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        path::{Path, PathBuf},
+    },
+};
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoundFile {
+    path: PathBuf,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Batch {
+    request: BoundFile,
+    response: BoundFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Plan {
+    schema: String,
+    first_slot: u64,
+    last_slot: u64,
+    block_list_request: BoundFile,
+    block_list: BoundFile,
+    rpc_batches: Vec<Batch>,
+    output: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct Gap {
+    parent_slot: u64,
+    slot: u64,
+    skipped_slots: u64,
+    expected_tick_boundaries: u64,
+    final_poh_hash: String,
+    previous_poh_hash: String,
+}
+
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn valid_sha(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn read_bound(bound: &BoundFile) -> Result<Vec<u8>> {
+    ensure!(valid_sha(&bound.sha256), "invalid input SHA-256");
+    ensure!(
+        bound.path.is_absolute() && bound.path.canonicalize()? == bound.path,
+        "input must be canonical and absolute"
+    );
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&bound.path)?;
+    let before = file.metadata()?;
+    ensure!(
+        before.is_file() && before.nlink() == 1 && before.uid() == 0 && before.mode() & 0o222 == 0,
+        "input must be root-owned, singly linked, immutable regular file"
+    );
+    ensure!(before.len() <= 8 * 1024 * 1024, "input exceeds size bound");
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 == before.len(), "input length changed");
+    let identity = |m: &fs::Metadata| {
+        (
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.uid(),
+            m.mode(),
+            m.nlink(),
+        )
+    };
+    ensure!(
+        identity(&before) == identity(&file.metadata()?)
+            && identity(&before) == identity(&fs::symlink_metadata(&bound.path)?),
+        "input identity changed"
+    );
+    ensure!(digest(&bytes) == bound.sha256, "input SHA-256 mismatch");
+    Ok(bytes)
+}
+
+fn array(value: &Value) -> Result<&Vec<Value>> {
+    value.as_array().context("expected JSON array")
+}
+
+type GapPairs = Vec<(u64, u64)>;
+
+fn check_block_list_request(
+    first: u64,
+    last: u64,
+    request: &Value,
+    response: &Value,
+) -> Result<()> {
+    ensure!(
+        request["jsonrpc"] == "2.0" && request["method"] == "getBlocks",
+        "wrong block-list request method/version"
+    );
+    ensure!(
+        request["id"].as_u64().is_some() && request["id"] == response["id"],
+        "block-list request/response ID mismatch"
+    );
+    let params = array(&request["params"])?;
+    ensure!(
+        params.len() == 3
+            && params[0] == first
+            && params[1] == last
+            && params[2]["commitment"] == "finalized",
+        "block-list request must bind exact finalized interval"
+    );
+    Ok(())
+}
+
+fn target_pairs(first: u64, last: u64, response: &Value) -> Result<(Vec<u64>, GapPairs)> {
+    ensure!(
+        last >= first && last - first <= 432_000,
+        "invalid or oversized slot interval"
+    );
+    ensure!(
+        response["jsonrpc"] == "2.0" && response.get("error").is_none(),
+        "invalid block-list RPC response"
+    );
+    let blocks = array(&response["result"])?
+        .iter()
+        .map(|v| v.as_u64().context("block slot is not an integer"))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        blocks.first() == Some(&first) && blocks.last() == Some(&last),
+        "block-list endpoints differ from plan"
+    );
+    ensure!(
+        blocks.windows(2).all(|p| p[0] < p[1]),
+        "block list is not strictly increasing"
+    );
+    let gaps = blocks
+        .windows(2)
+        .filter(|p| p[1] - p[0] > 1)
+        .map(|p| (p[0], p[1]))
+        .collect();
+    Ok((blocks, gaps))
+}
+
+fn check_hash(value: &Value) -> Result<String> {
+    let hash = value.as_str().context("PoH hash missing")?;
+    ensure!(
+        hash.len() <= 44
+            && bs58::decode(hash)
+                .into_vec()
+                .is_ok_and(|bytes| bytes.len() == 32),
+        "invalid PoH hash"
+    );
+    Ok(hash.to_owned())
+}
+
+fn collect_batch(
+    request: &Value,
+    response: &Value,
+    targets: &BTreeSet<u64>,
+    successes: &mut BTreeMap<u64, (u64, String, String)>,
+) -> Result<u64> {
+    let mut expected = BTreeSet::new();
+    for item in array(request)? {
+        let id = item["id"]
+            .as_u64()
+            .context("request ID must be slot integer")?;
+        ensure!(
+            expected.insert(id) && targets.contains(&id),
+            "duplicate or non-target request"
+        );
+        ensure!(
+            item["jsonrpc"] == "2.0" && item["method"] == "getBlock",
+            "wrong RPC method/version"
+        );
+        let params = array(&item["params"])?;
+        ensure!(
+            params.len() == 2
+                && params[0] == id
+                && params[1]["commitment"] == "finalized"
+                && params[1]["transactionDetails"] == "none"
+                && params[1]["rewards"] == false
+                && params[1]["maxSupportedTransactionVersion"] == 0,
+            "RPC request must bind finalized metadata-only block"
+        );
+    }
+    let mut seen = BTreeSet::new();
+    let mut errors = 0;
+    for item in array(response)? {
+        let id = item["id"]
+            .as_u64()
+            .context("response ID must be slot integer")?;
+        ensure!(
+            item["jsonrpc"] == "2.0" && expected.contains(&id) && seen.insert(id),
+            "duplicate, unexpected or malformed RPC response"
+        );
+        if let Some(error) = item.get("error") {
+            ensure!(
+                item.get("result").is_none()
+                    && error["code"].as_i64().is_some()
+                    && error["message"].as_str().is_some(),
+                "malformed RPC error"
+            );
+            errors += 1;
+            continue;
+        }
+        let result = &item["result"];
+        let value = (
+            result["parentSlot"]
+                .as_u64()
+                .context("missing parent slot")?,
+            check_hash(&result["blockhash"])?,
+            check_hash(&result["previousBlockhash"])?,
+        );
+        if let Some(previous) = successes.get(&id) {
+            ensure!(
+                previous == &value,
+                "conflicting finalized metadata for slot {id}"
+            );
+        } else {
+            successes.insert(id, value);
+        }
+    }
+    ensure!(seen == expected, "incomplete batch response");
+    Ok(errors)
+}
+
+fn assemble(
+    pairs: &[(u64, u64)],
+    successes: &BTreeMap<u64, (u64, String, String)>,
+) -> Result<Vec<Gap>> {
+    ensure!(
+        pairs.len() == successes.len(),
+        "incomplete target metadata census"
+    );
+    pairs
+        .iter()
+        .map(|&(parent, slot)| {
+            let (actual_parent, hash, previous) = successes
+                .get(&slot)
+                .context("missing successful finalized target response")?;
+            ensure!(
+                *actual_parent == parent,
+                "finalized parent disagrees with block-list gap at {slot}"
+            );
+            Ok(Gap {
+                parent_slot: parent,
+                slot,
+                skipped_slots: slot - parent - 1,
+                expected_tick_boundaries: slot - parent,
+                final_poh_hash: hash.clone(),
+                previous_poh_hash: previous.clone(),
+            })
+        })
+        .collect()
+}
+
+fn write_receipt(path: &Path, receipt: &Value) -> Result<()> {
+    let parent = path.parent().context("output parent missing")?;
+    ensure!(
+        path.is_absolute() && parent.canonicalize()? == parent,
+        "output parent must be canonical"
+    );
+    let metadata = fs::symlink_metadata(parent)?;
+    ensure!(
+        metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o077 == 0,
+        "output parent must be root-private"
+    );
+    let mut bytes = serde_json::to_vec_pretty(receipt)?;
+    bytes.push(b'\n');
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    output.write_all(&bytes)?;
+    output.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn run() -> Result<()> {
+    let args: Vec<_> = env::args().skip(1).collect();
+    ensure!(
+        args.len() == 5 && args[1] == "--plan-sha256" && args[3] == "--self-sha256",
+        "usage: jetstreamer-horizon-gap-audit PLAN --plan-sha256 HEX --self-sha256 HEX"
+    );
+    ensure!(
+        valid_sha(&args[4]) && digest(&fs::read("/proc/self/exe")?) == args[4],
+        "running binary SHA-256 mismatch"
+    );
+    ensure!(unsafe { libc::geteuid() } == 0, "must run as root");
+    let plan_binding = BoundFile {
+        path: PathBuf::from(&args[0]),
+        sha256: args[2].clone(),
+    };
+    let plan: Plan = serde_json::from_slice(&read_bound(&plan_binding)?)?;
+    ensure!(
+        plan.schema == "jetstreamer-horizon-finalized-gap-audit-plan-v1",
+        "wrong plan schema"
+    );
+    ensure!(
+        !plan.rpc_batches.is_empty() && plan.rpc_batches.len() <= 64,
+        "invalid batch count"
+    );
+    let blocks: Value = serde_json::from_slice(&read_bound(&plan.block_list)?)?;
+    let block_request: Value = serde_json::from_slice(&read_bound(&plan.block_list_request)?)?;
+    check_block_list_request(plan.first_slot, plan.last_slot, &block_request, &blocks)?;
+    let (present, pairs) = target_pairs(plan.first_slot, plan.last_slot, &blocks)?;
+    let targets = pairs.iter().map(|p| p.1).collect();
+    let mut successes = BTreeMap::new();
+    let mut retained_rpc_errors = 0;
+    for batch in &plan.rpc_batches {
+        retained_rpc_errors += collect_batch(
+            &serde_json::from_slice(&read_bound(&batch.request)?)?,
+            &serde_json::from_slice(&read_bound(&batch.response)?)?,
+            &targets,
+            &mut successes,
+        )?;
+    }
+    let gaps = assemble(&pairs, &successes)?;
+    let skipped_slots: u64 = gaps.iter().map(|g| g.skipped_slots).sum();
+    ensure!(
+        present.len() as u64 + skipped_slots == plan.last_slot - plan.first_slot + 1,
+        "interval count mismatch"
+    );
+    let receipt = json!({
+        "schema":"jetstreamer-horizon-finalized-gap-audit-v1", "plan":plan_binding,
+        "first_slot":plan.first_slot,"last_slot":plan.last_slot,"block_list_request":plan.block_list_request,"block_list":plan.block_list,
+        "rpc_batches":plan.rpc_batches,"present_slots":present.len(),"skipped_slots":skipped_slots,
+        "post_gap_targets":gaps.len(),"expected_tick_boundaries":gaps.iter().map(|g|g.expected_tick_boundaries).sum::<u64>(),
+        "gaps":gaps,"retained_rpc_errors":retained_rpc_errors,
+        "hash_semantics":"PoH, not Bank/SlotHashes hashes",
+        "source_obscuration_proven":false,"hidden_poh_hashes_recovered":false,
+        "bulk_download_authorized":false,"replay_launch_authorized":false,
+        "runtime_promotion_authorized":false,"publication_authorized":false,"r2_mutations":false
+    });
+    write_receipt(&plan.output, &receipt)?;
+    println!(
+        "{}",
+        json!({"output":plan.output,"post_gap_targets":pairs.len(),"skipped_slots":skipped_slots})
+    );
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn request(slot: u64) -> Value {
+        json!([{"jsonrpc":"2.0","id":slot,"method":"getBlock","params":[slot,{"commitment":"finalized","transactionDetails":"none","rewards":false,"maxSupportedTransactionVersion":0}]}])
+    }
+    fn response(slot: u64, parent: u64) -> Value {
+        json!([{"jsonrpc":"2.0","id":slot,"result":{"parentSlot":parent,"blockhash":"11111111111111111111111111111111","previousBlockhash":"11111111111111111111111111111111"}}])
+    }
+
+    #[test]
+    fn counts_every_gap_and_binds_finalized_parent() {
+        let (blocks, pairs) = target_pairs(
+            100,
+            108,
+            &json!({"jsonrpc":"2.0","result":[100,101,104,105,108]}),
+        )
+        .unwrap();
+        let targets = BTreeSet::from([104, 108]);
+        let mut successes = BTreeMap::new();
+        collect_batch(&request(104), &response(104, 101), &targets, &mut successes).unwrap();
+        assert!(assemble(&pairs, &successes).is_err());
+        collect_batch(&request(108), &response(108, 105), &targets, &mut successes).unwrap();
+        let gaps = assemble(&pairs, &successes).unwrap();
+        assert_eq!(blocks.len(), 5);
+        assert_eq!(gaps.iter().map(|g| g.skipped_slots).sum::<u64>(), 4);
+        assert_eq!(
+            gaps.iter().map(|g| g.expected_tick_boundaries).sum::<u64>(),
+            6
+        );
+        successes.get_mut(&108).unwrap().0 = 104;
+        assert!(assemble(&pairs, &successes).is_err());
+    }
+
+    #[test]
+    fn binds_finalized_block_list_request_and_response_identity() {
+        let mut request = json!({"jsonrpc":"2.0","id":2,"method":"getBlocks","params":[100,108,{"commitment":"finalized"}]});
+        let response = json!({"jsonrpc":"2.0","id":2,"result":[100,101,104,105,108]});
+        check_block_list_request(100, 108, &request, &response).unwrap();
+        assert!(check_block_list_request(100, 109, &request, &response).is_err());
+        request["params"][2]["commitment"] = json!("confirmed");
+        assert!(check_block_list_request(100, 108, &request, &response).is_err());
+        request["params"][2]["commitment"] = json!("finalized");
+        request["id"] = json!(3);
+        assert!(check_block_list_request(100, 108, &request, &response).is_err());
+    }
+
+    #[test]
+    fn rejects_nonfinalized_conflicting_duplicate_and_wrong_rpc_metadata() {
+        let targets = BTreeSet::from([104]);
+        let mut successes = BTreeMap::new();
+        let mut nonfinalized = request(104);
+        nonfinalized[0]["params"][1]["commitment"] = json!("confirmed");
+        assert!(
+            collect_batch(&nonfinalized, &response(104, 101), &targets, &mut successes).is_err()
+        );
+        collect_batch(&request(104), &response(104, 101), &targets, &mut successes).unwrap();
+        assert!(
+            collect_batch(&request(104), &response(104, 100), &targets, &mut successes).is_err()
+        );
+        assert!(
+            collect_batch(&request(104), &response(105, 101), &targets, &mut successes).is_err()
+        );
+        let duplicate = json!([response(104, 101)[0], response(104, 101)[0]]);
+        assert!(collect_batch(&request(104), &duplicate, &targets, &mut successes).is_err());
+    }
+
+    #[test]
+    fn preserves_errors_but_never_counts_them_as_success() {
+        let targets = BTreeSet::from([104]);
+        let mut successes = BTreeMap::new();
+        let error =
+            json!([{"jsonrpc":"2.0","id":104,"error":{"code":429,"message":"rate limited"}}]);
+        assert_eq!(
+            collect_batch(&request(104), &error, &targets, &mut successes).unwrap(),
+            1
+        );
+        assert!(successes.is_empty());
+        assert!(assemble(&[(101, 104)], &successes).is_err());
+        collect_batch(&request(104), &response(104, 101), &targets, &mut successes).unwrap();
+        assemble(&[(101, 104)], &successes).unwrap();
+    }
+
+    #[test]
+    fn rejects_unordered_or_incomplete_slot_lists_and_invalid_hashes() {
+        for slots in [
+            json!([100, 100, 108]),
+            json!([100, 99, 108]),
+            json!([101, 108]),
+        ] {
+            assert!(target_pairs(100, 108, &json!({"jsonrpc":"2.0","result":slots})).is_err());
+        }
+        assert!(target_pairs(0, 432001, &json!({"jsonrpc":"2.0","result":[0,432001]})).is_err());
+        assert!(check_hash(&json!("not-a-hash")).is_err());
+        assert!(check_hash(&json!("1".repeat(33))).is_err());
+    }
+
+    #[test]
+    fn root_input_integrity_and_private_no_clobber_output() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("input");
+        fs::write(&path, b"bounded evidence").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let bound = BoundFile {
+            path: path.clone(),
+            sha256: digest(b"bounded evidence"),
+        };
+        assert_eq!(read_bound(&bound).unwrap(), b"bounded evidence");
+        assert!(
+            read_bound(&BoundFile {
+                path: path.clone(),
+                sha256: "0".repeat(64)
+            })
+            .is_err()
+        );
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(
+            read_bound(&BoundFile {
+                path: link,
+                sha256: bound.sha256.clone()
+            })
+            .is_err()
+        );
+        fs::hard_link(&path, directory.path().join("hard-link")).unwrap();
+        assert!(read_bound(&bound).is_err());
+        let output = directory.path().join("receipt.json");
+        write_receipt(&output, &json!({"publication_authorized":false})).unwrap();
+        assert!(write_receipt(&output, &json!({"overwritten":true})).is_err());
+        assert_eq!(fs::metadata(&output).unwrap().mode() & 0o777, 0o600);
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(write_receipt(&directory.path().join("public-receipt.json"), &json!({})).is_err());
+    }
+}
