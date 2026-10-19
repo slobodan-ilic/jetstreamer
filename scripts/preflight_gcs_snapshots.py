@@ -109,6 +109,7 @@ RUNTIME_ROUTES = (
     (174, 200, "solana-v1.6.15", (".tar.bz2", ".tar.zst")),
     (201, 202, "solana-v1.6.16", (".tar.bz2", ".tar.zst")),
     (204, 204, "solana-v1.6.16", (".tar.bz2", ".tar.zst")),
+    (206, 206, "solana-v1.6.16", (".tar.bz2", ".tar.zst")),
     (213, 213, "solana-v1.6.16", (".tar.bz2", ".tar.zst")),
     (214, 215, "solana-v1.6.17", (".tar.bz2", ".tar.zst")),
     (216, 232, "solana-v1.6.20", (".tar.bz2", ".tar.zst")),

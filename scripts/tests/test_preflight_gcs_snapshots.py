@@ -487,6 +487,7 @@ class SelectionTests(unittest.TestCase):
             201: "solana-v1.6.16",
             202: "solana-v1.6.16",
             204: "solana-v1.6.16",
+            206: "solana-v1.6.16",
             213: "solana-v1.6.16",
             214: "solana-v1.6.17",
             215: "solana-v1.6.17",
@@ -508,6 +509,8 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(preflight.PreflightError):
             preflight.runtime_route(205)
         with self.assertRaises(preflight.PreflightError):
+            preflight.runtime_route(207)
+        with self.assertRaises(preflight.PreflightError):
             preflight.runtime_route(212)
         with self.assertRaises(preflight.PreflightError):
             preflight.runtime_route(302)
@@ -515,7 +518,7 @@ class SelectionTests(unittest.TestCase):
             preflight.requested_slot_range(301, 302)
 
     def test_promoted_v16_epochs_build_isolated_publishable_plans(self) -> None:
-        for epoch in (202, 204):
+        for epoch in (202, 204, 206):
             with self.subTest(epoch=epoch):
                 epoch_start, epoch_end = preflight.epoch_slot_range(epoch)
                 root = preflight.parse_inventory_json(

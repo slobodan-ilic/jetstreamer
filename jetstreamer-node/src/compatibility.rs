@@ -167,8 +167,20 @@ pub const SOLANA_V1_6_16_EPOCH_204_CANDIDATE_START_SLOT: Slot = 88_128_000;
 /// 88,559,361 and passed a complete archive reread plus the independent
 /// qualification validator.
 pub const SOLANA_V1_6_16_EPOCH_204_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 88_560_000;
+/// Epoch 206 was independently restarted across the still-unsupported epoch
+/// 205 from this canonical predecessor root.
+pub const SOLANA_V1_6_16_EPOCH_206_INITIAL_SNAPSHOT_SLOT: Slot = 88_991_050;
+pub const SOLANA_V1_6_16_EPOCH_206_INITIAL_REPLAY_SLOT: Slot =
+    SOLANA_V1_6_16_EPOCH_206_INITIAL_SNAPSHOT_SLOT + 1;
+pub const SOLANA_V1_6_16_EPOCH_206_CANDIDATE_START_SLOT: Slot = 88_992_000;
+/// The complete-span private qualification recorded every epoch-206 slot and
+/// continued to canonical root 89,523,820. Its recovered artifact passed an
+/// independent full reread and the focused qualification validator. Only the
+/// epoch-206 prefix is promoted; epoch 207 remains unsupported.
+pub const SOLANA_V1_6_16_EPOCH_206_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 89_424_000;
 /// Epoch 213 was independently restarted from this canonical predecessor root
-/// after the still-unsupported epoch 203 and epochs 205 through 212.
+/// after the still-unsupported epoch 203, epoch 205, and epochs 207 through
+/// 212.
 pub const SOLANA_V1_6_16_EPOCH_213_INITIAL_SNAPSHOT_SLOT: Slot = 92_015_419;
 pub const SOLANA_V1_6_16_EPOCH_213_INITIAL_REPLAY_SLOT: Slot =
     SOLANA_V1_6_16_EPOCH_213_INITIAL_SNAPSHOT_SLOT + 1;
@@ -1413,6 +1425,11 @@ pub static DESTINATION_SNAPSHOT_WARMUPS: &[DestinationSnapshotWarmup] = &[
         destination: &SOLANA_V1_6_16_RUNTIME,
     },
     DestinationSnapshotWarmup {
+        replay_start_slot: SOLANA_V1_6_16_EPOCH_206_INITIAL_REPLAY_SLOT,
+        output_start_slot: SOLANA_V1_6_16_EPOCH_206_CANDIDATE_START_SLOT,
+        destination: &SOLANA_V1_6_16_RUNTIME,
+    },
+    DestinationSnapshotWarmup {
         replay_start_slot: SOLANA_V1_6_16_EPOCH_213_INITIAL_REPLAY_SLOT,
         output_start_slot: SOLANA_V1_6_16_EPOCH_213_CANDIDATE_START_SLOT,
         destination: &SOLANA_V1_6_16_RUNTIME,
@@ -1827,8 +1844,22 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "historical-runtime-gap-epochs-205-212",
+        name: "historical-runtime-gap-epoch-205",
         start_slot: SOLANA_V1_6_16_EPOCH_204_CANDIDATE_END_SLOT_EXCLUSIVE,
+        end_slot_exclusive: Some(SOLANA_V1_6_16_EPOCH_206_CANDIDATE_START_SLOT),
+        backend: EraBackend::Unsupported,
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.6.16-epoch-206-checkpoint-candidate",
+        start_slot: SOLANA_V1_6_16_EPOCH_206_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_6_16_EPOCH_206_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_6_16_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "historical-runtime-gap-epochs-207-212",
+        start_slot: SOLANA_V1_6_16_EPOCH_206_CANDIDATE_END_SLOT_EXCLUSIVE,
         end_slot_exclusive: Some(SOLANA_V1_6_16_EPOCH_213_CANDIDATE_START_SLOT),
         backend: EraBackend::Unsupported,
         admission: AdmissionLevel::Candidate,
@@ -2237,7 +2268,7 @@ fn runtime_at(slot: Slot) -> Result<&'static RuntimeEra, String> {
 ///
 /// Keeping this out of `RUNTIME_ERAS` is the fail-closed boundary: ordinary
 /// epoch replay, range replay, archive reuse, and publication continue to see
-/// epoch 203 and epochs 205 through 212 as unsupported. Only the focused
+/// epoch 203, epoch 205, and epochs 207 through 212 as unsupported. Only the focused
 /// qualification CLI, which requires an explicit snapshot, checkpoint file,
 /// private output, and `--verify`, may ask the dedicated planner to use this
 /// envelope.
@@ -3729,6 +3760,31 @@ mod tests {
             output_only.descriptor,
             &SOLANA_V1_6_16_RUNTIME
         ));
+    }
+
+    #[test]
+    fn epoch_206_normal_warmup_uses_its_isolated_promoted_route() {
+        let replay_start = SOLANA_V1_6_16_EPOCH_206_INITIAL_REPLAY_SLOT;
+        let output = SOLANA_V1_6_16_EPOCH_206_CANDIDATE_START_SLOT
+            ..SOLANA_V1_6_16_EPOCH_206_CANDIDATE_END_SLOT_EXCLUSIVE;
+
+        let selection =
+            select_runtime_with_snapshot_warmup(replay_start, output.clone(), true).unwrap();
+        assert_eq!(selection.backend, RuntimeBackend::SolanaV1_6_16);
+        assert!(std::ptr::eq(selection.descriptor, &SOLANA_V1_6_16_RUNTIME));
+
+        let output_only = select_runtime(output, true).unwrap();
+        assert_eq!(output_only.backend, RuntimeBackend::SolanaV1_6_16);
+        assert!(std::ptr::eq(
+            output_only.descriptor,
+            &SOLANA_V1_6_16_RUNTIME
+        ));
+
+        for unsupported_epoch_start in [88_560_000, 89_424_000, 91_584_000] {
+            let error = select_runtime(unsupported_epoch_start..unsupported_epoch_start + 1, true)
+                .unwrap_err();
+            assert!(error.contains("unsupported runtime era"));
+        }
     }
 
     #[test]
