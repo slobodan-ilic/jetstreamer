@@ -350,6 +350,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   and runtime route before emitting a fresh v4 manifest. This is planning evidence only: snapshot
   restore must still re-observe the exact GCS generation and hashes before replay.
 - Failed-replay cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references each exact target, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output and partial archives only until their useful evidence is sealed: for a terminal, non-resumable, superseded generation that cannot satisfy a full/plugin/publication gate, fsync a root-owned receipt with the service result, last slot/progress, exact size and archive hash when available, and copy any segment manifest outside the deletion tree; then retire the unreferenced local output promptly while retaining logs, manifests, receipts, hashes, and inputs needed for lineage or reproduction. Never apply this rule to a controlled stop that can genuinely resume in place or to any locally complete archive awaiting verification/upload. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
+- Treat a deterministic replay failure as an immediate source-level incident, not only an
+  operational quarantine. As soon as the failure and restart block are durably captured, begin
+  debugging it in the current work cycle: reproduce the mismatch as narrowly as practical, add a
+  regression for the exact canonical behavior, implement the smallest source fix, run the relevant
+  tests, and commit and push the fix to the configured Horizon fork. If the current branch already
+  contains the correction and regression, bind the exact commits and test evidence and proceed
+  directly to immutable qualification instead of making a duplicate change. Never restart or deploy
+  an unqualified fix, and do not let source work weaken evidence preservation or disturb healthy
+  producers.
 - Diagnose an archive `SectionTooLarge` against both the record-count and data-arena limits for the
   named phase. The error's historical `bytes` field is also used for a count overflow, so a value
   such as `8193 (limit 8192)` can mean the 8,193rd update rather than an 8,193-byte account. Capture
