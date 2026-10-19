@@ -25,6 +25,11 @@ pub const ARCHIVE_PROVENANCE_VERSION_V2: u16 = 2;
 /// runtime segment.
 pub const ARCHIVE_PROVENANCE_VERSION_V3: u16 = 3;
 
+/// Provenance for independently restarted segments of one exact historical
+/// runtime. Older readers fail closed instead of mistaking a restart for V2
+/// raw-write continuity or a registered cross-runtime V3 handoff.
+pub const ARCHIVE_PROVENANCE_VERSION_V4: u16 = 4;
+
 /// Upper bound for a structured provenance envelope.
 pub const MAX_ARCHIVE_PROVENANCE_BYTES: usize = 16 << 10;
 
@@ -337,8 +342,11 @@ impl RuntimeSegmentProvenance {
     }
 
     fn has_same_producer_identity(&self, other: &Self) -> bool {
-        self.generation_profile == other.generation_profile
-            && self.runtime_profile == other.runtime_profile
+        self.generation_profile == other.generation_profile && self.has_same_runtime_identity(other)
+    }
+
+    fn has_same_runtime_identity(&self, other: &Self) -> bool {
+        self.runtime_profile == other.runtime_profile
             && self.runtime_admission == other.runtime_admission
             && self.runtime_revision == other.runtime_revision
             && self.runtime_toolchain == other.runtime_toolchain
@@ -440,6 +448,26 @@ pub struct ArchiveProvenanceV3 {
     pub handoffs: Vec<RuntimeHandoffProvenance>,
 }
 
+/// Independently restarted, checkpoint-bound segments of one exact runtime.
+///
+/// The shared layout retains every source generation, executable digest, raw
+/// write cursor, normalized mapping, native checkpoint tuple and full restart
+/// snapshot digest. Unlike V3, identical adjacent producers are meaningful:
+/// they restarted from independently loaded snapshots, not carried state.
+/// This envelope is structural evidence only. Canonical checkpoint admission,
+/// source verification, current-plugin validation and publication remain
+/// separate caller obligations; accepting V4 never promotes a runtime route.
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveProvenanceV4 {
+    pub base: ArchiveProvenanceV3,
+}
+
+impl ArchiveProvenanceV4 {
+    pub fn validate(&self) -> Result<(), ArchiveProvenanceError> {
+        self.base.validate_segments(true)
+    }
+}
+
 impl ArchiveProvenanceV1 {
     /// Returns the exclusive end of the requested output range.
     pub fn requested_slot_end(&self) -> Result<u64, ArchiveProvenanceError> {
@@ -474,6 +502,10 @@ impl ArchiveProvenanceV3 {
     /// segments. Producers must establish those facts before constructing the
     /// envelope; consumers still need an authenticated archive source.
     pub fn validate(&self) -> Result<(), ArchiveProvenanceError> {
+        self.validate_segments(false)
+    }
+
+    fn validate_segments(&self, checkpoint_restarts: bool) -> Result<(), ArchiveProvenanceError> {
         validate_text("assembly_profile", &self.assembly_profile)?;
         let requested_end = self.requested_slot_end()?;
 
@@ -498,6 +530,17 @@ impl ArchiveProvenanceV3 {
         let mut expected_archive_write_start = None;
         for (index, segment) in self.runtime_segments.iter().enumerate() {
             let segment_end = segment.validate(index)?;
+            if checkpoint_restarts {
+                if segment.worker_executable_sha256.is_none()
+                    || segment.worker_executable_sha256 == Some([0; 32])
+                {
+                    return Err(ArchiveProvenanceError::CheckpointRestartWorkerUnbound { index });
+                }
+                if index > 0 && !self.runtime_segments[index - 1].has_same_runtime_identity(segment)
+                {
+                    return Err(ArchiveProvenanceError::CheckpointRestartRuntimeMismatch { index });
+                }
+            }
             if segment.slot_start != expected_slot_start {
                 return Err(ArchiveProvenanceError::RuntimeSegmentCoverageMismatch {
                     index,
@@ -505,7 +548,10 @@ impl ArchiveProvenanceV3 {
                     actual_start: segment.slot_start,
                 });
             }
-            if index > 0 && self.runtime_segments[index - 1].has_same_producer_identity(segment) {
+            if !checkpoint_restarts
+                && index > 0
+                && self.runtime_segments[index - 1].has_same_producer_identity(segment)
+            {
                 return Err(ArchiveProvenanceError::RedundantAdjacentRuntimeSegments {
                     first: index - 1,
                     second: index,
@@ -552,6 +598,11 @@ impl ArchiveProvenanceV3 {
         }
 
         for (index, handoff) in self.handoffs.iter().enumerate() {
+            if checkpoint_restarts
+                && handoff.successor_bootstrap_kind != BootstrapStateKind::SnapshotArchive
+            {
+                return Err(ArchiveProvenanceError::CheckpointRestartRequiresSnapshot { index });
+            }
             let predecessor_segment = &self.runtime_segments[index];
             let successor_segment = &self.runtime_segments[index + 1];
             let expected_boundary = successor_segment.slot_start;
@@ -634,6 +685,8 @@ pub enum ArchiveProvenance {
     V2(ArchiveProvenanceV2),
     /// Provenance envelope version 3, covering two or more runtime segments.
     V3(ArchiveProvenanceV3),
+    /// Provenance envelope version 4, recording same-runtime snapshot restarts.
+    V4(ArchiveProvenanceV4),
 }
 
 impl ArchiveProvenance {
@@ -643,32 +696,34 @@ impl ArchiveProvenance {
             Self::V1(_) => ARCHIVE_PROVENANCE_VERSION_V1,
             Self::V2(_) => ARCHIVE_PROVENANCE_VERSION_V2,
             Self::V3(_) => ARCHIVE_PROVENANCE_VERSION_V3,
+            Self::V4(_) => ARCHIVE_PROVENANCE_VERSION_V4,
         }
     }
 
-    /// Returns the common v1 fields when this archive has one runtime.
+    /// Returns common v1 fields for one uninterrupted producer.
     ///
-    /// Multi-runtime V3 provenance cannot be projected into V1 without losing
-    /// material identity and handoff evidence, so it returns `None`.
+    /// Multi-runtime V3 and checkpoint-restarted V4 cannot be projected into
+    /// V1 without losing material generation and checkpoint evidence.
     pub const fn single_runtime_v1(&self) -> Option<&ArchiveProvenanceV1> {
         match self {
             Self::V1(value) => Some(value),
             Self::V2(value) => Some(&value.base),
-            Self::V3(_) => None,
+            Self::V3(_) | Self::V4(_) => None,
         }
     }
 
     /// SHA-256 of the out-of-process historical worker for a single-runtime
     /// archive.
     ///
-    /// The outer `Option` is `None` for multi-runtime V3. For a single-runtime
-    /// archive, the inner value is absent only for V1, which predates
-    /// executable binding.
+    /// The outer `Option` is `None` for V3 and V4: callers must inspect the
+    /// complete segment/checkpoint policy, not silently admit them as V2.
+    /// For one uninterrupted producer, the inner value is absent only for
+    /// V1, which predates executable binding.
     pub const fn single_runtime_worker_executable_sha256(&self) -> Option<Option<[u8; 32]>> {
         match self {
             Self::V1(_) => Some(None),
             Self::V2(value) => Some(Some(value.worker_executable_sha256)),
-            Self::V3(_) => None,
+            Self::V3(_) | Self::V4(_) => None,
         }
     }
 
@@ -681,6 +736,10 @@ impl ArchiveProvenance {
                 value.base.requested_slot_count,
             ),
             Self::V3(value) => (value.requested_slot_start, value.requested_slot_count),
+            Self::V4(value) => (
+                value.base.requested_slot_start,
+                value.base.requested_slot_count,
+            ),
         };
         let end = start
             .checked_add(count)
@@ -694,6 +753,7 @@ impl ArchiveProvenance {
             Self::V1(value) => value.validate(),
             Self::V2(value) => value.base.validate(),
             Self::V3(value) => value.validate(),
+            Self::V4(value) => value.validate(),
         }
     }
 
@@ -737,6 +797,12 @@ impl From<ArchiveProvenanceV3> for ArchiveProvenance {
     }
 }
 
+impl From<ArchiveProvenanceV4> for ArchiveProvenance {
+    fn from(value: ArchiveProvenanceV4) -> Self {
+        Self::V4(value)
+    }
+}
+
 /// Errors returned only when structured provenance is explicitly encoded or
 /// parsed.
 #[derive(Debug, thiserror::Error)]
@@ -759,7 +825,7 @@ pub enum ArchiveProvenanceError {
     },
     #[error("archive provenance requested slot range overflows u64")]
     SlotRangeOverflow,
-    #[error("archive provenance has {actual} runtime segments; expected {min}..={max} for V3")]
+    #[error("archive provenance has {actual} runtime segments; expected {min}..={max} for V3/V4")]
     InvalidRuntimeSegmentCount {
         actual: usize,
         min: usize,
@@ -785,6 +851,12 @@ pub enum ArchiveProvenanceError {
         "archive provenance runtime segments {first} and {second} have the same producer identity and must be coalesced"
     )]
     RedundantAdjacentRuntimeSegments { first: usize, second: usize },
+    #[error("checkpoint-restart segment {index} changes the exact runtime identity")]
+    CheckpointRestartRuntimeMismatch { index: usize },
+    #[error("checkpoint-restart segment {index} has no nonzero historical worker digest")]
+    CheckpointRestartWorkerUnbound { index: usize },
+    #[error("checkpoint restart {index} must independently load a snapshot, not carry state")]
+    CheckpointRestartRequiresSnapshot { index: usize },
     #[error(
         "archive provenance runtime segment {index} has inverted worker write range [{start}, {end})"
     )]
@@ -903,6 +975,9 @@ pub fn encode_archive_provenance(
         ArchiveProvenance::V3(value) => value
             .encode_ext(&mut encoded, None)
             .map_err(ArchiveProvenanceError::Encode)?,
+        ArchiveProvenance::V4(value) => value
+            .encode_ext(&mut encoded, None)
+            .map_err(ArchiveProvenanceError::Encode)?,
     };
     if encoded.len() > MAX_ARCHIVE_PROVENANCE_BYTES {
         return Err(ArchiveProvenanceError::TooLarge {
@@ -987,6 +1062,20 @@ pub fn decode_archive_provenance(
             .map_err(ArchiveProvenanceError::Decode)?;
             value.validate()?;
             ArchiveProvenance::V3(value)
+        }
+        ARCHIVE_PROVENANCE_VERSION_V4 => {
+            let value: ArchiveProvenanceV4 = decode_exact_with_limits(
+                payload,
+                None,
+                DecodeLimits::new(
+                    payload.len(),
+                    MAX_ARCHIVE_PROVENANCE_TEXT_BYTES,
+                    MAX_ARCHIVE_PROVENANCE_BYTES,
+                ),
+            )
+            .map_err(ArchiveProvenanceError::Decode)?;
+            value.validate()?;
+            ArchiveProvenance::V4(value)
         }
         other => return Err(ArchiveProvenanceError::UnsupportedVersion(other)),
     };
@@ -1113,6 +1202,138 @@ mod tests {
 
     fn sample_v3() -> ArchiveProvenance {
         sample_v3_value().into()
+    }
+
+    fn sample_v4_value() -> ArchiveProvenanceV4 {
+        let mut base = sample_v3_value();
+        let first = base.runtime_segments[0].clone();
+        let second = &mut base.runtime_segments[1];
+        *second = RuntimeSegmentProvenance {
+            slot_start: second.slot_start,
+            slot_count: second.slot_count,
+            write_versions: second.write_versions,
+            ..first
+        };
+        ArchiveProvenanceV4 { base }
+    }
+
+    #[test]
+    fn checkpoint_restart_v4_roundtrips_without_hiding_independent_cursors() {
+        let value = sample_v4_value();
+        assert!(matches!(
+            value.base.validate(),
+            Err(ArchiveProvenanceError::RedundantAdjacentRuntimeSegments { .. })
+        ));
+        let envelope = ArchiveProvenance::V4(value.clone());
+        envelope.validate_for_archive(432_000, 432_000).unwrap();
+        assert_eq!(envelope.version(), 4);
+        assert_eq!(envelope.single_runtime_v1(), None);
+        assert_eq!(envelope.single_runtime_worker_executable_sha256(), None);
+        assert_eq!(envelope.requested_range().unwrap(), 432_000..864_000);
+        assert_ne!(
+            value.base.handoffs[0].predecessor.next_write_version,
+            value.base.handoffs[0].successor.next_write_version
+        );
+        let mut encoded = encode_archive_provenance(&envelope).unwrap();
+        assert_eq!(decode_archive_provenance(&encoded).unwrap(), Some(envelope));
+        encoded[ARCHIVE_PROVENANCE_MAGIC.len()..PROVENANCE_PREFIX_BYTES]
+            .copy_from_slice(&ARCHIVE_PROVENANCE_VERSION_V3.to_le_bytes());
+        assert!(
+            decode_archive_provenance(&encoded).is_err(),
+            "a restart must not be mislabeled V3"
+        );
+    }
+
+    #[test]
+    fn checkpoint_restart_v4_keeps_generation_changes_but_not_runtime_changes() {
+        let mut changed_generation = sample_v4_value();
+        changed_generation.base.runtime_segments[1].generation_profile =
+            "new-parent/same-worker".into();
+        changed_generation.validate().unwrap();
+        let mutations: [fn(&mut RuntimeSegmentProvenance); 5] = [
+            |v| v.runtime_profile.push('x'),
+            |v| v.runtime_revision.push('x'),
+            |v| v.runtime_toolchain.push('x'),
+            |v| v.runtime_admission = RuntimeAdmission::Verified,
+            |v| v.worker_executable_sha256 = Some([0x42; 32]),
+        ];
+        for mutate in mutations {
+            let mut value = sample_v4_value();
+            mutate(&mut value.base.runtime_segments[1]);
+            assert!(matches!(
+                value.validate(),
+                Err(ArchiveProvenanceError::CheckpointRestartRuntimeMismatch { .. })
+            ));
+        }
+        for worker in [None, Some([0; 32])] {
+            let mut value = sample_v4_value();
+            value.base.runtime_segments[0].worker_executable_sha256 = worker;
+            assert!(matches!(
+                value.validate(),
+                Err(ArchiveProvenanceError::CheckpointRestartWorkerUnbound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn checkpoint_restart_v4_requires_independently_loaded_snapshot_and_zero_bootstrap_writes() {
+        let mut value = sample_v4_value();
+        value.base.handoffs[0].successor_bootstrap_kind = BootstrapStateKind::CarriedBank;
+        assert!(matches!(
+            value.validate(),
+            Err(ArchiveProvenanceError::CheckpointRestartRequiresSnapshot { .. })
+        ));
+        let mut value = sample_v4_value();
+        value.base.handoffs[0].successor_bootstrap_archive_sha256 = [0; 32];
+        assert!(matches!(
+            value.validate(),
+            Err(ArchiveProvenanceError::MissingSuccessorBootstrapArchiveDigest { .. })
+        ));
+        let mut value = sample_v4_value();
+        value.base.handoffs[0].successor_bootstrap_write_count = 1;
+        assert!(matches!(
+            value.validate(),
+            Err(ArchiveProvenanceError::SuccessorBootstrapEmittedWrites { .. })
+        ));
+    }
+
+    #[test]
+    fn checkpoint_restart_v4_checks_every_native_consensus_field() {
+        let mutations: [fn(&mut RuntimeStateCheckpoint); 9] = [
+            |v| v.slot += 1,
+            |v| v.bank_hash = Hash::new_from_array([9; 32]),
+            |v| v.accounts_hash_kind = AccountsHashKind::AccountsLtHash,
+            |v| v.accounts_hash = Hash::new_from_array([9; 32]),
+            |v| v.last_blockhash = Hash::new_from_array([9; 32]),
+            |v| v.capitalization += 1,
+            |v| v.transaction_count += 1,
+            |v| v.tick_height += 1,
+            |v| v.slot_complete = false,
+        ];
+        for mutate in mutations {
+            let mut value = sample_v4_value();
+            mutate(&mut value.base.handoffs[0].successor);
+            assert!(value.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_restart_v4_keeps_coverage_and_write_mapping_fail_closed() {
+        let mut value = sample_v4_value();
+        value.base.runtime_segments[1].write_versions.archive_start += 1;
+        assert!(value.validate().is_err());
+        let mut value = sample_v4_value();
+        value.base.handoffs[0].successor.next_write_version += 1;
+        assert!(value.validate().is_err());
+        let mut value = sample_v4_value();
+        value.base.runtime_segments[1].slot_start += 1;
+        assert!(value.validate().is_err());
+        let mut value = sample_v4_value();
+        value.base.handoffs.clear();
+        assert!(value.validate().is_err());
+        let mut value = sample_v4_value();
+        value.base.runtime_segments.truncate(1);
+        assert!(value.validate().is_err());
     }
 
     #[test]

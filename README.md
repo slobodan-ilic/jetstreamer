@@ -666,6 +666,18 @@ receipts. It preserves the run root, logs, receipts, prefix archive, and all rem
 Only a collected transient guard may use the exact hash-bound stop-intent/completion chain as
 terminal evidence; the producer still requires a current matching terminal systemd identity.
 
+Horizon provenance V4 explicitly represents independently snapshot-restarted pieces of one exact
+historical runtime. `merge_checkpoint_restart_segments` retains each source generation and worker
+digest, checks native consensus-state equality and the full restart snapshot digest, and rebases
+independent raw write-version namespaces while verifying complete source hashes, PoH continuity,
+metadata and update ordering. A worker/runtime change, carried-state restart, bootstrap writes,
+coverage gap, missing snapshot digest or inconsistent write mapping fails closed. Existing V3
+cross-runtime behavior is unchanged, and V4 cannot be silently projected into uninterrupted V2
+provenance. This is low-level assembly support, not a replay or publication route: no continuation
+CLI or ordinary V4 archive-reuse admission is enabled by it. Epoch 213 still requires its reviewed
+checkpoint-bound suffix path, independent complete-prefix verification, current-plugin validation,
+and the normal authenticated archive/sidecar publication gates.
+
 The final sealed root cohort replays epochs 298-301 in a private lane. A fresh campaign manifest
 must bind `--last-epoch=301 --publish-through-epoch=300`; after all four archives and the epoch-301
 root gate pass, its importer may transactionally publish only epochs 298-300. Epoch 301 remains

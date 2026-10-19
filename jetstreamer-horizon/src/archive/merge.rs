@@ -3,7 +3,8 @@
 //! Sources are decoded and re-encoded in event order. This is intentionally
 //! not a bucket concatenation operation: runtime-local account write versions
 //! are checked and rebased, and PoH continuity is checked across every bucket
-//! and source boundary before a V3 provenance envelope is attached.
+//! and source boundary before an explicit V3 (cross-runtime) or V4
+//! (same-runtime checkpoint-restart) provenance envelope is attached.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -13,11 +14,11 @@ use solana_hash::Hash;
 use crate::{account_updates::AccountUpdateView, transactions::Transaction};
 
 use super::{
-    ARCHIVE_PROVENANCE_VERSION_V1, ARCHIVE_PROVENANCE_VERSION_V3, ArchiveFormatError,
-    ArchiveProvenance, ArchiveProvenanceError, ArchiveProvenanceV2, ArchiveProvenanceV3,
-    ArchiveReader, ArchiveStats, ArchiveWriter, ArchiveWriterConfig, BlockNotification,
-    BucketHeader, ChainMismatchPolicy, Consumption, EntryRecord, EpochMeta, FORMAT_VERSION_V2,
-    RuntimeSegmentProvenance, SlotKind, SlotVisitor, WriteVersionNormalization,
+    ARCHIVE_PROVENANCE_VERSION_V1, ArchiveFormatError, ArchiveProvenance, ArchiveProvenanceError,
+    ArchiveProvenanceV2, ArchiveProvenanceV3, ArchiveProvenanceV4, ArchiveReader, ArchiveStats,
+    ArchiveWriter, ArchiveWriterConfig, BlockNotification, BucketHeader, ChainMismatchPolicy,
+    Consumption, EntryRecord, EpochMeta, FORMAT_VERSION_V2, RuntimeSegmentProvenance, SlotKind,
+    SlotVisitor, WriteVersionNormalization,
 };
 
 /// Counters from one verified multi-segment assembly.
@@ -241,6 +242,53 @@ where
     provenance
         .validate()
         .map_err(MultiSegmentMergeError::InvalidDestinationProvenance)?;
+    merge_validated_segments(
+        sources,
+        sink,
+        writer_config,
+        provenance,
+        ArchiveProvenance::V3(provenance.clone()),
+    )
+}
+
+/// Assembles independently verified V2 pieces of one exact historical runtime
+/// into explicit V4 checkpoint-restart provenance. This performs the same full
+/// source-handle digest, decode, PoH, metadata, and raw-write normalization
+/// checks as the cross-runtime merger; it does not qualify a canonical root or
+/// authorize replay, publication, or a checksum sidecar.
+pub fn merge_checkpoint_restart_segments<R, W>(
+    sources: Vec<RuntimeSegmentSource<R>>,
+    sink: W,
+    writer_config: ArchiveWriterConfig,
+    provenance: &ArchiveProvenanceV4,
+) -> Result<(W, MultiSegmentMergeStats), MultiSegmentMergeError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    provenance
+        .validate()
+        .map_err(MultiSegmentMergeError::InvalidDestinationProvenance)?;
+    merge_validated_segments(
+        sources,
+        sink,
+        writer_config,
+        &provenance.base,
+        ArchiveProvenance::V4(provenance.clone()),
+    )
+}
+
+fn merge_validated_segments<R, W>(
+    sources: Vec<RuntimeSegmentSource<R>>,
+    sink: W,
+    writer_config: ArchiveWriterConfig,
+    provenance: &ArchiveProvenanceV3,
+    destination: ArchiveProvenance,
+) -> Result<(W, MultiSegmentMergeStats), MultiSegmentMergeError>
+where
+    R: Read + Seek,
+    W: Write,
+{
     if sources.len() != provenance.runtime_segments.len() {
         return Err(MultiSegmentMergeError::SourceCountMismatch {
             expected: provenance.runtime_segments.len(),
@@ -248,15 +296,14 @@ where
         });
     }
 
-    let destination = ArchiveProvenance::V3(provenance.clone());
     let requested_end = provenance
         .requested_slot_start
         .checked_add(provenance.requested_slot_count)
-        .expect("validated V3 requested range cannot overflow");
+        .expect("validated multi-segment requested range cannot overflow");
     let mut sources = sources.into_iter().enumerate();
     let (first_index, first_source) = sources
         .next()
-        .expect("validated V3 contains at least two runtime segments");
+        .expect("validated provenance contains at least two runtime segments");
     let (first_source, first_terminal_hash) = verify_source_digest(first_source, first_index)?;
     validate_source_terminal_evidence(first_index, first_terminal_hash, provenance)?;
     let mut first_reader = prepare_source(
@@ -460,10 +507,10 @@ fn prepare_source<R: Read + Seek>(
                 actual: ARCHIVE_PROVENANCE_VERSION_V1,
             });
         }
-        ArchiveProvenance::V3(_) => {
+        value @ (ArchiveProvenance::V3(_) | ArchiveProvenance::V4(_)) => {
             return Err(MultiSegmentMergeError::SourceProvenanceVersion {
                 index,
-                actual: ARCHIVE_PROVENANCE_VERSION_V3,
+                actual: value.version(),
             });
         }
     };
@@ -1410,6 +1457,119 @@ mod tests {
         }
         assert_eq!(collector.epochs, vec![(EPOCH, FIRST_SLOT, 2, FIRST_SLOT)]);
         assert_eq!(collector.versions, vec![1_000, 1_001, 1_002, 1_003, 1_004]);
+    }
+
+    fn fixture_restart_provenance() -> ArchiveProvenanceV4 {
+        let mut base = fixture_provenance();
+        let first = base.runtime_segments[0].clone();
+        let second = &mut base.runtime_segments[1];
+        *second = RuntimeSegmentProvenance {
+            slot_start: second.slot_start,
+            slot_count: second.slot_count,
+            write_versions: second.write_versions,
+            ..first
+        };
+        ArchiveProvenanceV4 { base }
+    }
+
+    fn merge_restarted(
+        sources: Vec<RuntimeSegmentSource<Cursor<Vec<u8>>>>,
+        provenance: &ArchiveProvenanceV4,
+    ) -> Result<(Vec<u8>, MultiSegmentMergeStats), MultiSegmentMergeError> {
+        merge_checkpoint_restart_segments(
+            sources,
+            Vec::new(),
+            ArchiveWriterConfig {
+                bucket_slots: 1,
+                compression: Compression::None,
+                ..ArchiveWriterConfig::default()
+            },
+            provenance,
+        )
+    }
+
+    #[test]
+    fn checkpoint_restart_merge_keeps_v4_and_rebases_all_update_phases() {
+        let provenance = fixture_restart_provenance();
+        let bytes = fixture_sources(&provenance.base);
+        assert!(
+            merge(bytes.clone(), &provenance.base).is_err(),
+            "V3 must remain unchanged"
+        );
+        let (output, stats) =
+            merge_restarted(bind_sources(bytes, &provenance.base), &provenance).unwrap();
+        assert_eq!(stats.source_archives, 2);
+        assert_eq!(stats.account_updates_rebased, 5);
+        assert_eq!(stats.slots_merged, 2);
+        let mut reader = ArchiveReader::open(Cursor::new(output)).unwrap();
+        assert_eq!(
+            reader.provenance().unwrap(),
+            Some(ArchiveProvenance::V4(provenance))
+        );
+        reader.verify_chain = true;
+        reader.chain_mismatch_policy = ChainMismatchPolicy::Reject;
+        let mut collector = WriteVersionCollector::default();
+        for bucket in 0..reader.bucket_count() {
+            reader.read_bucket(bucket, &mut collector).unwrap();
+        }
+        assert_eq!(collector.versions, vec![1_000, 1_001, 1_002, 1_003, 1_004]);
+        assert_eq!(collector.epochs, vec![(EPOCH, FIRST_SLOT, 2, FIRST_SLOT)]);
+    }
+
+    #[test]
+    fn checkpoint_restart_merge_binds_source_digest_and_every_terminal() {
+        let provenance = fixture_restart_provenance();
+        let bytes = fixture_sources(&provenance.base);
+        let mut changed = bind_sources(bytes.clone(), &provenance.base);
+        changed[1].reader.get_mut()[0] ^= 1;
+        assert!(matches!(
+            merge_restarted(changed, &provenance),
+            Err(MultiSegmentMergeError::SourceDigestMismatch { index: 1, .. })
+        ));
+        let mut wrong_prefix_terminal = bind_sources(bytes.clone(), &provenance.base);
+        wrong_prefix_terminal[0].expected_terminal_last_blockhash = hash(0x99);
+        assert!(matches!(
+            merge_restarted(wrong_prefix_terminal, &provenance),
+            Err(MultiSegmentMergeError::SourceTerminalEvidenceMismatch { index: 0, .. })
+        ));
+        let mut wrong_suffix_terminal = bind_sources(bytes, &provenance.base);
+        wrong_suffix_terminal[1].expected_terminal_last_blockhash = hash(0x99);
+        assert!(matches!(
+            merge_restarted(wrong_suffix_terminal, &provenance),
+            Err(MultiSegmentMergeError::TerminalBlockhashMismatch { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn checkpoint_restart_merge_rejects_poh_discontinuity_and_raw_write_gaps() {
+        let provenance = fixture_restart_provenance();
+        let mut changed = fixture_sources(&provenance.base);
+        changed[1] = write_source(
+            &provenance.base,
+            1,
+            &[200],
+            hash(0x99),
+            hash(0x30),
+            Some(source_provenance(&provenance.base, 1).into()),
+        );
+        assert!(matches!(
+            merge_restarted(bind_sources(changed, &provenance.base), &provenance),
+            Err(MultiSegmentMergeError::PohAnchorMismatch { index: 1, .. })
+        ));
+        let mut changed = fixture_sources(&provenance.base);
+        changed[0] = write_source(
+            &provenance.base,
+            0,
+            &[10, 11, 13, 13],
+            hash(0x10),
+            hash(0x20),
+            Some(source_provenance(&provenance.base, 0).into()),
+        );
+        assert!(merge_restarted(bind_sources(changed, &provenance.base), &provenance).is_err());
+        assert!(matches!(
+            merge_restarted(Vec::new(), &provenance),
+            Err(MultiSegmentMergeError::SourceCountMismatch { .. })
+        ));
     }
 
     #[test]
