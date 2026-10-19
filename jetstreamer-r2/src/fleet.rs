@@ -198,6 +198,44 @@ fn persist(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_previous_fleet(previous: &Value, first: u64, last: u64, sample: &str) -> Result<()> {
+    ensure!(
+        previous["schema"] == SCHEMA,
+        "invalid previous fleet schema"
+    );
+    // The original sealed ledgers used an explicit assignment object. Preserve
+    // their exact digest as the predecessor; never rewrite them into a new shape.
+    let (old_first, old_last, old_sample) = if previous.get("assigned_range").is_some() {
+        ensure!(
+            previous.get("first_epoch").is_none()
+                && previous.get("last_epoch").is_none()
+                && previous.get("sampled_at_utc").is_none(),
+            "ambiguous previous fleet shape"
+        );
+        (
+            previous["assigned_range"]["first_epoch"].as_u64(),
+            previous["assigned_range"]["last_epoch"].as_u64(),
+            previous["production_observation_sampled_at_utc"].as_str(),
+        )
+    } else {
+        (
+            previous["first_epoch"].as_u64(),
+            previous["last_epoch"].as_u64(),
+            previous["sampled_at_utc"].as_str(),
+        )
+    };
+    ensure!(
+        old_first == Some(first) && old_last == Some(last),
+        "previous fleet has different assignment"
+    );
+    let old_sample = old_sample.context("previous fleet omits sample timestamp")?;
+    ensure!(
+        utc_seconds(old_sample)? < utc_seconds(sample)?,
+        "fleet sample must advance"
+    );
+    Ok(())
+}
+
 pub(super) async fn run() -> Result<()> {
     let args: Vec<_> = env::args().collect();
     ensure!(
@@ -286,22 +324,7 @@ pub(super) async fn run() -> Result<()> {
     );
     if let Some(previous) = &plan.previous_fleet {
         let previous = bound_json(previous)?;
-        ensure!(
-            previous["schema"] == SCHEMA,
-            "invalid previous fleet schema"
-        );
-        ensure!(
-            previous["first_epoch"] == plan.first_epoch
-                && previous["last_epoch"] == plan.last_epoch,
-            "previous fleet has different assignment"
-        );
-        ensure!(
-            previous["sampled_at_utc"]
-                .as_str()
-                .context("previous fleet omits sample timestamp")?
-                < sample,
-            "fleet sample must advance"
-        );
+        validate_previous_fleet(&previous, plan.first_epoch, plan.last_epoch, sample)?;
     }
     let replays = observer["replays"]
         .as_array()
@@ -408,6 +431,20 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn predecessor_migration_preserves_assignment_and_monotonic_sample() {
+        let sample = "2026-10-19T14:34:42Z";
+        let mut previous = json!({"schema":SCHEMA,"assigned_range":{"first_epoch":201,"last_epoch":300},"production_observation_sampled_at_utc":"2026-10-19T14:04:42Z"});
+        validate_previous_fleet(&previous, 201, 300, sample).unwrap();
+        assert!(validate_previous_fleet(&previous, 200, 300, sample).is_err());
+        assert!(validate_previous_fleet(&previous, 201, 300, "2026-10-19T14:04:42Z").is_err());
+        previous["first_epoch"] = json!(201);
+        assert!(validate_previous_fleet(&previous, 201, 300, sample).is_err());
+        previous = json!({"schema":SCHEMA,"first_epoch":201,"last_epoch":300,"sampled_at_utc":"2026-10-19T14:04:42Z"});
+        validate_previous_fleet(&previous, 201, 300, sample).unwrap();
+        previous["sampled_at_utc"] = json!("2026-02-30T00:00:00Z");
+        assert!(validate_previous_fleet(&previous, 201, 300, sample).is_err());
+    }
     #[test]
     fn stale_or_replaced_status_never_matches_a_live_claim() {
         let status = EpochStatus {
