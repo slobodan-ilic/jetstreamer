@@ -54,9 +54,12 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
         receipt["schema"] == "jetstreamer-private-epoch213-checkpoint-continuation-launch-v1";
     let bootstrap_resource =
         receipt["schema"] == "jetstreamer-private-epoch225-bootstrap-resource-launch-v1";
+    let bounded_resource =
+        receipt["schema"] == "jetstreamer-private-epoch225-bounded-resource-launch-v1";
     ensure!(
         (continuation
             || bootstrap_resource
+            || bounded_resource
             || receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1")
             && receipt["launched"] == true
             && receipt["remote_mutations"] == false
@@ -89,6 +92,26 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             && receipt["worker_sha256"]
                 == "f39140b9a9659e7c6e8207076a2d0c560a6b69df42cc92e19a421cf46c2b761c"
             && receipt["replay_entries_authorized"] == false
+            && receipt["full_cold_epoch_peak_qualified"] == false
+            && receipt["canonical_sidecar_authorized"] == false
+            && receipt["publication_authorized"] == false
+    } else if bounded_resource {
+        claim.epoch == 225
+            && claim
+                .unit
+                .starts_with("horizon-qualify-225-bounded-resource-")
+            && claim.unit.ends_with(".service")
+            && receipt["epoch"] == 225
+            && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+            && receipt["snapshot_slot"] == 97_199_617u64
+            && receipt["snapshot_sha256"]
+                == "094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d"
+            && receipt["worker_sha256"]
+                == "f39140b9a9659e7c6e8207076a2d0c560a6b69df42cc92e19a421cf46c2b761c"
+            && receipt["target_slot"] == 97_202_500u64
+            && receipt["terminal_root_slot"] == 97_631_459u64
+            && receipt["bounded_replay_authorized"] == true
+            && receipt["ordinary_replay_authorized"] == false
             && receipt["full_cold_epoch_peak_qualified"] == false
             && receipt["canonical_sidecar_authorized"] == false
             && receipt["publication_authorized"] == false
@@ -642,6 +665,33 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_225_replay_is_diagnostic_only_and_cannot_expand_its_target() {
+        let claim = DiagnosticClaim {
+            epoch: 225,
+            unit: "horizon-qualify-225-bounded-resource-test.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/private/bounded-225".into(),
+            launch_receipt: BoundFile {
+                path: "/private/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let receipt = json!({"schema":"jetstreamer-private-epoch225-bounded-resource-launch-v1","launched":true,"epoch":225,"private_run_root":claim.scratch_path,"snapshot_slot":97199617,"snapshot_sha256":"094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d","worker_sha256":"f39140b9a9659e7c6e8207076a2d0c560a6b69df42cc92e19a421cf46c2b761c","target_slot":97202500,"terminal_root_slot":97631459,"bounded_replay_authorized":true,"ordinary_replay_authorized":false,"full_cold_epoch_peak_qualified":false,"canonical_sidecar_authorized":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false,"evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,"restarts":0,"load_state":"loaded","active_state":"active","sub_state":"running","main_pid":123,"result":"success"}]}});
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        for (key, value) in [
+            ("target_slot", json!(97202501)),
+            ("terminal_root_slot", json!(97631458)),
+            ("ordinary_replay_authorized", json!(true)),
+            ("full_cold_epoch_peak_qualified", json!(true)),
+            ("bounded_replay_authorized", json!(false)),
+            ("publication_authorized", json!(true)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[key] = value;
+            assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{key}");
+        }
+    }
     #[test]
     fn bootstrap_resource_claim_is_exact_and_cannot_authorize_replay_or_publication() {
         let claim = DiagnosticClaim {
