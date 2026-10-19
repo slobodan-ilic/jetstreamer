@@ -25,6 +25,7 @@ use {
 };
 
 const CONFIG_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-config-v2";
+mod append_log;
 const OUTPUT_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-v2";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PREVIOUS_SAMPLE_BYTES: u64 = 4 * 1024 * 1024;
@@ -101,6 +102,8 @@ struct ReplayConfig {
     expected_producer_invocation_id: String,
     scratch_path: PathBuf,
     worker_executable_basename: String,
+    #[serde(default)]
+    append_log: Option<append_log::Config>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -138,6 +141,8 @@ struct ProgressPoint {
 
 #[derive(Debug, Serialize)]
 struct ProgressWindow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    append_log_evidence: Option<append_log::Evidence>,
     journal_invocation_id: String,
     since_unix_seconds: u64,
     until_unix_seconds: u64,
@@ -1312,6 +1317,7 @@ fn progress_window_from_points(
             .map(|elapsed| delta as f64 / elapsed)
     };
     Ok(ProgressWindow {
+        append_log_evidence: None,
         journal_invocation_id: invocation_id.to_owned(),
         since_unix_seconds,
         until_unix_seconds,
@@ -1463,11 +1469,15 @@ fn run(config: Config) -> Result<()> {
         let producer_io_counter_delta_available = producer_before.cgroup.io_counters_available
             && producer_after.cgroup.io_counters_available
             && producer_cgroup_counter_delta.io_counters_comparable;
-        let useful_work = observe_progress(
-            &replay.expected_producer_invocation_id,
-            progress_since_unix,
-            started_unix,
-        )?;
+        let useful_work = if let Some(log) = &replay.append_log {
+            append_log::observe(log, &producer_before, progress_since_unix, started_unix)?
+        } else {
+            observe_progress(
+                &replay.expected_producer_invocation_id,
+                progress_since_unix,
+                started_unix,
+            )?
+        };
         let conservative_observed_physical_bytes = scratch_pass_1
             .physical_bytes
             .max(scratch_pass_2.physical_bytes);
@@ -1928,6 +1938,7 @@ mod tests {
             expected_producer_invocation_id: invocation.to_owned(),
             scratch_path: PathBuf::from("/scratch"),
             worker_executable_basename: "worker".to_owned(),
+            append_log: None,
         };
         let producer_before = UnitObservation {
             unit: "producer.service".to_owned(),
@@ -1959,6 +1970,7 @@ mod tests {
             matching_workers: 1,
         };
         let useful_work = ProgressWindow {
+            append_log_evidence: None,
             journal_invocation_id: invocation.to_owned(),
             since_unix_seconds: parse_utc("2026-10-16T08:36:00Z").unwrap(),
             until_unix_seconds: parse_utc("2026-10-16T09:06:00Z").unwrap(),
