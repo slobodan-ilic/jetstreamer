@@ -790,19 +790,26 @@ fn counter_deltas(
     before: &BTreeMap<String, u64>,
     after: &BTreeMap<String, u64>,
 ) -> Result<BTreeMap<String, u64>> {
-    ensure!(
-        before.keys().eq(after.keys()),
-        "cgroup counter set changed during observation"
-    );
-    before
+    // cgroup v2 can add an optional io.stat field when that operation is
+    // first observed.  Identity and cgroup-path stability are checked
+    // independently, so a newly materialized monotonic counter has a valid
+    // zero baseline.  A disappearing counter remains fail-closed because its
+    // accumulated value could no longer be accounted for.
+    for name in before.keys() {
+        ensure!(
+            after.contains_key(name),
+            "cgroup counter {name} disappeared during observation"
+        );
+    }
+    after
         .iter()
-        .map(|(name, before_value)| {
-            let after_value = after[name];
+        .map(|(name, after_value)| {
+            let before_value = before.get(name).copied().unwrap_or(0);
             ensure!(
-                after_value >= *before_value,
+                *after_value >= before_value,
                 "cgroup counter {name} decreased during observation"
             );
-            Ok((name.clone(), after_value - before_value))
+            Ok((name.clone(), *after_value - before_value))
         })
         .collect()
 }
@@ -1702,6 +1709,31 @@ mod tests {
         assert_eq!(io["io.wbytes"], 60);
         assert_eq!(io["io.rios"], 4);
         assert_eq!(io["io.wios"], 6);
+    }
+
+    #[test]
+    fn cgroup_deltas_accept_new_monotonic_fields_but_not_disappearing_fields() {
+        let before = BTreeMap::from([
+            ("cpu.usage_usec".to_owned(), 100),
+            ("io.rbytes".to_owned(), 20),
+        ]);
+        let after = BTreeMap::from([
+            ("cpu.usage_usec".to_owned(), 130),
+            ("io.dbytes".to_owned(), 7),
+            ("io.rbytes".to_owned(), 25),
+        ]);
+        let deltas = counter_deltas(&before, &after).unwrap();
+        assert_eq!(deltas["cpu.usage_usec"], 30);
+        assert_eq!(deltas["io.rbytes"], 5);
+        assert_eq!(deltas["io.dbytes"], 7);
+
+        let disappeared = BTreeMap::from([("cpu.usage_usec".to_owned(), 140)]);
+        assert!(
+            counter_deltas(&before, &disappeared)
+                .unwrap_err()
+                .to_string()
+                .contains("io.rbytes disappeared")
+        );
     }
 
     #[test]
