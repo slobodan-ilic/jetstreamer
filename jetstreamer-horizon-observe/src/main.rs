@@ -793,15 +793,17 @@ fn counter_deltas(
     // cgroup v2 can add an optional io.stat field when that operation is
     // first observed.  Identity and cgroup-path stability are checked
     // independently, so a newly materialized monotonic counter has a valid
-    // zero baseline.  A disappearing counter remains fail-closed because its
-    // accumulated value could no longer be accounted for.
-    for name in before.keys() {
+    // zero baseline.  The kernel may also omit the optional discard counters
+    // when their value is zero on a later io.stat read.  Preserve that known
+    // zero without weakening any nonzero or required-counter disappearance.
+    for (name, before_value) in before {
         ensure!(
-            after.contains_key(name),
+            after.contains_key(name)
+                || (*before_value == 0 && matches!(name.as_str(), "io.dbytes" | "io.dios")),
             "cgroup counter {name} disappeared during observation"
         );
     }
-    after
+    let mut deltas = after
         .iter()
         .map(|(name, after_value)| {
             let before_value = before.get(name).copied().unwrap_or(0);
@@ -811,7 +813,13 @@ fn counter_deltas(
             );
             Ok((name.clone(), *after_value - before_value))
         })
-        .collect()
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    for (name, before_value) in before {
+        if !after.contains_key(name) && *before_value == 0 {
+            deltas.insert(name.clone(), 0);
+        }
+    }
+    Ok(deltas)
 }
 
 fn json_u64(value: &Value, field: &str) -> Result<u64> {
@@ -1712,19 +1720,36 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_deltas_accept_new_monotonic_fields_but_not_disappearing_fields() {
+    fn cgroup_deltas_handle_only_zero_optional_discard_counter_disappearance() {
         let before = BTreeMap::from([
             ("cpu.usage_usec".to_owned(), 100),
+            ("io.dbytes".to_owned(), 0),
+            ("io.dios".to_owned(), 0),
             ("io.rbytes".to_owned(), 20),
         ]);
         let after = BTreeMap::from([
             ("cpu.usage_usec".to_owned(), 130),
-            ("io.dbytes".to_owned(), 7),
             ("io.rbytes".to_owned(), 25),
         ]);
         let deltas = counter_deltas(&before, &after).unwrap();
         assert_eq!(deltas["cpu.usage_usec"], 30);
         assert_eq!(deltas["io.rbytes"], 5);
+        assert_eq!(deltas["io.dbytes"], 0);
+        assert_eq!(deltas["io.dios"], 0);
+
+        let newly_materialized = BTreeMap::from([
+            ("cpu.usage_usec".to_owned(), 130),
+            ("io.dbytes".to_owned(), 7),
+            ("io.rbytes".to_owned(), 25),
+        ]);
+        let deltas = counter_deltas(
+            &BTreeMap::from([
+                ("cpu.usage_usec".to_owned(), 100),
+                ("io.rbytes".to_owned(), 20),
+            ]),
+            &newly_materialized,
+        )
+        .unwrap();
         assert_eq!(deltas["io.dbytes"], 7);
 
         let disappeared = BTreeMap::from([("cpu.usage_usec".to_owned(), 140)]);
@@ -1733,6 +1758,17 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("io.rbytes disappeared")
+        );
+
+        let nonzero_discard = BTreeMap::from([
+            ("cpu.usage_usec".to_owned(), 100),
+            ("io.dbytes".to_owned(), 1),
+        ]);
+        assert!(
+            counter_deltas(&nonzero_discard, &disappeared)
+                .unwrap_err()
+                .to_string()
+                .contains("io.dbytes disappeared")
         );
     }
 
