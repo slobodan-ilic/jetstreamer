@@ -210,7 +210,11 @@ fn unit(name: &str) -> Result<Value> {
     Ok(Value::Object(values))
 }
 
-fn census(names: &BTreeSet<String>) -> Result<BTreeMap<String, Value>> {
+fn census(
+    names: &BTreeSet<String>,
+    first_epoch: u64,
+    last_epoch: u64,
+) -> Result<BTreeMap<String, Value>> {
     let mut result = BTreeMap::new();
     for name in names {
         result.insert(name.clone(), unit(name)?);
@@ -231,7 +235,16 @@ fn census(names: &BTreeSet<String>) -> Result<BTreeMap<String, Value>> {
         let name = value["unit"]
             .as_str()
             .context("discovered unit omits name")?;
-        if name.starts_with("jetstreamer-root-sweep-") || name.starts_with("horizon-qualify-") {
+        let assigned_diagnostic = name.contains('@')
+            && name
+                .strip_prefix("horizon-perf-epoch")
+                .and_then(|tail| tail.split('-').next())
+                .and_then(|epoch| epoch.parse::<u64>().ok())
+                .is_some_and(|epoch| (first_epoch..=last_epoch).contains(&epoch));
+        if name.starts_with("jetstreamer-root-sweep-")
+            || name.starts_with("horizon-qualify-")
+            || assigned_diagnostic
+        {
             ensure!(
                 names.contains(name),
                 "unbound live producer {name}; rebuild fleet plan and observer census"
@@ -445,7 +458,7 @@ pub(super) async fn run() -> Result<()> {
         }
         names.insert(claim.unit.clone());
     }
-    let before = census(&names)?;
+    let before = census(&names, plan.first_epoch, plan.last_epoch)?;
     let r2 = r2_config_from_env()?;
     let s3 = s3_client(&r2);
     let mut entries = Vec::new();
@@ -547,7 +560,7 @@ pub(super) async fn run() -> Result<()> {
         entries.push(json!({"epoch":epoch,"state":state,"next_action":next,"status":status,"gate_evidence":gate.evidence.iter().map(|e|json!({"path":e.path,"sha256":e.sha256})).collect::<Vec<_>>()}));
         remote_entries.push(remote);
     }
-    let after = census(&names)?;
+    let after = census(&names, plan.first_epoch, plan.last_epoch)?;
     ensure!(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() - sample_seconds <= 1800,
         "observer became stale during fleet reconciliation"
