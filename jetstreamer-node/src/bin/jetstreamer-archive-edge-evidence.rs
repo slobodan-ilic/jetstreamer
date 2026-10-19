@@ -205,6 +205,7 @@ impl SlotVisitor for EdgeVisitor {
 struct EpochEvidence {
     archive: PathBuf,
     archive_bytes: u64,
+    runtime_profile: String,
     output_start_slot: u64,
     observed_first_write_version: u64,
     terminal_slot: u64,
@@ -214,6 +215,29 @@ struct EpochEvidence {
     derived_terminal_checkpoint_write_count: u64,
     checkpoint_write_derivation: &'static str,
     observed_terminal_blockhash: String,
+}
+
+fn terminal_checkpoint_write_count(
+    runtime_profile: &str,
+    post_write_count: u64,
+) -> Result<(u64, &'static str), String> {
+    let derivation = match runtime_profile {
+        "solana-v1.4.25" => {
+            "solana-v1.4.25 freeze checkpoint writes are terminal post-phase writes minus the final freeze-root drain write"
+        }
+        "solana-v1.6.16" => {
+            "solana-v1.6.16 freeze checkpoint writes are terminal post-phase writes minus the final freeze-root drain write"
+        }
+        _ => {
+            return Err(format!(
+                "checkpoint write derivation is not qualified for runtime {runtime_profile}"
+            ));
+        }
+    };
+    let write_count = post_write_count.checked_sub(1).ok_or_else(|| {
+        format!("{runtime_profile} terminal slot has no post-phase final-freeze write to exclude")
+    })?;
+    Ok((write_count, derivation))
 }
 
 #[derive(Debug, Serialize)]
@@ -309,12 +333,7 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
     let ArchiveProvenance::V2(provenance) = provenance else {
         return Err("archive edge recovery requires single-runtime V2 provenance".to_string());
     };
-    if provenance.base.runtime_profile != "solana-v1.6.16" {
-        return Err(format!(
-            "checkpoint write derivation is not qualified for runtime {}",
-            provenance.base.runtime_profile
-        ));
-    }
+    let runtime_profile = provenance.base.runtime_profile.clone();
     let bucket_count = reader.bucket_count();
     if bucket_count == 0 {
         return Err("archive has no buckets".to_string());
@@ -353,10 +372,8 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
             terminal.slot
         ));
     }
-    let derived_terminal_checkpoint_write_count =
-        terminal.post_write_count.checked_sub(1).ok_or_else(|| {
-            "v1.6.16 terminal slot has no post-phase final-freeze write to exclude".to_string()
-        })?;
+    let (derived_terminal_checkpoint_write_count, checkpoint_write_derivation) =
+        terminal_checkpoint_write_count(&runtime_profile, terminal.post_write_count)?;
     let blockhash = terminal
         .blockhash
         .ok_or_else(|| "terminal block has no blockhash".to_string())?;
@@ -390,6 +407,7 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
         EpochEvidence {
             archive,
             archive_bytes,
+            runtime_profile,
             output_start_slot: header.slot_start,
             observed_first_write_version: first_write,
             terminal_slot: terminal.slot,
@@ -401,8 +419,7 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
                 post: terminal.post_write_count,
             },
             derived_terminal_checkpoint_write_count,
-            checkpoint_write_derivation:
-                "solana-v1.6.16 freeze checkpoint writes are terminal post-phase writes minus the final freeze-root drain write",
+            checkpoint_write_derivation,
             observed_terminal_blockhash: blockhash.to_string(),
         },
     );
@@ -549,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_phase_counts_preserve_v1_6_16_checkpoint_derivation() {
+    fn qualified_runtimes_preserve_terminal_checkpoint_derivation() {
         let mut visitor = EdgeVisitor {
             current_slot: Some(10),
             current_kind: Some(SlotKind::Block),
@@ -567,6 +584,13 @@ mod tests {
         assert_eq!(visitor.current_pre_write_count, 3);
         assert_eq!(visitor.current_transaction_write_count, 5);
         assert_eq!(visitor.current_post_write_count, 4);
-        assert_eq!(visitor.current_post_write_count.checked_sub(1), Some(3));
+        for runtime in ["solana-v1.4.25", "solana-v1.6.16"] {
+            let (count, derivation) =
+                terminal_checkpoint_write_count(runtime, visitor.current_post_write_count).unwrap();
+            assert_eq!(count, 3);
+            assert!(derivation.starts_with(runtime));
+        }
+        assert!(terminal_checkpoint_write_count("solana-v1.5.19", 4).is_err());
+        assert!(terminal_checkpoint_write_count("solana-v1.4.25", 0).is_err());
     }
 }

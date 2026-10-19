@@ -385,9 +385,9 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   incompatibility, not archive-corruption evidence: preserve the failed invocation, seal a verifier
   containing the producer's limit change, prove the same narrow region with both binaries, and retry
   the complete reread under a distinct invocation before recovery continues.
-  When recovering v1.6.16 terminal evidence from the archive, do not equate all terminal-slot
+  When recovering v1.4.25 or v1.6.16 terminal evidence from the archive, do not equate all terminal-slot
   account updates with the checkpoint's drained-write count. Bind the archive to single-runtime V2
-  `solana-v1.6.16` provenance, count pre-, transaction-, and post-phase writes separately, and
+  `solana-v1.4.25` or `solana-v1.6.16` provenance, count pre-, transaction-, and post-phase writes separately, and
   derive the checkpoint count as post-phase writes minus the final freeze-root drain write. Require
   that runtime-specific derivation to match the journal's drained-write count and next write-version
   cursor; fail closed for other provenance or an empty post phase until its runtime semantics are
