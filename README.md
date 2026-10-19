@@ -677,6 +677,9 @@ provenance. Ordinary V4 archive-reuse and publication admission remain disabled.
 The independent readback verifier explicitly validates optional structured provenance before
 scanning slots; malformed or unknown envelopes fail closed. Structural V4 acceptance is not
 canonical checkpoint, current-plugin, runtime-route or publication admission.
+For an independently bound canonical endpoint, `verify_archive --full --anchor SLOT HASH
+--expected-terminal SLOT HASH` additionally checks the scanned final block's slot and hash.
+The terminal option rejects partial, internal-only and chain modes.
 
 The dedicated `epoch213-checkpoint-continuation-diagnostic` node build exposes only the private
 epoch-213 continuation experiment. Invoke it with `213 /PRIVATE_RUN_ROOT/ledger --verify

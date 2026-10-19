@@ -1038,7 +1038,7 @@ fn run_scan(
 
 fn usage() -> ! {
     eprintln!(
-        "usage: verify_archive <path> [max_slots] [start_slot] [--full] [--internal-full] [--anchor SLOT HASH] [--threads N]"
+        "usage: verify_archive <path> [max_slots] [start_slot] [--full] [--internal-full] [--anchor SLOT HASH] [--expected-terminal SLOT HASH] [--threads N]"
     );
     eprintln!(
         "       verify_archive --chain <path>... [--segment] [--full] [--anchor SLOT HASH] [--threads N]"
@@ -1052,6 +1052,9 @@ fn usage() -> ! {
         "  --internal-full     with --full, verify all within-archive invariants without requiring an external boundary anchor; requires a separate successful --chain pass"
     );
     eprintln!("  --anchor SLOT HASH  trusted canonical block immediately before the range");
+    eprintln!(
+        "  --expected-terminal SLOT HASH  with --full, require this exact canonical final block; no partial/internal-only mode"
+    );
     eprintln!("  --chain              verify ordered, contiguous archives as one chain");
     eprintln!(
         "  --segment            verify only the boundaries inside a multi-archive chain segment; defer both outer boundaries"
@@ -1073,6 +1076,10 @@ fn validate_structured_provenance<R: Read + std::io::Seek>(reader: &ArchiveReade
             provenance.version()
         );
     }
+}
+
+fn terminal_expectation_matches(actual: Option<ChainPoint>, expected: Option<ChainPoint>) -> bool {
+    expected.is_none() || actual == expected
 }
 
 /// Prove that this exact verifier build can decode the historical pre-update
@@ -1404,6 +1411,7 @@ fn main() {
     let mut full = false;
     let mut internal_full = false;
     let mut anchor = None;
+    let mut expected_terminal = None;
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
@@ -1451,6 +1459,12 @@ fn main() {
             "--full" => full = true,
             "--internal-full" => internal_full = true,
             "--anchor" => anchor = Some(parse_anchor(&args, &mut i)),
+            "--expected-terminal" => {
+                if expected_terminal.is_some() {
+                    usage();
+                }
+                expected_terminal = Some(parse_anchor(&args, &mut i));
+            }
             value if value.starts_with("--") => usage(),
             other => positionals.push(
                 other
@@ -1464,6 +1478,9 @@ fn main() {
     let start_slot_arg: Option<u64> = positionals.get(1).copied();
 
     if internal_full && (!full || anchor.is_some() || !positionals.is_empty()) {
+        usage();
+    }
+    if expected_terminal.is_some() && (!full || internal_full || !positionals.is_empty()) {
         usage();
     }
 
@@ -1485,7 +1502,21 @@ fn main() {
                 end.saturating_sub(1)
             );
         }
-        std::process::exit(if outcome.ok && tail_ok { 0 } else { 1 });
+        let terminal_ok = terminal_expectation_matches(outcome.terminal, expected_terminal);
+        if let Some(expected) = expected_terminal {
+            println!(
+                "CANONICAL TERMINAL {}: expected slot={} blockhash={}, actual={:?}",
+                if terminal_ok { "OK" } else { "FAIL" },
+                expected.slot,
+                expected.blockhash,
+                outcome.terminal
+            );
+        }
+        std::process::exit(if outcome.ok && tail_ok && terminal_ok {
+            0
+        } else {
+            1
+        });
     }
     if max_slots == u64::MAX && start_slot_arg.is_none() {
         let outcome = run_scan(&path, threads, false, anchor, anchor.is_some());
@@ -1566,6 +1597,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_terminal_requires_both_slot_and_hash() {
+        let expected = ChainPoint {
+            slot: 11,
+            blockhash: Hash::new_from_array([3; 32]),
+        };
+        assert!(terminal_expectation_matches(Some(expected), Some(expected)));
+        assert!(terminal_expectation_matches(None, None));
+        assert!(!terminal_expectation_matches(None, Some(expected)));
+        assert!(!terminal_expectation_matches(
+            Some(ChainPoint {
+                slot: 10,
+                ..expected
+            }),
+            Some(expected)
+        ));
+        assert!(!terminal_expectation_matches(
+            Some(ChainPoint {
+                blockhash: Hash::new_from_array([4; 32]),
+                ..expected
+            }),
+            Some(expected)
+        ));
+    }
 
     #[test]
     fn readback_scan_rejects_unknown_provenance_before_scanning_slots() {
