@@ -1,6 +1,161 @@
 //! Proves why point-prefix scans cannot by themselves establish RocksDB live state.
 use rocksdb::{ColumnFamilyDescriptor, DB, DBCompressionType, Options};
+use sha2::{Digest, Sha256};
 use std::{env, fs, process::Command};
+
+// A separate process exits without dropping DB, leaving acknowledged, synced
+// writes in the WAL rather than turning the fixture into an SST-only test.
+#[test]
+#[ignore = "fixture subprocess for native_readonly_resolves_manifest_and_wal"]
+fn native_readonly_wal_fixture_child() {
+    let Some(path) = env::var_os("JETSTREAMER_NATIVE_WAL_FIXTURE") else {
+        return;
+    };
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    options.create_missing_column_families(true);
+    options.set_disable_auto_compactions(true);
+    options.set_compression_type(DBCompressionType::Lz4);
+    let families = ["default", "data_shred", "meta"]
+        .map(|name| ColumnFamilyDescriptor::new(name, options.clone()));
+    let database = DB::open_cf_descriptors(&options, path, families).unwrap();
+    let cf = database.cf_handle("data_shred").unwrap();
+    let slot = 60912004_u64;
+    let key = |index: u64| [slot.to_be_bytes(), index.to_be_bytes()].concat();
+    for index in 0..=2 {
+        database.put_cf(cf, key(index), b"old-sst-value").unwrap();
+    }
+    database.flush_cf(cf).unwrap();
+    let before_slot = [(slot - 1).to_be_bytes(), 0_u64.to_be_bytes()].concat();
+    database.delete_range_cf(cf, before_slot, key(1)).unwrap();
+    database.delete_cf(cf, key(1)).unwrap();
+    database.put_cf(cf, key(2), b"new-wal-value").unwrap();
+    database.put_cf(cf, key(3), b"wal-only-value").unwrap();
+    database.flush_wal(true).unwrap();
+    // Do not run DB's Drop/close: that could flush the memtable and invalidate
+    // the deliberately crash-shaped, generation-stable backup fixture.
+    std::process::exit(0);
+}
+
+#[test]
+#[ignore = "explicit native RocksDB qualification; isolated disposable databases only"]
+fn native_readonly_resolves_manifest_and_wal() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("complete-db");
+    let child = Command::new(env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "native_readonly_wal_fixture_child"])
+        .env("JETSTREAMER_NATIVE_WAL_FIXTURE", &path)
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "fixture failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let files: Vec<_> = fs::read_dir(&path)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(files.iter().any(|p| p.file_name().unwrap() == "CURRENT"));
+    assert!(files.iter().any(|p| {
+        p.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("MANIFEST-")
+    }));
+    assert!(
+        files
+            .iter()
+            .any(|p| p.extension().is_some_and(|e| e == "sst"))
+    );
+    assert!(
+        files
+            .iter()
+            .any(|p| p.extension().is_some_and(|e| e == "log"))
+    );
+    let input_hashes: Vec<_> = files
+        .iter()
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            name == "CURRENT"
+                || name.starts_with("MANIFEST-")
+                || p.extension().is_some_and(|e| e == "sst" || e == "log")
+        })
+        .map(|p| (p, Sha256::digest(fs::read(p).unwrap())))
+        .collect();
+    let options = Options::default();
+    let families = DB::list_cf(&options, &path).unwrap();
+    assert_eq!(families.len(), 3);
+    // Read-only RocksDB may permit a subset; the recovery policy must compare
+    // its requested families against the full authenticated manifest census.
+    if let Ok(partial) = DB::open_cf_for_read_only(&options, &path, ["data_shred"], false) {
+        assert!(partial.cf_handle("meta").is_none());
+        assert!(families.iter().any(|family| family == "meta"));
+        println!("native read-only subset open is possible: complete CF census is a separate gate");
+    }
+    // Strict log rejection cannot substitute for recovery of the present WAL.
+    assert!(DB::open_cf_for_read_only(&options, &path, &families, true).is_err());
+    let database = DB::open_cf_for_read_only(&options, &path, &families, false).unwrap();
+    let cf = database.cf_handle("data_shred").unwrap();
+    let slot = 60912004_u64;
+    let key = |index: u64| [slot.to_be_bytes(), index.to_be_bytes()].concat();
+    assert_eq!(database.get_cf(cf, key(0)).unwrap(), None);
+    assert_eq!(database.get_cf(cf, key(1)).unwrap(), None);
+    assert_eq!(
+        database.get_cf(cf, key(2)).unwrap().as_deref(),
+        Some(b"new-wal-value".as_slice())
+    );
+    assert_eq!(
+        database.get_cf(cf, key(3)).unwrap().as_deref(),
+        Some(b"wal-only-value".as_slice())
+    );
+    drop(database);
+    for (path, before) in input_hashes {
+        assert_eq!(
+            before,
+            Sha256::digest(fs::read(path).unwrap()),
+            "native read-only open changed a manifest/WAL/SST input"
+        );
+    }
+
+    // A successful native open is not by itself proof that a backup is complete.
+    // Preserve every file except WALs in a second disposable database and show
+    // that omitted-WAL evidence must be rejected, even if RocksDB can open it.
+    let incomplete = root.path().join("missing-wal-db");
+    fs::create_dir(&incomplete).unwrap();
+    for file in &files {
+        if file.is_file() && file.extension().is_none_or(|e| e != "log") {
+            fs::copy(file, incomplete.join(file.file_name().unwrap())).unwrap();
+        }
+    }
+    match DB::open_cf_for_read_only(&options, &incomplete, &families, false) {
+        Ok(incomplete_db) => {
+            let incomplete_cf = incomplete_db.cf_handle("data_shred").unwrap();
+            assert_eq!(
+                incomplete_db
+                    .get_cf(incomplete_cf, key(0))
+                    .unwrap()
+                    .as_deref(),
+                Some(b"old-sst-value".as_slice())
+            );
+            assert_eq!(
+                incomplete_db
+                    .get_cf(incomplete_cf, key(2))
+                    .unwrap()
+                    .as_deref(),
+                Some(b"old-sst-value".as_slice())
+            );
+            assert_eq!(incomplete_db.get_cf(incomplete_cf, key(3)).unwrap(), None);
+            println!(
+                "missing WAL silently resurrects SST values: authenticated complete file census is mandatory"
+            );
+        }
+        Err(error) => println!("native decoder rejected incomplete WAL set: {error}"),
+    }
+    println!(
+        "native read-only resolution honored outside-prefix range tombstone, point deletion, latest WAL version, WAL-only value, and the complete CF set"
+    );
+}
 
 #[test]
 #[ignore = "requires separately pinned JETSTREAMER_SST_DUMP_TEST_BIN"]
