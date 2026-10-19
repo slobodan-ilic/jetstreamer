@@ -66,3 +66,22 @@ They are not an upstream-runtime differential or real-ledger qualification.
 Entry-vector decoding, padding checks, complete tick/PoH verification and all
 canonical boundary gates still follow; no source completeness, runtime route,
 publication or R2 authority is conferred by assembled bytes.
+
+`horizon_legacy_entry::decode_v1_4_25_padded_entries` is the next diagnostic
+stage. It bounds total bytes, entries, transactions and signatures; decodes
+fixed-integer entry-vector framing and complete legacy transaction wire shapes;
+rejects noncanonical ShortU16 lengths and nonzero trailing padding; and derives
+the pinned signature Merkle root (leaf prefix zero, node prefix one, odd-leaf
+duplication). It distinguishes tick entries from signature-free transactions.
+It deliberately does not execute claimed PoH work, authenticate transaction
+signatures, sanitize messages, verify tick ordinals, or establish any canonical
+boundary. There is no production recovery caller. Complete generation collection,
+native live-state resolution, chained entry/tick/PoH verification and the
+independent canonical final blockhash checks remain required before recovery.
+
+The pinned historical worker's test-only
+`pinned_sdk_legacy_entry_wire_and_signature_merkle_fixture` checks synthetic
+wire bytes with that SDK's actual Transaction/Message serialization and MerkleTree.
+Run it from `historical-runtime/v1_4_25` with its pinned compiler and bounded build
+jobs. Neither that synthetic fixture nor the modern decoder tests qualify a real
+ledger, the upstream full Entry implementation, or a runtime route.
