@@ -27,6 +27,14 @@ const EPOCH_SLOTS: u64 = 432_000;
 const MIN_SNAPSHOT_SLOT: u64 = 86_831_488;
 const MAX_SLOT_EXCLUSIVE: u64 = 92_448_000;
 
+fn worker_member(plan: &Plan) -> &'static str {
+    if plan.epoch == 224 {
+        "jetstreamer-historical-worker-v1-6-25"
+    } else {
+        "jetstreamer-historical-worker-v1-6-16-store8"
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Plan {
@@ -312,6 +320,7 @@ fn validate_package_receipt(plan: &Plan) -> Result<String> {
             receipt.get("schema").and_then(|value| value.as_str()),
             Some("jetstreamer-private-immutable-complete-span-package-v1")
                 | Some("jetstreamer-private-configured-immutable-complete-span-package-v1")
+                | Some("jetstreamer-private-configured-immutable-complete-span-package-v2")
         ),
         "unexpected package receipt schema"
     );
@@ -341,10 +350,7 @@ fn validate_package_receipt(plan: &Plan) -> Result<String> {
         .context("package receipt lacks member evidence")?;
     for (name, digest) in [
         ("jetstreamer-node", &plan.node_sha256),
-        (
-            "jetstreamer-historical-worker-v1-6-16-store8",
-            &plan.worker_sha256,
-        ),
+        (worker_member(plan), &plan.worker_sha256),
         (plan.snapshot_name.as_str(), &plan.snapshot_sha256),
         (plan.checkpoint_name.as_str(), &plan.checkpoint_sha256),
     ] {
@@ -488,6 +494,17 @@ fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<String> {
 
 fn expected_log_markers(plan: &Plan, missing_snapshot: &Path) -> [String; 4] {
     let output_slot_start = plan.epoch * EPOCH_SLOTS;
+    let (runtime, era) = if plan.epoch == 224 {
+        (
+            "solana-v1.6.25",
+            "solana-v1.6.20-epochs-216-232-checkpoint-candidate",
+        )
+    } else {
+        (
+            "solana-v1.6.16",
+            "solana-v1.6.16-epochs-203-213-focused-qualification-candidate",
+        )
+    };
     [
         format!(
             "focused qualification requested: epoch {}, bootstrap {}, replay {}..={}",
@@ -497,12 +514,12 @@ fn expected_log_markers(plan: &Plan, missing_snapshot: &Path) -> [String; 4] {
             plan.terminal_slot
         ),
         format!(
-            "epoch {}: selected execution profile solana-v1.6.16 (Candidate) from slots {}..{}",
+            "epoch {}: selected execution profile {runtime} (Candidate) from slots {}..{}",
             plan.epoch,
             output_slot_start,
             plan.terminal_slot + 1
         ),
-        "execution=solana-v1.6.16-epochs-203-213-focused-qualification-candidate".to_string(),
+        format!("execution={era}"),
         format!("failed to read snapshot {}", missing_snapshot.display()),
     ]
 }
@@ -690,14 +707,32 @@ fn process_references(probe_root: &Path, worker: &Path) -> Result<Vec<String>> {
 fn validate_plan(plan: &Plan) -> Result<()> {
     ensure!(plan.schema == PLAN_SCHEMA, "plan schema mismatch");
     ensure!(
-        (203..=212).contains(&plan.epoch),
+        (203..=212).contains(&plan.epoch) || plan.epoch == 224,
         "epoch outside focused capability range"
     );
     ensure!(
         plan.terminal_slot > (plan.epoch + 1) * EPOCH_SLOTS - 1
-            && plan.terminal_slot < MAX_SLOT_EXCLUSIVE,
+            && (if plan.epoch == 224 {
+                plan.terminal_slot == 97_631_459
+            } else {
+                plan.terminal_slot < MAX_SLOT_EXCLUSIVE
+            }),
         "terminal slot does not cover the epoch"
     );
+    if plan.epoch == 224 {
+        ensure!(
+            plan.bootstrap_slot == 96_767_522
+                && plan.snapshot_name
+                    == "snapshot-96767522-3SdyhqCuei4esVf8imz8A2rPB1z83sAK3KHbtKefJDS7.tar.zst"
+                && plan.snapshot_sha256
+                    == "dc7f2ac03813bc609629885af82222ac5af070cc6187b7bce08e10944fd214e1"
+                && plan.checkpoint_sha256
+                    == "916a4d9414db22338d55eef537cb630fa47f86dc993c7d8be585cd2afa4bb8a4"
+                && plan.worker_sha256
+                    == "f26fb8598aef4091356be31a0ee322c2e428609f201390cce26ec60df9c62c45",
+            "epoch 224 exact runtime or checkpoint binding mismatch"
+        );
+    }
     ensure!(
         (MIN_SNAPSHOT_SLOT..plan.epoch * EPOCH_SLOTS).contains(&plan.bootstrap_slot),
         "bootstrap does not precede epoch output"
@@ -709,36 +744,55 @@ fn validate_plan(plan: &Plan) -> Result<()> {
             && plan.receipt.is_absolute(),
         "plan paths must be absolute"
     );
-    let expected_package = format!(
-        "/var/lib/jetstreamer/horizon-focused-{}-complete-span-store8-ca2e38b-v1",
-        plan.epoch
-    );
+    let expected_package = if plan.epoch == 224 {
+        "/var/lib/jetstreamer/horizon-focused-224-complete-span-v1-6-25-01879c4-v1".to_string()
+    } else {
+        format!(
+            "/var/lib/jetstreamer/horizon-focused-{}-complete-span-store8-ca2e38b-v1",
+            plan.epoch
+        )
+    };
     ensure!(
         plan.package.to_str() == Some(expected_package.as_str()),
         "package path is not canonical for the epoch"
     );
     validate_campaign_receipt_path(
         &plan.package_receipt,
-        &format!(
-            "epoch{}-complete-span-store8-immutable-package-ca2e38b-",
-            plan.epoch
-        ),
+        &if plan.epoch == 224 {
+            "epoch224-complete-span-v1-6-25-immutable-package-01879c4-".to_string()
+        } else {
+            format!(
+                "epoch{}-complete-span-store8-immutable-package-ca2e38b-",
+                plan.epoch
+            )
+        },
     )
     .context("package receipt path is not canonical for the epoch")?;
-    let expected_probe_root = format!(
-        "/home/ubuntu/.jetstreamer-private/qualification-{}/package-capability-probe-rust-ca2e38b-v{}",
-        plan.epoch, plan.probe_attempt
-    );
+    let expected_probe_root = if plan.epoch == 224 {
+        format!(
+            "/home/ubuntu/.jetstreamer-private/qualification-224/package-capability-probe-rust-01879c4-v{}",
+            plan.probe_attempt
+        )
+    } else {
+        format!(
+            "/home/ubuntu/.jetstreamer-private/qualification-{}/package-capability-probe-rust-ca2e38b-v{}",
+            plan.epoch, plan.probe_attempt
+        )
+    };
     ensure!(
         plan.probe_root.to_str() == Some(expected_probe_root.as_str()),
         "probe root is not canonical for the epoch"
     );
     validate_campaign_receipt_path(
         &plan.receipt,
-        &format!(
-            "epoch{}-complete-span-package-capability-ca2e38b-rust-",
-            plan.epoch
-        ),
+        &if plan.epoch == 224 {
+            "epoch224-complete-span-package-capability-01879c4-rust-".to_string()
+        } else {
+            format!(
+                "epoch{}-complete-span-package-capability-ca2e38b-rust-",
+                plan.epoch
+            )
+        },
     )
     .context("receipt path is not canonical for the epoch")?;
     ensure!(
@@ -838,7 +892,7 @@ fn run() -> Result<()> {
     let worker = require_member(
         &plan.package,
         &sums,
-        "jetstreamer-historical-worker-v1-6-16-store8",
+        worker_member(&plan),
         &plan.worker_sha256,
         true,
     )?;
@@ -897,7 +951,14 @@ fn run() -> Result<()> {
         .arg(format!("--horizon-output={}", archive.display()))
         .arg(format!("--replay-scratch={}", scratch.display()))
         .env("JETSTREAMER_ALLOW_CANDIDATE_RUNTIME", "1")
-        .env("JETSTREAMER_HISTORICAL_WORKER_V1_6_16", &worker.path)
+        .env(
+            if plan.epoch == 224 {
+                "JETSTREAMER_HISTORICAL_WORKER_V1_6_25"
+            } else {
+                "JETSTREAMER_HISTORICAL_WORKER_V1_6_16"
+            },
+            &worker.path,
+        )
         .env("JETSTREAMER_PRIVATE_RUN_ROOT", &private_root)
         .env("RUST_LOG", "info")
         .env("SOLANA_RAYON_THREADS", "16")
@@ -1067,6 +1128,54 @@ mod tests {
             stdout: text.as_bytes().to_vec(),
             stderr: Vec::new(),
         }
+    }
+
+    #[test]
+    fn epoch224_probe_is_bound_to_exact_runtime_and_private_complete_span() {
+        let mut current = plan();
+        current.epoch = 224;
+        current.bootstrap_slot = 96_767_522;
+        current.terminal_slot = 97_631_459;
+        current.package =
+            "/var/lib/jetstreamer/horizon-focused-224-complete-span-v1-6-25-01879c4-v1".into();
+        current.package_receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch224-complete-span-v1-6-25-immutable-package-01879c4-test.json".into();
+        current.snapshot_name =
+            "snapshot-96767522-3SdyhqCuei4esVf8imz8A2rPB1z83sAK3KHbtKefJDS7.tar.zst".into();
+        current.snapshot_sha256 =
+            "dc7f2ac03813bc609629885af82222ac5af070cc6187b7bce08e10944fd214e1".into();
+        current.checkpoint_name = "epoch-hashes-224-complete-span.txt".into();
+        current.checkpoint_sha256 =
+            "916a4d9414db22338d55eef537cb630fa47f86dc993c7d8be585cd2afa4bb8a4".into();
+        current.worker_sha256 =
+            "f26fb8598aef4091356be31a0ee322c2e428609f201390cce26ec60df9c62c45".into();
+        current.probe_root = "/home/ubuntu/.jetstreamer-private/qualification-224/package-capability-probe-rust-01879c4-v4".into();
+        current.receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch224-complete-span-package-capability-01879c4-rust-test.json".into();
+        validate_plan(&current).unwrap();
+        assert_eq!(
+            worker_member(&current),
+            "jetstreamer-historical-worker-v1-6-25"
+        );
+        let missing = current
+            .probe_root
+            .join("missing")
+            .join(&current.snapshot_name);
+        let text = expected_log_markers(&current, &missing).join("\n");
+        validate_output(&current, &missing, &output(&text, 1)).unwrap();
+        assert!(
+            validate_output(
+                &current,
+                &missing,
+                &output(&text.replace("solana-v1.6.25", "solana-v1.6.20"), 1)
+            )
+            .is_err()
+        );
+        current.terminal_slot -= 1;
+        assert!(validate_plan(&current).is_err());
+        current.terminal_slot += 1;
+        current.worker_sha256 = "2".repeat(64);
+        assert!(validate_plan(&current).is_err());
+        current.epoch = 225;
+        assert!(validate_plan(&current).is_err());
     }
 
     #[test]

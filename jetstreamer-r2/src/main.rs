@@ -1349,6 +1349,57 @@ fn current_jet_size(directory: &Path, epoch: u64) -> Result<u64> {
     }
 }
 
+fn validate_status_archive_directory(
+    observer_bytes: &[u8],
+    epoch: u64,
+    directory: &Path,
+    phase: &str,
+) -> Result<()> {
+    if phase != "replay" {
+        return Ok(());
+    }
+    // validate_observer_binding independently authenticates this exact claim
+    // before this function is called. A root cohort writes privately until its
+    // shared import gate: measuring the final destination silently reports zero.
+    let observer: Value = serde_json::from_slice(observer_bytes)?;
+    let replay = observer["replays"]
+        .as_array()
+        .context("observer replays missing")?
+        .iter()
+        .find(|replay| {
+            replay["range"]
+                .as_str()
+                .and_then(|range| parse_observer_claim_range(range).ok())
+                .is_some_and(|claim| claim.contains(&epoch))
+        })
+        .context("status directory has no observer claim")?;
+    let scratch = Path::new(observer_string(replay, &["scratch_path"])?);
+    ensure!(
+        scratch.is_absolute(),
+        "observer scratch path is not absolute"
+    );
+    let root_cohort = scratch.components().any(|part| {
+        part.as_os_str()
+            .to_str()
+            .is_some_and(|name| name.starts_with("root-cohort-"))
+    });
+    if root_cohort {
+        let run = scratch.parent().context("scratch has no run parent")?;
+        let cohort_name = format!("root-cohort-{}", observer_string(replay, &["range"])?);
+        ensure!(
+            scratch.file_name() == Some(std::ffi::OsStr::new("scratch"))
+                && run.parent().and_then(Path::file_name)
+                    == Some(std::ffi::OsStr::new(&cohort_name)),
+            "observer root-cohort scratch layout does not bind its claim"
+        );
+        ensure!(
+            directory == run.join("archives"),
+            "replay status must measure this invocation's private root-cohort archives, not its import destination"
+        );
+    }
+    Ok(())
+}
+
 fn status_receipt_path(directory: &Path, status: &EpochStatus) -> PathBuf {
     let timestamp = status
         .sampled_at_utc
@@ -1495,6 +1546,12 @@ async fn status_publish(
             .expected_producer_invocation_id
             .as_deref()
             .expect("validated"),
+    )?;
+    validate_status_archive_directory(
+        &observer_bytes,
+        epoch,
+        &config.directory,
+        config.phase.as_deref().expect("validated"),
     )?;
     let status = EpochStatus {
         epoch,
@@ -3301,6 +3358,93 @@ mod tests {
             authenticated_readback: true,
             verified_unix_seconds: 1,
         }
+    }
+
+    #[test]
+    fn replay_status_measures_private_root_cohort_not_import_destination() {
+        let mut observer = serde_json::json!({"replays":[{
+            "range":"216-219",
+            "scratch_path":"/private/work/root-cohort-216-219/run-123/scratch"
+        }]});
+        let bytes = serde_json::to_vec(&observer).unwrap();
+        for epoch in 216..=219 {
+            validate_status_archive_directory(
+                &bytes,
+                epoch,
+                Path::new("/private/work/root-cohort-216-219/run-123/archives"),
+                "replay",
+            )
+            .unwrap();
+            assert!(
+                validate_status_archive_directory(
+                    &bytes,
+                    epoch,
+                    Path::new("/private/lane/output"),
+                    "replay"
+                )
+                .is_err()
+            );
+            assert!(
+                validate_status_archive_directory(
+                    &bytes,
+                    epoch,
+                    Path::new("/private/work/root-cohort-216-219/run-other/archives"),
+                    "replay"
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_status_archive_directory(
+                &bytes,
+                220,
+                Path::new("/private/work/root-cohort-216-219/run-123/archives"),
+                "replay"
+            )
+            .is_err()
+        );
+        observer["replays"][0]["scratch_path"] =
+            serde_json::json!("/private/work/root-cohort-220-223/run-123/scratch");
+        assert!(
+            validate_status_archive_directory(
+                &serde_json::to_vec(&observer).unwrap(),
+                216,
+                Path::new("/private/work/root-cohort-220-223/run-123/archives"),
+                "replay"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn status_directory_guard_preserves_standalone_and_downstream_phases() {
+        let observer = serde_json::json!({"replays":[{
+            "range":"224-224", "scratch_path":"/private/qualification-224/run-1/scratch"
+        }]});
+        let bytes = serde_json::to_vec(&observer).unwrap();
+        validate_status_archive_directory(
+            &bytes,
+            224,
+            Path::new("/private/diagnostic-output"),
+            "replay",
+        )
+        .unwrap();
+        validate_status_archive_directory(
+            &bytes,
+            224,
+            Path::new("/private/imported-output"),
+            "verification",
+        )
+        .unwrap();
+        assert!(
+            validate_status_archive_directory(
+                b"{\"replays\":[]}",
+                224,
+                Path::new("/private/output"),
+                "replay"
+            )
+            .is_err()
+        );
     }
 
     #[test]
