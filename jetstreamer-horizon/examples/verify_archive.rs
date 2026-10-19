@@ -694,11 +694,23 @@ fn run_scan(
     expected_parent: Option<ChainPoint>,
     require_anchor: bool,
 ) -> ScanOutcome {
+    run_scan_with_provenance(path, threads, full, expected_parent, require_anchor, None)
+}
+
+fn run_scan_with_provenance(
+    path: &str,
+    threads: usize,
+    full: bool,
+    expected_parent: Option<ChainPoint>,
+    require_anchor: bool,
+    expected_provenance_sha256: Option<&str>,
+) -> ScanOutcome {
     let (slot_start, slot_count, bucket_slots, bucket_count, epoch, coverage_ok) = {
         let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
         let mut r = ArchiveReader::open(BufReader::with_capacity(1 << 20, file))
             .unwrap_or_else(|e| panic!("open archive: {e}"));
-        validate_structured_provenance(&r);
+        validate_provenance_expectation(&r, expected_provenance_sha256)
+            .unwrap_or_else(|error| panic!("validate archive provenance: {error}"));
         let h = r.header().clone();
         let coverage_ok = r
             .has_complete_slot_coverage()
@@ -1038,7 +1050,7 @@ fn run_scan(
 
 fn usage() -> ! {
     eprintln!(
-        "usage: verify_archive <path> [max_slots] [start_slot] [--full] [--internal-full] [--anchor SLOT HASH] [--expected-terminal SLOT HASH] [--threads N]"
+        "usage: verify_archive <path> [max_slots] [start_slot] [--full] [--internal-full] [--anchor SLOT HASH] [--expected-terminal SLOT HASH] [--expected-provenance-sha256 HEX] [--threads N]"
     );
     eprintln!(
         "       verify_archive --chain <path>... [--segment] [--full] [--anchor SLOT HASH] [--threads N]"
@@ -1055,6 +1067,9 @@ fn usage() -> ! {
     eprintln!(
         "  --expected-terminal SLOT HASH  with --full, require this exact canonical final block; no partial/internal-only mode"
     );
+    eprintln!(
+        "  --expected-provenance-sha256 HEX  with strict --full, bind the canonical encoded provenance to independently derived source evidence (not publication admission)"
+    );
     eprintln!("  --chain              verify ordered, contiguous archives as one chain");
     eprintln!(
         "  --segment            verify only the boundaries inside a multi-archive chain segment; defer both outer boundaries"
@@ -1067,15 +1082,34 @@ fn usage() -> ! {
 /// integrity verifier must parse it explicitly, including V4 restart mappings.
 /// Structural acceptance is not canonical runtime or publication admission.
 fn validate_structured_provenance<R: Read + std::io::Seek>(reader: &ArchiveReader<R>) {
-    if let Some(provenance) = reader
-        .provenance()
-        .unwrap_or_else(|error| panic!("validate archive provenance: {error}"))
-    {
-        println!(
-            "archive provenance V{}: structurally valid (not runtime/publication admission)",
-            provenance.version()
-        );
+    validate_provenance_expectation(reader, None)
+        .unwrap_or_else(|error| panic!("validate archive provenance: {error}"));
+}
+
+fn validate_provenance_expectation<R: Read + std::io::Seek>(
+    reader: &ArchiveReader<R>,
+    expected_sha256: Option<&str>,
+) -> Result<(), String> {
+    if let Some(expected) = expected_sha256 {
+        require_hex(expected, &[64], "--expected-provenance-sha256")?;
     }
+    let provenance = reader.provenance().map_err(|error| error.to_string())?;
+    if let Some(provenance) = provenance {
+        let encoded = jetstreamer_horizon::archive::encode_archive_provenance(&provenance)
+            .map_err(|error| error.to_string())?;
+        let digest = format!("{:x}", Sha256::digest(&encoded));
+        if expected_sha256.is_some_and(|expected| expected != digest) {
+            return Err(format!("provenance SHA-256 mismatch: actual {digest}"));
+        }
+        println!(
+            "archive provenance V{}: structurally valid; sha256={} (not runtime/publication admission)",
+            provenance.version(),
+            digest
+        );
+    } else if expected_sha256.is_some() {
+        return Err("expected provenance is absent".into());
+    }
+    Ok(())
 }
 
 fn terminal_expectation_matches(actual: Option<ChainPoint>, expected: Option<ChainPoint>) -> bool {
@@ -1412,6 +1446,7 @@ fn main() {
     let mut internal_full = false;
     let mut anchor = None;
     let mut expected_terminal = None;
+    let mut expected_provenance_sha256 = None;
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
@@ -1465,6 +1500,16 @@ fn main() {
                 }
                 expected_terminal = Some(parse_anchor(&args, &mut i));
             }
+            "--expected-provenance-sha256" => {
+                if expected_provenance_sha256.is_some() {
+                    usage();
+                }
+                i += 1;
+                let digest = args.get(i).unwrap_or_else(|| usage());
+                require_hex(digest, &[64], "--expected-provenance-sha256")
+                    .unwrap_or_else(|_| usage());
+                expected_provenance_sha256 = Some(digest.as_str());
+            }
             value if value.starts_with("--") => usage(),
             other => positionals.push(
                 other
@@ -1483,12 +1528,22 @@ fn main() {
     if expected_terminal.is_some() && (!full || internal_full || !positionals.is_empty()) {
         usage();
     }
+    if expected_provenance_sha256.is_some() && (!full || internal_full || !positionals.is_empty()) {
+        usage();
+    }
 
     // `--full` and whole-file normal verification both run the parallel scanner.
     // A partial slice (max_slots / start_slot, for throughput sampling) keeps the
     // single-pass path below.
     if full {
-        let outcome = run_scan(&path, threads, true, anchor, !internal_full);
+        let outcome = run_scan_with_provenance(
+            &path,
+            threads,
+            true,
+            anchor,
+            !internal_full,
+            expected_provenance_sha256,
+        );
         let end = outcome.slot_start.saturating_add(outcome.slot_count);
         let tail_ok = tail_requirement_satisfied(outcome.last_block_slot, end, !internal_full);
         if !tail_ok {
@@ -1597,6 +1652,123 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expected_provenance_binds_v4_restart_snapshot_and_raw_namespaces() {
+        use jetstreamer_horizon::archive::{
+            AccountsHashKind, ArchiveProvenance, ArchiveProvenanceV3, ArchiveProvenanceV4,
+            BootstrapStateKind, RuntimeAdmission, RuntimeHandoffProvenance,
+            RuntimeSegmentProvenance, RuntimeStateCheckpoint, StateCommitment, StateCommitmentKind,
+            TransactionMetadataPolicy, WriteVersionNormalization, encode_archive_provenance,
+        };
+        let predecessor = RuntimeStateCheckpoint {
+            slot: 10,
+            bank_hash: Hash::new_from_array([2; 32]),
+            accounts_hash_kind: AccountsHashKind::LegacyAccountsHash,
+            accounts_hash: Hash::new_from_array([3; 32]),
+            last_blockhash: Hash::new_from_array([4; 32]),
+            capitalization: 100,
+            transaction_count: 20,
+            tick_height: 640,
+            slot_complete: true,
+            next_write_version: 1,
+        };
+        let segment = |slot, worker_start, archive_start| RuntimeSegmentProvenance {
+            slot_start: slot,
+            slot_count: 1,
+            generation_profile: "independently-bound-generation".into(),
+            runtime_profile: "same-runtime".into(),
+            runtime_admission: RuntimeAdmission::Candidate,
+            runtime_revision: "same-revision".into(),
+            runtime_toolchain: "same-toolchain".into(),
+            worker_executable_sha256: Some([5; 32]),
+            write_versions: WriteVersionNormalization {
+                worker_start,
+                worker_end_exclusive: worker_start + 1,
+                archive_start,
+            },
+        };
+        let value = ArchiveProvenanceV4 {
+            base: ArchiveProvenanceV3 {
+                assembly_profile: "private-restart-test".into(),
+                genesis_hash: Hash::new_from_array([6; 32]),
+                bootstrap_state_kind: BootstrapStateKind::SnapshotArchive,
+                bootstrap_state: StateCommitment {
+                    slot: 9,
+                    kind: StateCommitmentKind::LegacyAccountsHash,
+                    hash: Hash::new_from_array([7; 32]),
+                },
+                requested_slot_start: 10,
+                requested_slot_count: 2,
+                transaction_metadata: TransactionMetadataPolicy::observed(),
+                runtime_segments: vec![segment(10, 0, 0), segment(11, 50, 1)],
+                handoffs: vec![RuntimeHandoffProvenance {
+                    boundary_slot: 11,
+                    predecessor,
+                    successor: RuntimeStateCheckpoint {
+                        next_write_version: 50,
+                        ..predecessor
+                    },
+                    successor_bootstrap_kind: BootstrapStateKind::SnapshotArchive,
+                    successor_bootstrap_archive_sha256: [8; 32],
+                    successor_bootstrap_write_count: 0,
+                }],
+            },
+        };
+        let expected = format!(
+            "{:x}",
+            Sha256::digest(
+                encode_archive_provenance(&ArchiveProvenance::V4(value.clone())).unwrap()
+            )
+        );
+        let reader_for = |provenance: ArchiveProvenanceV4| {
+            let mut writer = ArchiveWriter::new_with_provenance(
+                Vec::new(),
+                1,
+                10,
+                2,
+                ArchiveWriterConfig::default(),
+                &provenance.into(),
+            )
+            .unwrap();
+            writer.write_skipped_slot(10).unwrap();
+            writer.write_skipped_slot(11).unwrap();
+            ArchiveReader::open(Cursor::new(writer.finish().unwrap().0)).unwrap()
+        };
+        validate_provenance_expectation(&reader_for(value.clone()), Some(&expected)).unwrap();
+        // Both mutations remain structurally valid. Only the independent
+        // expectation detects substitution of the snapshot or raw namespace.
+        let mut wrong_snapshot = value.clone();
+        wrong_snapshot.base.handoffs[0].successor_bootstrap_archive_sha256 = [9; 32];
+        assert!(
+            validate_provenance_expectation(&reader_for(wrong_snapshot), Some(&expected)).is_err()
+        );
+        let mut wrong_cursor = value;
+        wrong_cursor.base.runtime_segments[1]
+            .write_versions
+            .worker_start += 100;
+        wrong_cursor.base.runtime_segments[1]
+            .write_versions
+            .worker_end_exclusive += 100;
+        wrong_cursor.base.handoffs[0].successor.next_write_version += 100;
+        assert!(
+            validate_provenance_expectation(&reader_for(wrong_cursor), Some(&expected)).is_err()
+        );
+    }
+
+    #[test]
+    fn expected_provenance_rejects_missing_and_noncanonical_expectations() {
+        let legacy = ArchiveReader::open(Cursor::new(write_archive(1, 10, &[None]))).unwrap();
+        assert!(validate_provenance_expectation(&legacy, None).is_ok());
+        for expected in [
+            "a".repeat(64),
+            "A".repeat(64),
+            "a".repeat(63),
+            String::new(),
+        ] {
+            assert!(validate_provenance_expectation(&legacy, Some(&expected)).is_err());
+        }
+    }
 
     #[test]
     fn canonical_terminal_requires_both_slot_and_hash() {

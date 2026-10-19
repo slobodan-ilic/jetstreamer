@@ -680,6 +680,13 @@ canonical checkpoint, current-plugin, runtime-route or publication admission.
 For an independently bound canonical endpoint, `verify_archive --full --anchor SLOT HASH
 --expected-terminal SLOT HASH` additionally checks the scanned final block's slot and hash.
 The terminal option rejects partial, internal-only and chain modes.
+Strict full verification may also bind `--expected-provenance-sha256 HEX`, the SHA-256 of
+`encode_archive_provenance` applied to an independently derived expected envelope. Derive that
+expectation from sealed source manifests, native checkpoint and snapshot evidence, never by
+copying the target archive's reported digest. This binds the complete envelope, including V4
+restart snapshot identities and both raw/normalized write-version namespaces. Missing or
+different provenance fails before the slot scan. The option rejects partial, internal-only and
+chain modes and grants no runtime, canonical-import or publication admission.
 
 The dedicated `epoch213-checkpoint-continuation-diagnostic` node build exposes only the private
 epoch-213 continuation experiment. Invoke it with `213 /PRIVATE_RUN_ROOT/ledger --verify
