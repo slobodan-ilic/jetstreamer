@@ -5029,6 +5029,10 @@ fn usage(program: &str) -> String {
          \x20       --recover-unreceipted-root-cohort-only]\n\
          \x20      [--source-cohort-receipt=PATH | --unreceipted-recovery-evidence=PATH]\n\
          \x20      [--publish-through-epoch=N]\n\
+         Read-only source diagnostic: {program} --probe-successor-boundary=SLOT\n\
+         SLOT must be a nonzero epoch boundary; no other arguments are accepted.\n\
+         This runs the production boundary reader with a 60-second total timeout,\n\
+         writes only diagnostic JSON to stdout, and never starts replay or publication.\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
@@ -8698,6 +8702,28 @@ fn post_firehose_incomplete_retry_attempts() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS)
+}
+
+fn parse_successor_boundary_probe(
+    argument: &str,
+    has_extra_arguments: bool,
+) -> Result<Slot, String> {
+    let value = argument
+        .strip_prefix("--probe-successor-boundary=")
+        .ok_or_else(|| "expected --probe-successor-boundary=SLOT".to_string())?;
+    if has_extra_arguments || value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("successor probe requires one decimal slot and no other arguments".to_string());
+    }
+    let slot: Slot = value
+        .parse()
+        .map_err(|_| "invalid successor probe slot".to_string())?;
+    if slot == 0 || !slot.is_multiple_of(432_000) {
+        return Err("successor probe slot must be a nonzero epoch boundary".to_string());
+    }
+    // Match the ordinary epoch parser's representability gate.
+    slot.checked_add(432_000)
+        .ok_or_else(|| "successor probe epoch exceeds the representable slot range".to_string())?;
+    Ok(slot)
 }
 
 async fn fetch_first_block_edge_at_or_after(
@@ -18796,6 +18822,45 @@ async fn main() {
         return;
     }
 
+    if epoch_arg.starts_with("--probe-successor-boundary") {
+        let slot = match parse_successor_boundary_probe(&epoch_arg, args.next().is_some()) {
+            Ok(slot) => slot,
+            Err(error) => {
+                eprintln!("{error}");
+                exit(2);
+            }
+        };
+        // Deliberately return before destination parsing, snapshot access, leases,
+        // runtime selection, or any replay/archive/publication setup.
+        let client = jetstreamer_firehose::network::create_http_client();
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            fetch_first_block_edge_at_or_after(slot, &client),
+        )
+        .await;
+        match result {
+            Ok(Ok((parent_slot, first_block_slot))) => println!(
+                "{}",
+                serde_json::json!({
+                    "schema": "jetstreamer-successor-boundary-source-probe-v1",
+                    "epoch": slot_to_epoch(slot), "requested_slot": slot,
+                    "parent_slot": parent_slot, "first_block_slot": first_block_slot,
+                    "production_boundary_reader": true, "replay_launch_authorized": false,
+                    "publication_authorized": false, "remote_mutations": false, "r2_mutations": false
+                })
+            ),
+            Ok(Err(error)) => {
+                eprintln!("successor boundary probe failed: {error}");
+                exit(1);
+            }
+            Err(_) => {
+                eprintln!("successor boundary probe exceeded its 60-second total timeout");
+                exit(1);
+            }
+        }
+        return;
+    }
+
     let (start_epoch, end_epoch) = match parse_epoch_range(&epoch_arg) {
         Ok(range) => range,
         Err(err) => {
@@ -20937,6 +21002,43 @@ async fn main() {
 #[cfg(test)]
 mod early_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn successor_boundary_probe_accepts_only_nonzero_epoch_boundaries() {
+        for slot in [79_488_000_u64, 85_968_000] {
+            assert_eq!(
+                parse_successor_boundary_probe(
+                    &format!("--probe-successor-boundary={slot}"),
+                    false
+                )
+                .unwrap(),
+                slot
+            );
+        }
+        for argument in [
+            "--probe-successor-boundary",
+            "--probe-successor-boundary=",
+            "--probe-successor-boundary=0",
+            "--probe-successor-boundary=-432000",
+            "--probe-successor-boundary=+432000",
+            "--probe-successor-boundary=432001",
+            "--probe-successor-boundary=18446744073709551616",
+        ] {
+            assert!(
+                parse_successor_boundary_probe(argument, false).is_err(),
+                "{argument}"
+            );
+        }
+        assert!(parse_successor_boundary_probe("--probe-successor-boundary=432000", true).is_err());
+        let near_maximum_boundary = u64::MAX / 432_000 * 432_000;
+        assert!(
+            parse_successor_boundary_probe(
+                &format!("--probe-successor-boundary={near_maximum_boundary}"),
+                false
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn compact_index_retry_delay_honors_retry_after_and_caps_backoff() {
