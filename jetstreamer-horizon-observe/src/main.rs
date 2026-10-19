@@ -161,6 +161,7 @@ struct CrossSampleObservation {
     previous_completed_at_utc: String,
     elapsed_seconds: u64,
     producer_cgroup_counter_delta: BTreeMap<String, u64>,
+    producer_io_counter_delta_available: bool,
     effective_cpu_cores: Option<f64>,
     physical_scratch_delta_bytes: i128,
     worker_vma_delta: i128,
@@ -174,6 +175,7 @@ struct PreviousReplayObservation {
     completed_at_utc: String,
     completed_unix: u64,
     producer_cgroup_counters: BTreeMap<String, u64>,
+    producer_io_counters_available: bool,
     physical_scratch_bytes: u64,
     worker_vmas: u64,
 }
@@ -214,6 +216,7 @@ struct ReplayObservation {
     producer_after: UnitObservation,
     worker_after: WorkerObservation,
     producer_cgroup_counter_delta: BTreeMap<String, u64>,
+    producer_io_counter_delta_available: bool,
     useful_work: ProgressWindow,
     cross_sample: Option<CrossSampleObservation>,
     invocation_binding_stable: bool,
@@ -786,25 +789,45 @@ fn observe_cgroup(control_group: &str) -> Result<CgroupObservation> {
     })
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct CounterDeltas {
+    counters: BTreeMap<String, u64>,
+    io_counters_comparable: bool,
+}
+
 fn counter_deltas(
     before: &BTreeMap<String, u64>,
     after: &BTreeMap<String, u64>,
-) -> Result<BTreeMap<String, u64>> {
+) -> Result<CounterDeltas> {
     // cgroup v2 can add an optional io.stat field when that operation is
     // first observed.  Identity and cgroup-path stability are checked
     // independently, so a newly materialized monotonic counter has a valid
-    // zero baseline.  The kernel may also omit the optional discard counters
-    // when their value is zero on a later io.stat read.  Preserve that known
-    // zero without weakening any nonzero or required-counter disappearance.
+    // zero baseline.  The kernel may also remove an io.stat device row after
+    // its I/O completes, which makes the aggregate I/O fields disappear or
+    // decrease even though the cgroup itself is stable.  In that case omit
+    // only the incomparable I/O delta and retain every required counter gate.
     for (name, before_value) in before {
-        ensure!(
-            after.contains_key(name)
-                || (*before_value == 0 && matches!(name.as_str(), "io.dbytes" | "io.dios")),
-            "cgroup counter {name} disappeared during observation"
-        );
+        if !name.starts_with("io.") {
+            let after_value = after
+                .get(name)
+                .ok_or_else(|| anyhow!("cgroup counter {name} disappeared during observation"))?;
+            ensure!(
+                *after_value >= *before_value,
+                "cgroup counter {name} decreased during observation"
+            );
+        }
     }
-    let mut deltas = after
+    let io_counters_comparable = before
         .iter()
+        .filter(|(name, _)| name.starts_with("io."))
+        .all(|(name, before_value)| {
+            after
+                .get(name)
+                .is_some_and(|after_value| after_value >= before_value)
+        });
+    let counters = after
+        .iter()
+        .filter(|(name, _)| io_counters_comparable || !name.starts_with("io."))
         .map(|(name, after_value)| {
             let before_value = before.get(name).copied().unwrap_or(0);
             ensure!(
@@ -814,12 +837,10 @@ fn counter_deltas(
             Ok((name.clone(), *after_value - before_value))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    for (name, before_value) in before {
-        if !after.contains_key(name) && *before_value == 0 {
-            deltas.insert(name.clone(), 0);
-        }
-    }
-    Ok(deltas)
+    Ok(CounterDeltas {
+        counters,
+        io_counters_comparable,
+    })
 }
 
 fn json_u64(value: &Value, field: &str) -> Result<u64> {
@@ -880,6 +901,10 @@ fn previous_replay_observation(
     let counters = producer_after
         .pointer("/cgroup/counters")
         .ok_or_else(|| anyhow!("previous v2 sample lacks cgroup counters for {range}"))?;
+    let io_counters_available = producer_after
+        .pointer("/cgroup/io_counters_available")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("previous v2 sample lacks I/O counter availability for {range}"))?;
     let physical_scratch_bytes = replay
         .get("conservative_observed_physical_bytes")
         .ok_or_else(|| anyhow!("previous v2 sample lacks scratch bytes for {range}"))?;
@@ -891,6 +916,7 @@ fn previous_replay_observation(
         completed_at_utc: completed_at_utc.to_owned(),
         completed_unix,
         producer_cgroup_counters: json_counter_map(counters, "cgroup counters")?,
+        producer_io_counters_available: io_counters_available,
         physical_scratch_bytes: json_u64(physical_scratch_bytes, "scratch bytes")?,
         worker_vmas: json_u64(worker_vmas, "worker VMAs")?,
     }))
@@ -923,7 +949,11 @@ fn cross_sample_observation(
         &previous.producer_cgroup_counters,
         &producer_before.cgroup.counters,
     )?;
+    let producer_io_counter_delta_available = previous.producer_io_counters_available
+        && producer_before.cgroup.io_counters_available
+        && producer_cgroup_counter_delta.io_counters_comparable;
     let effective_cpu_cores = producer_cgroup_counter_delta
+        .counters
         .get("cpu.usage_usec")
         .map(|usage| *usage as f64 / (elapsed_seconds as f64 * 1_000_000.0));
     let physical_scratch_delta_bytes = i128::from(conservative_physical_scratch_bytes)
@@ -937,7 +967,8 @@ fn cross_sample_observation(
         previous_sample_schema: previous.schema,
         previous_completed_at_utc: previous.completed_at_utc,
         elapsed_seconds,
-        producer_cgroup_counter_delta,
+        producer_cgroup_counter_delta: producer_cgroup_counter_delta.counters,
+        producer_io_counter_delta_available,
         effective_cpu_cores,
         physical_scratch_delta_bytes,
         worker_vma_delta,
@@ -1429,6 +1460,9 @@ fn run(config: Config) -> Result<()> {
             &producer_before.cgroup.counters,
             &producer_after.cgroup.counters,
         )?;
+        let producer_io_counter_delta_available = producer_before.cgroup.io_counters_available
+            && producer_after.cgroup.io_counters_available
+            && producer_cgroup_counter_delta.io_counters_comparable;
         let useful_work = observe_progress(
             &replay.expected_producer_invocation_id,
             progress_since_unix,
@@ -1471,7 +1505,8 @@ fn run(config: Config) -> Result<()> {
             controller_after,
             producer_after,
             worker_after,
-            producer_cgroup_counter_delta,
+            producer_cgroup_counter_delta: producer_cgroup_counter_delta.counters,
+            producer_io_counter_delta_available,
             useful_work,
             cross_sample,
             invocation_binding_stable,
@@ -1720,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_deltas_handle_only_zero_optional_discard_counter_disappearance() {
+    fn cgroup_deltas_omit_only_incomparable_io_counters() {
         let before = BTreeMap::from([
             ("cpu.usage_usec".to_owned(), 100),
             ("io.dbytes".to_owned(), 0),
@@ -1732,10 +1767,9 @@ mod tests {
             ("io.rbytes".to_owned(), 25),
         ]);
         let deltas = counter_deltas(&before, &after).unwrap();
-        assert_eq!(deltas["cpu.usage_usec"], 30);
-        assert_eq!(deltas["io.rbytes"], 5);
-        assert_eq!(deltas["io.dbytes"], 0);
-        assert_eq!(deltas["io.dios"], 0);
+        assert_eq!(deltas.counters["cpu.usage_usec"], 30);
+        assert!(!deltas.io_counters_comparable);
+        assert!(!deltas.counters.keys().any(|name| name.starts_with("io.")));
 
         let newly_materialized = BTreeMap::from([
             ("cpu.usage_usec".to_owned(), 130),
@@ -1750,36 +1784,43 @@ mod tests {
             &newly_materialized,
         )
         .unwrap();
-        assert_eq!(deltas["io.dbytes"], 7);
+        assert_eq!(deltas.counters["io.dbytes"], 7);
+        assert_eq!(deltas.counters["io.rbytes"], 5);
+        assert!(deltas.io_counters_comparable);
 
         let disappeared = BTreeMap::from([("cpu.usage_usec".to_owned(), 140)]);
-        assert!(
-            counter_deltas(&before, &disappeared)
-                .unwrap_err()
-                .to_string()
-                .contains("io.rbytes disappeared")
-        );
+        let deltas = counter_deltas(&before, &disappeared).unwrap();
+        assert_eq!(deltas.counters["cpu.usage_usec"], 40);
+        assert!(!deltas.io_counters_comparable);
+        assert!(!deltas.counters.keys().any(|name| name.starts_with("io.")));
 
         let nonzero_discard = BTreeMap::from([
             ("cpu.usage_usec".to_owned(), 100),
             ("io.dbytes".to_owned(), 1),
         ]);
-        assert!(
-            counter_deltas(&nonzero_discard, &disappeared)
-                .unwrap_err()
-                .to_string()
-                .contains("io.dbytes disappeared")
-        );
+        let deltas = counter_deltas(&nonzero_discard, &disappeared).unwrap();
+        assert!(!deltas.io_counters_comparable);
 
         let zero_required = BTreeMap::from([
             ("cpu.usage_usec".to_owned(), 100),
-            ("io.rbytes".to_owned(), 0),
+            ("memory_events.oom".to_owned(), 0),
         ]);
         assert!(
             counter_deltas(&zero_required, &disappeared)
                 .unwrap_err()
                 .to_string()
-                .contains("io.rbytes disappeared")
+                .contains("memory_events.oom disappeared")
+        );
+
+        let decreased_required = BTreeMap::from([("cpu.usage_usec".to_owned(), 99)]);
+        assert!(
+            counter_deltas(
+                &BTreeMap::from([("cpu.usage_usec".to_owned(), 100)]),
+                &decreased_required,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cpu.usage_usec decreased")
         );
     }
 
@@ -1867,10 +1908,13 @@ mod tests {
                 "range": "216-219",
                 "producer_after": {
                     "invocation_id": invocation,
-                    "cgroup": {"counters": {
-                        "cpu.usage_usec": 1_000_000,
-                        "io.rbytes": 100
-                    }}
+                    "cgroup": {
+                        "io_counters_available": true,
+                        "counters": {
+                            "cpu.usage_usec": 1_000_000,
+                            "io.rbytes": 100
+                        }
+                    }
                 },
                 "conservative_observed_physical_bytes": 1_000,
                 "worker_after": {"vmas": 100}
@@ -1948,6 +1992,7 @@ mod tests {
             3_600_000_000
         );
         assert_eq!(observation.effective_cpu_cores, Some(2.0));
+        assert!(observation.producer_io_counter_delta_available);
         assert_eq!(observation.physical_scratch_delta_bytes, 500);
         assert_eq!(observation.worker_vma_delta, 20);
         assert_eq!(
