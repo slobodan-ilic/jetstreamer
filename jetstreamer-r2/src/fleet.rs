@@ -22,6 +22,16 @@ struct Gate {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DiagnosticClaim {
+    epoch: u64,
+    unit: String,
+    invocation_id: String,
+    scratch_path: PathBuf,
+    launch_receipt: BoundFile,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Plan {
     schema: String,
     first_epoch: u64,
@@ -33,6 +43,86 @@ struct Plan {
     gates: BTreeMap<u64, Gate>,
     // Include terminal and quarantined controllers, not just observer entries.
     tracked_units: Vec<String>,
+    // Bounded private comparisons capture their own in-run resource counters.
+    // They are active qualification work, not ordinary replay/sidecar claims.
+    #[serde(default)]
+    diagnostics: Vec<DiagnosticClaim>,
+}
+
+fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Result<()> {
+    ensure!(
+        receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1"
+            && receipt["launched"] == true
+            && receipt["remote_mutations"] == false
+            && receipt["r2_mutations"] == false,
+        "invalid diagnostic launch receipt"
+    );
+    ensure!(
+        claim
+            .unit
+            .starts_with(&format!("horizon-perf-epoch{}-", claim.epoch))
+            && claim.unit.contains('@')
+            && claim.scratch_path.is_absolute(),
+        "diagnostic scope or scratch binding is invalid"
+    );
+    let matching: Vec<_> = receipt["evidence"]["units"]
+        .as_array()
+        .context("launch omits units")?
+        .iter()
+        .filter(|unit| unit["unit"] == claim.unit)
+        .collect();
+    ensure!(
+        matching.len() == 1
+            && matching[0]["invocation_id"] == claim.invocation_id
+            && claim.invocation_id.len() == 32
+            && claim
+                .invocation_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && matching[0]["restarts"] == 0
+            && matching[0]["load_state"] == "loaded"
+            && matching[0]["result"] == "success"
+            && matching[0]["main_pid"].as_u64().is_some_and(|pid| pid > 0)
+            && matching[0]["active_state"] == "active"
+            && matching[0]["sub_state"] == "running",
+        "diagnostic launch identity mismatch"
+    );
+    Ok(())
+}
+
+fn transitions(
+    previous: &Value,
+    current_units: &BTreeMap<String, Value>,
+    epochs: &[Value],
+) -> Vec<Value> {
+    let mut changes = Vec::new();
+    let prior_units = previous["unit_census"].as_object();
+    let mut names: BTreeSet<_> = current_units.keys().cloned().collect();
+    if let Some(units) = prior_units {
+        names.extend(units.keys().cloned());
+    }
+    for name in names {
+        let before = prior_units
+            .and_then(|units| units.get(&name))
+            .unwrap_or(&Value::Null);
+        let after = current_units.get(&name).unwrap_or(&Value::Null);
+        if before != after {
+            changes
+                .push(json!({"kind":"unit-transition","unit":name,"before":before,"after":after}));
+        }
+    }
+    if let Some(prior_epochs) = previous["epochs"].as_array() {
+        for epoch in epochs {
+            if let Some(before) = prior_epochs
+                .iter()
+                .find(|prior| prior["epoch"] == epoch["epoch"])
+                && before["state"] != epoch["state"]
+            {
+                changes.push(json!({"kind":"epoch-state-transition","epoch":epoch["epoch"],"before":before["state"],"after":epoch["state"]}));
+            }
+        }
+    }
+    changes
 }
 
 fn bound_json(bound: &BoundFile) -> Result<Value> {
@@ -284,7 +374,7 @@ pub(super) async fn run() -> Result<()> {
         sample_seconds <= started_seconds && started_seconds - sample_seconds <= 1800,
         "fleet requires an observer sample no older than 30 minutes"
     );
-    if let Some(previous) = &plan.previous_fleet {
+    let previous_fleet = if let Some(previous) = &plan.previous_fleet {
         let previous = bound_json(previous)?;
         ensure!(
             previous["schema"] == SCHEMA,
@@ -302,7 +392,10 @@ pub(super) async fn run() -> Result<()> {
                 < sample,
             "fleet sample must advance"
         );
-    }
+        previous
+    } else {
+        Value::Null
+    };
     let replays = observer["replays"]
         .as_array()
         .context("observer replays missing")?;
@@ -312,11 +405,53 @@ pub(super) async fn run() -> Result<()> {
             names.insert(observer_string(replay, &[kind, "unit"])?.into());
         }
     }
+    let mut diagnostic_units = BTreeSet::new();
+    for claim in &plan.diagnostics {
+        ensure!(
+            (plan.first_epoch..=plan.last_epoch).contains(&claim.epoch)
+                && diagnostic_units.insert(claim.unit.clone()),
+            "duplicate or out-of-range diagnostic claim"
+        );
+        validate_diagnostic_launch(&bound_json(&claim.launch_receipt)?, claim)?;
+        for replay in replays {
+            ensure!(
+                !parse_observer_claim_range(observer_string(replay, &["range"])?)?
+                    .contains(&claim.epoch),
+                "diagnostic overlaps an ordinary replay claim"
+            );
+        }
+        names.insert(claim.unit.clone());
+    }
     let before = census(&names)?;
     let r2 = r2_config_from_env()?;
     let s3 = s3_client(&r2);
     let mut entries = Vec::new();
     let mut active = Vec::new();
+    let mut diagnostics = Vec::new();
+    for claim in &plan.diagnostics {
+        let current = &before[&claim.unit];
+        let is_active = current["ActiveState"] == "active" && current["SubState"] == "running";
+        if is_active {
+            ensure!(
+                current["InvocationID"] == claim.invocation_id && current["NRestarts"] == "0",
+                "diagnostic live invocation changed"
+            );
+            ensure!(
+                claim.scratch_path.canonicalize()? == claim.scratch_path
+                    && claim.scratch_path.is_dir(),
+                "diagnostic scratch must be an exact canonical directory"
+            );
+            active.push(json!({"epoch":claim.epoch,"phase":"diagnostic-qualification","producer":current,
+                "scratch_path":claim.scratch_path,"launch_receipt":claim.launch_receipt.path,
+                "launch_receipt_sha256":claim.launch_receipt.sha256,"sampled_at_utc":sample,
+                "resource_basis":"bounded runner captures invocation-bound in-run cgroup and target-stop metrics",
+                "ordinary_replay_claim":false,"current_sidecar_eta_valid":false}));
+        }
+        diagnostics.push(json!({"epoch":claim.epoch,"unit":current,"live":is_active,
+            "launch_invocation_id":claim.invocation_id,"launch_receipt":claim.launch_receipt.path,
+            "launch_receipt_sha256":claim.launch_receipt.sha256,
+            "terminal_outcome_requires_canary_receipt":!is_active}));
+    }
     let mut remote_entries = Vec::new();
     for epoch in plan.first_epoch..=plan.last_epoch {
         let remote = inventory_epoch(&s3, &r2, epoch).await?;
@@ -399,7 +534,8 @@ pub(super) async fn run() -> Result<()> {
         "fleet unit identities or commands changed during reconciliation"
     );
     let inventory = inventory_report(remote_entries);
-    let receipt = json!({"schema":SCHEMA,"first_epoch":plan.first_epoch,"last_epoch":plan.last_epoch,"sampled_at_utc":sample,"observer_receipt":plan.observer.path,"observer_sha256":plan.observer.sha256,"previous_fleet":plan.previous_fleet.as_ref().map(|p|json!({"path":p.path,"sha256":p.sha256})),"plan":plan_bound.path,"plan_sha256":plan_bound.sha256,"inventory":inventory,"unit_census":after,"active":active,"epochs":entries,"recorded_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),"remote_mutations":false,"producer_mutations":false,"publication_authorized":false});
+    let changes = transitions(&previous_fleet, &after, &entries);
+    let receipt = json!({"schema":SCHEMA,"first_epoch":plan.first_epoch,"last_epoch":plan.last_epoch,"sampled_at_utc":sample,"observer_receipt":plan.observer.path,"observer_sha256":plan.observer.sha256,"previous_fleet":plan.previous_fleet.as_ref().map(|p|json!({"path":p.path,"sha256":p.sha256})),"plan":plan_bound.path,"plan_sha256":plan_bound.sha256,"inventory":inventory,"unit_census":after,"active":active,"diagnostics":diagnostics,"transitions":changes,"epochs":entries,"recorded_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),"remote_mutations":false,"producer_mutations":false,"publication_authorized":false});
     persist(&plan.output, &receipt)?;
     println!("{}", plan.output.display());
     Ok(())
@@ -408,6 +544,61 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_launch_binds_epoch_unit_and_exact_zero_restart_invocation() {
+        let mut claim = DiagnosticClaim {
+            epoch: 154,
+            unit: "horizon-perf-epoch154-test@control.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/private/epoch154/control/scratch".into(),
+            launch_receipt: BoundFile {
+                path: "/private/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let mut receipt = json!({"schema":"jetstreamer-historical-performance-launch-receipt-v1",
+            "launched":true,"remote_mutations":false,"r2_mutations":false,
+            "evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,
+                "restarts":0,"load_state":"loaded","result":"success","main_pid":1,
+                "active_state":"active","sub_state":"running"}]}});
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        claim.epoch = 155;
+        assert!(validate_diagnostic_launch(&receipt, &claim).is_err());
+        claim.epoch = 154;
+        receipt["evidence"]["units"][0]["invocation_id"] = json!("c".repeat(32));
+        assert!(validate_diagnostic_launch(&receipt, &claim).is_err());
+        receipt["evidence"]["units"][0]["invocation_id"] = json!(claim.invocation_id);
+        receipt["evidence"]["units"][0]["restarts"] = json!(1);
+        assert!(validate_diagnostic_launch(&receipt, &claim).is_err());
+    }
+
+    #[test]
+    fn fleet_records_disappeared_invocations_new_units_and_epoch_transitions() {
+        let previous = json!({"unit_census":{"old.service":{"InvocationID":"a"},
+            "gone.service":{"InvocationID":"c"}},"epochs":[{"epoch":154,"state":"blocked-qualification"}]});
+        let current = BTreeMap::from([
+            ("old.service".into(), json!({"InvocationID":"b"})),
+            ("new.service".into(), json!({"InvocationID":"d"})),
+        ]);
+        let epochs = vec![json!({"epoch":154,"state":"remote-ready"})];
+        let changes = transitions(&previous, &current, &epochs);
+        assert_eq!(changes.len(), 4);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c["unit"] == "gone.service" && c["after"].is_null())
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c["unit"] == "new.service" && c["before"].is_null())
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c["kind"] == "epoch-state-transition" && c["epoch"] == 154)
+        );
+    }
     #[test]
     fn stale_or_replaced_status_never_matches_a_live_claim() {
         let status = EpochStatus {
