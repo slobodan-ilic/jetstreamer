@@ -1770,6 +1770,17 @@ mod tests {
                 .to_string()
                 .contains("io.dbytes disappeared")
         );
+
+        let zero_required = BTreeMap::from([
+            ("cpu.usage_usec".to_owned(), 100),
+            ("io.rbytes".to_owned(), 0),
+        ]);
+        assert!(
+            counter_deltas(&zero_required, &disappeared)
+                .unwrap_err()
+                .to_string()
+                .contains("io.rbytes disappeared")
+        );
     }
 
     #[test]
