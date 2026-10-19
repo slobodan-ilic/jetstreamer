@@ -54,3 +54,41 @@ original cgroup. A replacement invocation is never stopped. Old receipts remain
 unchanged. The guard does not delete scratch, restart work, publish archives,
 mutate R2, establish resource admission, or replace coordinated 30-minute replay
 observations and fleet reconciliation.
+
+For a bounded measurement, add the optional strict mode:
+
+```json
+{
+  "worker_root": "/srv/horizon/private/exact-generation/scratch",
+  "bounded_measurement": {
+    "intent_path": "/srv/horizon/private/exact-generation/target-stop-intent.json",
+    "producer_uid": 1001,
+    "target_slot": 66577778,
+    "maximum_drain_seconds": 600
+  }
+}
+```
+
+This is an extension to the complete plan above, not a standalone plan. The
+intent must be a direct member of the producer-owned private measurement root,
+immediately above the exact scratch directory. Strict mode requires one readable
+bound worker while active; start under observation and prove the guard against
+the actual worker before leaving it unattended. A zero-worker observation is
+accepted only with the unchanged sealed runner's complete, private, stable,
+same-invocation target-stop intent: target reached, scratch snapshot captured,
+SIGINT controlled stop, no external signal, and a fresh timestamp. The timeout
+must be between 1 and 900 seconds; the existing runner uses 600 seconds.
+
+The first accepted workerless handoff is pinned no-clobber in the root-private
+guard directory. A rewritten intent, moved deadline, changed digest, different
+plan or different producer invocation cannot renew or transfer that exception.
+Malformed, missing, unreadable, stale or foreign handoffs trip the exact bound
+producer. A valid handoff never excuses multiple workers, unreadable maps, a
+filesystem-floor trip or a VMA trip. Legacy plans without this optional mode
+retain their normal bootstrap/drainage behavior.
+
+Every stop goes through the same final exact-invocation/restart-policy check;
+an identity mismatch is an error without signaling the replacement. This differs
+from the old performance guard's mismatch-as-stop behavior, which must not be
+reused for new measurements. Qualify the Rust binary and its handoff/copy-path
+tests before sealing, and retain the real sandboxed first-fire requirement.

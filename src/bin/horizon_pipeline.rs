@@ -28,6 +28,9 @@ use jetstreamer_plugin::plugins::account_writes::AccountWritesPlugin;
 use jetstreamer_plugin::plugins::pubkey_stats_horizon::PubkeyStatsHorizonPlugin;
 use jetstreamer_plugin::plugins::verification::VerificationPlugin;
 
+#[path = "horizon_pipeline/capacity.rs"]
+mod capacity;
+
 // jemalloc, for the same reason as jetstreamer-node: the decode path churns
 // huge short-lived allocations across many threads, where glibc malloc costs
 // kernel time (mmap/munmap per allocation) that grows with thread count.
@@ -46,7 +49,8 @@ fn should_spawn_for_dsn(dsn: &str) -> bool {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: horizon-pipeline <epoch|start:end> <jet-dir-or-base-url> \
+        "usage: horizon-pipeline --archive-capacity-probe\n\
+         or: horizon-pipeline <epoch|start:end> <jet-dir-or-base-url> \
          [--threads N] [--clickhouse-dsn URL] [--bench|--verify-only] \
          [--no-account-bytes] [--no-preload]\n\
          --verify-only runs the read-only Horizon verification plugin over \
@@ -249,6 +253,19 @@ async fn main() {
 
     let mut args = std::env::args().skip(1);
     let range = args.next().unwrap_or_else(|| usage());
+    if range == "--archive-capacity-probe" {
+        if args.next().is_some() {
+            usage();
+        }
+        match capacity::probe() {
+            Ok(result) => println!("{result}"),
+            Err(error) => {
+                eprintln!("archive capacity probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let location = args.next().unwrap_or_else(|| usage());
     let mut threads_override: Option<usize> = None;
     let mut dsn =

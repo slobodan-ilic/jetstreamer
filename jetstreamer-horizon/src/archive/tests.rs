@@ -21,7 +21,16 @@ fn writer_defaults_to_measured_archival_zstd_level() {
 
 #[test]
 fn historical_epoch_boundary_pre_updates_cover_epoch_201_reward_burst() {
-    const OBSERVED_REWARD_RECIPIENTS: usize = 70_318;
+    epoch_201_pre_update_count_roundtrip(70_318);
+}
+
+#[test]
+fn private_epoch_201_audit_pre_update_count_roundtrips() {
+    // Exact count rejected by the retained plugin's 65,536-record decoder.
+    epoch_201_pre_update_count_roundtrip(71_524);
+}
+
+fn epoch_201_pre_update_count_roundtrip(observed_pre_updates: usize) {
     let mut writer = ArchiveWriter::new(
         Vec::new(),
         201,
@@ -34,7 +43,7 @@ fn historical_epoch_boundary_pre_updates_cover_epoch_201_reward_burst() {
     )
     .unwrap();
     writer.begin_slot(86_832_000).unwrap();
-    for write_version in 0..OBSERVED_REWARD_RECIPIENTS as u64 {
+    for write_version in 0..observed_pre_updates as u64 {
         writer
             .write_orphan_update(&AccountUpdateView {
                 pubkey: Address::new_from_array([7; 32]),
@@ -63,7 +72,7 @@ fn historical_epoch_boundary_pre_updates_cover_epoch_201_reward_burst() {
     let mut reader = ArchiveReader::open(std::io::Cursor::new(archive)).unwrap();
     let mut count = CountPreUpdates::default();
     reader.read_slots(0, u64::MAX, &mut count).unwrap();
-    assert_eq!(count.0, OBSERVED_REWARD_RECIPIENTS);
+    assert_eq!(count.0, observed_pre_updates);
 }
 
 #[test]

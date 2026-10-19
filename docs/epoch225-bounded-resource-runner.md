@@ -72,6 +72,10 @@ for this role. Use its separately sealed optional `bounded_canary` profile:
 intent and the matching capture; absent, malformed, stale, substituted, or
 wrong-invocation evidence cannot excuse zero workers. Do not launch this runner
 until the exact deployed sandbox and first real guard fire are qualified.
+The first accepted intent and capture are pinned in the root-private guard
+directory; replacing either file or moving the timestamp cannot renew drainage.
+Do not combine this profile with the separate generic `bounded_measurement`
+profile used by older performance runners.
 
 Keep the existing 30-minute coordinated observation cadence; guard and target
 events are safety/lifecycle handling, not an additional routine replay poll.

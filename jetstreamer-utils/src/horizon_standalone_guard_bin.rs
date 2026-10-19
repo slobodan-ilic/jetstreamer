@@ -17,6 +17,9 @@ use {
     },
 };
 
+#[path = "horizon_standalone_guard_handoff.rs"]
+mod handoff;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Plan {
@@ -28,6 +31,8 @@ struct Plan {
     worker_root: PathBuf,
     maximum_worker_vmas: u64,
     receipt_directory: PathBuf,
+    #[serde(default)]
+    bounded_measurement: Option<handoff::BoundedMeasurement>,
     #[serde(default)]
     bounded_canary: Option<BoundedCanary>,
 }
@@ -159,16 +164,14 @@ fn canary_target(p: &Plan, c: &BoundedCanary, now: u64) -> Result<Option<Value>>
         Err(e) => return Err(e.into()),
         Ok(_) => {}
     }
-    let intent: Value = serde_json::from_slice(&read_canary_evidence(
-        &c.target_stop_intent,
-        c.expected_uid,
-        64 << 10,
-    )?)?;
-    let capture: Value = serde_json::from_slice(&read_canary_evidence(
+    let intent_raw = read_canary_evidence(&c.target_stop_intent, c.expected_uid, 64 << 10)?;
+    let capture_raw = read_canary_evidence(
         &p.worker_root.join("receipts/target-capture.json"),
         c.expected_uid,
         64 << 20,
-    )?)?;
+    )?;
+    let intent: Value = serde_json::from_slice(&intent_raw)?;
+    let capture: Value = serde_json::from_slice(&capture_raw)?;
     validate_canary_target(
         &intent,
         &capture,
@@ -177,7 +180,36 @@ fn canary_target(p: &Plan, c: &BoundedCanary, now: u64) -> Result<Option<Value>>
         now,
         c.maximum_drainage_seconds,
     )?;
-    Ok(Some(intent))
+    Ok(Some(
+        json!({"intent":intent,"intent_sha256":sha(&intent_raw),"capture_sha256":sha(&capture_raw)}),
+    ))
+}
+
+fn pinned_canary_target(
+    p: &Plan,
+    c: &BoundedCanary,
+    now: u64,
+    plan_sha: &str,
+) -> Result<Option<Value>> {
+    let Some(evidence) = canary_target(p, c, now)? else {
+        return Ok(None);
+    };
+    let pin_path = p.receipt_directory.join("canary-target-handoff-pin.json");
+    match fs::symlink_metadata(&pin_path) {
+        Ok(_) => {
+            let pin: Value = serde_json::from_slice(&read_private(&pin_path)?)?;
+            ensure!(
+                handoff_pin_matches(&pin, plan_sha, &p.invocation_id, &evidence),
+                "canary target evidence changed after first accepted observation"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => persist(
+            &pin_path,
+            &json!({"schema":"jetstreamer-horizon-bounded-handoff-pin-v1","plan_sha256":plan_sha,"producer_invocation_id":p.invocation_id,"target_handoff":evidence,"remote_mutations":false,"r2_mutations":false}),
+        )?,
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(evidence))
 }
 
 fn canary_trip_reason(
@@ -348,6 +380,17 @@ fn active(unit: &Unit) -> bool {
     ) && unit.pid != 0
 }
 
+fn stop_if_bound<F>(unit: &Unit, expected_invocation: &str, stop: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    bound(unit, expected_invocation)?;
+    if active(unit) {
+        stop()?;
+    }
+    Ok(())
+}
+
 fn collected(unit: &Unit) -> bool {
     unit.load_state == "not-found"
         && unit.active == "inactive"
@@ -380,8 +423,23 @@ fn cgroup_pids(root: &Path) -> Result<Vec<u32>> {
 }
 
 fn workers(unit: &Unit, worker_root: &Path) -> Result<Vec<(u32, u64)>> {
+    workers_from_roots(
+        unit,
+        worker_root,
+        Path::new("/sys/fs/cgroup"),
+        Path::new("/proc"),
+    )
+}
+
+fn workers_from_roots(
+    unit: &Unit,
+    worker_root: &Path,
+    cgroup_root: &Path,
+    proc_root: &Path,
+) -> Result<Vec<(u32, u64)>> {
     ensure!(
         unit.cgroup.starts_with('/')
+            && !unit.cgroup.starts_with("//")
             && unit.cgroup != "/"
             && !unit
                 .cgroup
@@ -389,16 +447,10 @@ fn workers(unit: &Unit, worker_root: &Path) -> Result<Vec<(u32, u64)>> {
                 .any(|part| part == ".." || part == "."),
         "unsafe cgroup path"
     );
-    workers_from_pids(
-        &cgroup_pids(&Path::new("/sys/fs/cgroup").join(&unit.cgroup[1..]))?,
-        worker_root,
-    )
-}
-
-fn workers_from_pids(pids: &[u32], worker_root: &Path) -> Result<Vec<(u32, u64)>> {
     let mut workers = Vec::new();
-    for &pid in pids {
-        let executable = match fs::read_link(format!("/proc/{pid}/exe")) {
+    for pid in cgroup_pids(&cgroup_root.join(&unit.cgroup[1..]))? {
+        let process = proc_root.join(pid.to_string());
+        let executable = match fs::read_link(process.join("exe")) {
             Ok(path) => path,
             Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
                 continue;
@@ -418,7 +470,7 @@ fn workers_from_pids(pids: &[u32], worker_root: &Path) -> Result<Vec<(u32, u64)>
                 executable.starts_with(worker_root),
                 "worker escaped the bound generation"
             );
-            let maps = fs::read_to_string(format!("/proc/{pid}/maps"))?;
+            let maps = fs::read_to_string(process.join("maps"))?;
             workers.push((pid, maps.lines().count() as u64));
         }
     }
@@ -442,10 +494,33 @@ fn trip_reason(
     }
 }
 
+fn measurement_trip_reason(
+    free: u64,
+    floor: u64,
+    workers: &[(u32, u64)],
+    max_vmas: u64,
+    bounded_measurement: bool,
+    valid_handoff: bool,
+) -> Option<&'static str> {
+    trip_reason(free, floor, workers, max_vmas).or_else(|| {
+        (bounded_measurement && workers.is_empty() && !valid_handoff)
+            .then_some("missing-or-invalid-target-handoff")
+    })
+}
+
 fn intent_matches(intent: &Value, plan_sha: &str, invocation: &str) -> bool {
     intent["schema"] == "jetstreamer-horizon-standalone-stop-intent-v1"
         && intent["plan_sha256"] == plan_sha
         && intent["producer_invocation_id"] == invocation
+}
+
+fn handoff_pin_matches(pin: &Value, plan_sha: &str, invocation: &str, handoff: &Value) -> bool {
+    pin["schema"] == "jetstreamer-horizon-bounded-handoff-pin-v1"
+        && pin["plan_sha256"] == plan_sha
+        && pin["producer_invocation_id"] == invocation
+        && pin["target_handoff"] == *handoff
+        && pin["remote_mutations"] == false
+        && pin["r2_mutations"] == false
 }
 
 fn run() -> Result<()> {
@@ -464,6 +539,10 @@ fn run() -> Result<()> {
     let bytes = read_private(Path::new(&args[1]))?;
     ensure!(sha(&bytes) == args[3], "guard plan digest mismatch");
     let plan: Plan = serde_json::from_slice(&bytes)?;
+    ensure!(
+        plan.bounded_measurement.is_none() || plan.bounded_canary.is_none(),
+        "choose exactly one bounded guard profile"
+    );
     if let Some(c) = &plan.bounded_canary {
         ensure!(
             plan.unit
@@ -497,6 +576,9 @@ fn run() -> Result<()> {
         plan.worker_root != Path::new("/") && plan.worker_root != plan.filesystem,
         "worker root must name an isolated generation"
     );
+    if let Some(measurement) = &plan.bounded_measurement {
+        measurement.validate(&plan.worker_root)?;
+    }
     let invocation = env::var("INVOCATION_ID").context("guard must run in systemd")?;
     ensure!(identity(&invocation), "invalid guard invocation");
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -587,10 +669,10 @@ fn run() -> Result<()> {
     // never evidence that the unit has no worker.
     let error = observed_workers.as_ref().err().map(ToString::to_string);
     let worker_list = observed_workers.unwrap_or_default();
-    let target_observation = if active(&before) {
+    let target_observation = if active(&before) && error.is_none() {
         plan.bounded_canary
             .as_ref()
-            .map(|c| canary_target(&plan, c, now))
+            .map(|c| pinned_canary_target(&plan, c, now, &args[3]))
     } else {
         None
     };
@@ -601,16 +683,48 @@ fn run() -> Result<()> {
     let valid_target = target_observation
         .as_ref()
         .is_some_and(|r| matches!(r, Ok(Some(_))));
+    let handoff = if active(&before) && error.is_none() && worker_list.is_empty() {
+        plan.bounded_measurement
+            .as_ref()
+            .map(|measurement| -> Result<Value> {
+                let evidence = measurement.read(&plan.invocation_id, now)?;
+                let pin_path = plan.receipt_directory.join("target-handoff-pin.json");
+                match fs::symlink_metadata(&pin_path) {
+                    Ok(_) => {
+                        let pin: Value = serde_json::from_slice(&read_private(&pin_path)?)?;
+                        ensure!(handoff_pin_matches(&pin,&args[3],&plan.invocation_id,&evidence),
+                            "target handoff changed after first workerless observation");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => persist(
+                        &pin_path,
+                        &json!({"schema":"jetstreamer-horizon-bounded-handoff-pin-v1",
+                            "plan_sha256":args[3],"producer_invocation_id":plan.invocation_id,
+                            "target_handoff":evidence,"remote_mutations":false,"r2_mutations":false}),
+                    )?,
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(evidence)
+            })
+    } else {
+        None
+    };
+    let handoff_error = handoff
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .map(ToString::to_string);
+    let handoff_evidence = handoff.and_then(Result::ok);
     let reason = if intent.is_some() {
         Some("resume-stop-intent")
     } else if error.is_some() {
         Some("worker-observation-failed")
     } else if active(&before) {
-        trip_reason(
+        measurement_trip_reason(
             available,
             plan.minimum_free_bytes,
             &worker_list,
             plan.maximum_worker_vmas,
+            plan.bounded_measurement.is_some(),
+            handoff_evidence.is_some(),
         )
         .or_else(|| {
             plan.bounded_canary.as_ref().and_then(|_| {
@@ -631,7 +745,9 @@ fn run() -> Result<()> {
         "producer":after,"producer_invocation_id":plan.invocation_id,"available_bytes":available,
         "minimum_free_bytes":plan.minimum_free_bytes,"maximum_worker_vmas":plan.maximum_worker_vmas,
         "workers":worker_list,"worker_observation_error":error,"trip_reason":reason,
+        "bounded_measurement":plan.bounded_measurement.is_some(),
         "bounded_canary":plan.bounded_canary,"canary_target_stop_valid":valid_target,"canary_target_error":target_error,
+        "target_handoff":handoff_evidence,"target_handoff_error":handoff_error,
         "remote_mutations":false,"r2_mutations":false,"scratch_deleted":false});
     persist(
         &plan
@@ -648,8 +764,7 @@ fn run() -> Result<()> {
             )?;
         }
         let current = sample(&plan.unit)?;
-        bound(&current, &plan.invocation_id)?;
-        if active(&current) {
+        stop_if_bound(&current, &plan.invocation_id, || {
             let stopped = Command::new("systemctl")
                 .args(["stop", &plan.unit])
                 .output()?;
@@ -658,7 +773,8 @@ fn run() -> Result<()> {
                 "guard could not stop producer: {}",
                 String::from_utf8_lossy(&stopped.stderr)
             );
-        }
+            Ok(())
+        })?;
         let terminal = sample(&plan.unit)?;
         if collected(&terminal) {
             ensure!(
@@ -725,52 +841,146 @@ mod tests {
             pid: 1,
         }
     }
+
     #[test]
-    fn changed_invocation_or_restart_policy_is_never_stopped() {
+    fn actual_stop_callsite_never_signals_replacement_or_restarted_invocation() {
+        let calls = std::cell::Cell::new(0);
+        let stop = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
         let mut state = unit();
-        assert!(bound(&state, &"a".repeat(32)).is_ok());
-        assert!(bound(&state, &"b".repeat(32)).is_err());
+        assert!(stop_if_bound(&state, &"b".repeat(32), stop).is_err());
+        assert_eq!(calls.get(), 0);
         state.restarts = 1;
-        assert!(bound(&state, &"a".repeat(32)).is_err());
+        assert!(stop_if_bound(&state, &"a".repeat(32), stop).is_err());
+        assert_eq!(calls.get(), 0);
         state.restarts = 0;
-        state.restart_policy = "on-failure".into();
-        assert!(bound(&state, &"a".repeat(32)).is_err());
-        state.restart_policy = "no".into();
-        state.kill_mode = "process".into();
-        assert!(bound(&state, &"a".repeat(32)).is_err());
-        state.kill_mode = "control-group".into();
-        state.delegated = true;
-        assert!(bound(&state, &"a".repeat(32)).is_err());
-    }
-    #[test]
-    fn collected_exception_cannot_match_a_replacement_or_live_process() {
-        let mut state = unit();
-        state.load_state = "not-found".into();
+        stop_if_bound(&state, &"a".repeat(32), stop).unwrap();
+        assert_eq!(calls.get(), 1);
         state.active = "inactive".into();
         state.sub = "dead".into();
         state.pid = 0;
-        state.cgroup.clear();
-        state.invocation_id.clear();
-        assert!(collected(&state));
-        state.load_state = "loaded".into();
-        assert!(!collected(&state));
-        state.load_state = "not-found".into();
-        state.pid = 1;
-        assert!(!collected(&state));
+        stop_if_bound(&state, &"a".repeat(32), stop).unwrap();
+        assert_eq!(calls.get(), 1);
     }
+
     #[test]
-    fn reserve_vma_and_multiple_worker_trips() {
-        assert_eq!(trip_reason(99, 100, &[], 500), Some("filesystem-floor"));
+    fn first_workerless_handoff_is_pinned_and_cannot_be_renewed_or_transferred() {
+        let handoff = json!({"sha256":"first","written_unix_seconds":1000.25});
+        let pin = json!({"schema":"jetstreamer-horizon-bounded-handoff-pin-v1",
+            "plan_sha256":"plan","producer_invocation_id":"a".repeat(32),
+            "target_handoff":handoff,"remote_mutations":false,"r2_mutations":false});
+        assert!(handoff_pin_matches(&pin, "plan", &"a".repeat(32), &handoff));
+        let renewed = json!({"sha256":"new","written_unix_seconds":1100.25});
+        assert!(!handoff_pin_matches(
+            &pin,
+            "plan",
+            &"a".repeat(32),
+            &renewed
+        ));
+        assert!(!handoff_pin_matches(
+            &pin,
+            "plan",
+            &"b".repeat(32),
+            &handoff
+        ));
+        assert!(!handoff_pin_matches(
+            &pin,
+            "other-plan",
+            &"a".repeat(32),
+            &handoff
+        ));
+    }
+
+    #[test]
+    fn target_handoff_only_relaxes_zero_worker_draining_not_any_safety_trip() {
         assert_eq!(
-            trip_reason(100, 100, &[(1, 501)], 500),
+            measurement_trip_reason(100, 100, &[], 500, false, false),
+            None
+        );
+        assert_eq!(
+            measurement_trip_reason(100, 100, &[], 500, true, false),
+            Some("missing-or-invalid-target-handoff")
+        );
+        assert_eq!(
+            measurement_trip_reason(100, 100, &[], 500, true, true),
+            None
+        );
+        assert_eq!(
+            measurement_trip_reason(99, 100, &[], 500, true, true),
+            Some("filesystem-floor")
+        );
+        assert_eq!(
+            measurement_trip_reason(100, 100, &[(1, 1), (2, 1)], 500, true, true),
+            Some("multiple-workers")
+        );
+        assert_eq!(
+            measurement_trip_reason(100, 100, &[(1, 501)], 500, true, true),
             Some("worker-vma-ceiling")
         );
         assert_eq!(
-            trip_reason(100, 100, &[(1, 1), (2, 1)], 500),
-            Some("multiple-workers")
+            measurement_trip_reason(100, 100, &[(1, 500)], 500, true, false),
+            None
         );
-        assert_eq!(trip_reason(100, 100, &[], 500), None);
-        assert_eq!(trip_reason(100, 100, &[(1, 500)], 500), None);
+    }
+
+    #[test]
+    fn nested_fake_cgroup_recognizes_bound_copy_and_rejects_unreadable_or_escaped_workers() {
+        let root = tempfile::tempdir().unwrap();
+        let cgroups = root.path().join("cgroups");
+        let proc = root.path().join("proc");
+        let scratch = root.path().join("scratch");
+        let group = cgroups.join("system.slice/test.service");
+        fs::create_dir_all(group.join("nested")).unwrap();
+        fs::create_dir_all(proc.join("7")).unwrap();
+        fs::write(group.join("cgroup.procs"), "7\n").unwrap();
+        fs::write(group.join("nested/cgroup.procs"), "7\n").unwrap();
+        std::os::unix::fs::symlink(
+            scratch.join(".historical-runtime/test/bound-worker/historical-worker"),
+            proc.join("7/exe"),
+        )
+        .unwrap();
+        fs::write(proc.join("7/maps"), "map1\nmap2\n").unwrap();
+        let state = unit();
+        assert_eq!(
+            workers_from_roots(&state, &scratch, &cgroups, &proc).unwrap(),
+            vec![(7, 2)]
+        );
+        fs::remove_file(proc.join("7/maps")).unwrap();
+        assert!(workers_from_roots(&state, &scratch, &cgroups, &proc).is_err());
+        fs::write(proc.join("7/maps"), "map\n").unwrap();
+        fs::remove_file(proc.join("7/exe")).unwrap();
+        std::os::unix::fs::symlink(
+            root.path()
+                .join("scratch-store8/bound-worker/historical-worker"),
+            proc.join("7/exe"),
+        )
+        .unwrap();
+        assert!(workers_from_roots(&state, &scratch, &cgroups, &proc).is_err());
+        fs::remove_file(proc.join("7/exe")).unwrap();
+        std::os::unix::fs::symlink(
+            scratch.join("bound-worker/historical-worker"),
+            proc.join("7/exe"),
+        )
+        .unwrap();
+        fs::create_dir_all(proc.join("8")).unwrap();
+        fs::write(proc.join("8/maps"), "map\n").unwrap();
+        std::os::unix::fs::symlink(
+            scratch.join("bound-worker/historical-worker"),
+            proc.join("8/exe"),
+        )
+        .unwrap();
+        fs::write(group.join("nested/cgroup.procs"), "7\n8\n").unwrap();
+        assert_eq!(
+            workers_from_roots(&state, &scratch, &cgroups, &proc)
+                .unwrap()
+                .len(),
+            2
+        );
+        let mut escaped = state;
+        escaped.cgroup = "//system.slice/test.service".into();
+        assert!(workers_from_roots(&escaped, &scratch, &cgroups, &proc).is_err());
     }
     #[test]
     fn canary_zero_worker_exception_requires_fresh_valid_target_evidence() {
@@ -886,6 +1096,37 @@ mod tests {
         assert!(canary_target(&p, c, 1100).is_err());
     }
     #[test]
+    fn pinned_canary_target_cannot_renew_its_timestamp() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        fs::set_permissions(t.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let receipts = t.path().join("receipts");
+        fs::create_dir(&receipts).unwrap();
+        fs::set_permissions(&receipts, fs::Permissions::from_mode(0o700)).unwrap();
+        let (mut intent, capture) = target_fixture(t.path());
+        let p:Plan=serde_json::from_value(json!({"schema":"jetstreamer-horizon-standalone-guard-plan-v1","unit":"horizon-qualify-225-bounded-resource-test.service","invocation_id":"a".repeat(32),"filesystem":"/","minimum_free_bytes":1,"worker_root":t.path(),"maximum_worker_vmas":3500000,"receipt_directory":t.path(),"bounded_canary":{"expected_uid":0,"target_stop_intent":receipts.join("target-stop.json"),"maximum_drainage_seconds":180}})).unwrap();
+        let c = p.bounded_canary.as_ref().unwrap();
+        let capture_path = receipts.join("target-capture.json");
+        fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+        fs::set_permissions(&capture_path, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::write(
+            &c.target_stop_intent,
+            serde_json::to_vec_pretty(&intent).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&c.target_stop_intent, fs::Permissions::from_mode(0o400)).unwrap();
+        pinned_canary_target(&p, c, 1100, "plan").unwrap().unwrap();
+        pinned_canary_target(&p, c, 1100, "plan").unwrap().unwrap();
+        intent["written_unix_seconds"] = json!(1100);
+        let replacement = receipts.join("renewed.json");
+        fs::write(&replacement, serde_json::to_vec_pretty(&intent).unwrap()).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::rename(replacement, &c.target_stop_intent).unwrap();
+        assert!(pinned_canary_target(&p, c, 1101, "plan").is_err());
+    }
+    #[test]
     fn nested_cgroup_census_recognizes_the_actual_copied_worker_and_maps() {
         struct Owned(std::process::Child);
         impl Drop for Owned {
@@ -901,7 +1142,7 @@ mod tests {
         fs::copy("/bin/sleep", &exe).unwrap();
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o555)).unwrap();
         let child = Owned(Command::new(&exe).arg("20").spawn().unwrap());
-        let cg = t.path().join("cgroup");
+        let cg = t.path().join("actual");
         fs::create_dir(&cg).unwrap();
         fs::write(cg.join("cgroup.procs"), b"").unwrap();
         let nested = cg.join("child");
@@ -909,11 +1150,68 @@ mod tests {
         fs::write(nested.join("cgroup.procs"), format!("{}\n", child.0.id())).unwrap();
         let pids = cgroup_pids(&cg).unwrap();
         assert_eq!(pids, vec![child.0.id()]);
-        let found = workers_from_pids(&pids, &root).unwrap();
+        let mut state = unit();
+        state.cgroup = "/actual".into();
+        let found = workers_from_roots(&state, &root, t.path(), Path::new("/proc")).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, child.0.id());
         assert!(found[0].1 > 0);
-        assert!(workers_from_pids(&pids, &t.path().join("foreign")).is_err());
+        assert!(
+            workers_from_roots(
+                &state,
+                &t.path().join("foreign"),
+                t.path(),
+                Path::new("/proc")
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn changed_invocation_or_restart_policy_is_never_stopped() {
+        let mut state = unit();
+        assert!(bound(&state, &"a".repeat(32)).is_ok());
+        assert!(bound(&state, &"b".repeat(32)).is_err());
+        state.restarts = 1;
+        assert!(bound(&state, &"a".repeat(32)).is_err());
+        state.restarts = 0;
+        state.restart_policy = "on-failure".into();
+        assert!(bound(&state, &"a".repeat(32)).is_err());
+        state.restart_policy = "no".into();
+        state.kill_mode = "process".into();
+        assert!(bound(&state, &"a".repeat(32)).is_err());
+        state.kill_mode = "control-group".into();
+        state.delegated = true;
+        assert!(bound(&state, &"a".repeat(32)).is_err());
+    }
+    #[test]
+    fn collected_exception_cannot_match_a_replacement_or_live_process() {
+        let mut state = unit();
+        state.load_state = "not-found".into();
+        state.active = "inactive".into();
+        state.sub = "dead".into();
+        state.pid = 0;
+        state.cgroup.clear();
+        state.invocation_id.clear();
+        assert!(collected(&state));
+        state.load_state = "loaded".into();
+        assert!(!collected(&state));
+        state.load_state = "not-found".into();
+        state.pid = 1;
+        assert!(!collected(&state));
+    }
+    #[test]
+    fn reserve_vma_and_multiple_worker_trips() {
+        assert_eq!(trip_reason(99, 100, &[], 500), Some("filesystem-floor"));
+        assert_eq!(
+            trip_reason(100, 100, &[(1, 501)], 500),
+            Some("worker-vma-ceiling")
+        );
+        assert_eq!(
+            trip_reason(100, 100, &[(1, 1), (2, 1)], 500),
+            Some("multiple-workers")
+        );
+        assert_eq!(trip_reason(100, 100, &[], 500), None);
+        assert_eq!(trip_reason(100, 100, &[(1, 500)], 500), None);
     }
     #[test]
     fn interrupted_stop_is_bound_to_exact_plan_and_producer() {

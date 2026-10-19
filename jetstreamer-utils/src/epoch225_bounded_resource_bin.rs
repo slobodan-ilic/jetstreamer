@@ -235,6 +235,18 @@ fn progress_slot(line: &str) -> Option<u64> {
     (97_199_618..=TERMINAL).contains(&slot).then_some(slot)
 }
 
+fn progress_counters(line: &str) -> Option<Value> {
+    let slot = progress_slot(line)?;
+    let counter = |prefix: &str| {
+        line.split_whitespace()
+            .find_map(|s| s.strip_prefix(prefix))
+            .and_then(|n| n.parse::<u64>().ok())
+    };
+    Some(
+        json!({"slot":slot,"transactions":counter("txs=")?,"account_updates":counter("accounts=")?}),
+    )
+}
+
 fn metrics(cgroup: &Path) -> Result<Value> {
     let mut map = serde_json::Map::new();
     for name in [
@@ -569,6 +581,8 @@ fn measure(
     let mut capture = Value::Null;
     let mut error = None;
     let mut exit = None;
+    let mut first_progress: Option<Value> = None;
+    let mut last_progress: Option<Value> = None;
     let outcome = (|| -> Result<()> {
         loop {
             let external = EXTERNAL_SIGNAL.load(Ordering::SeqCst);
@@ -593,6 +607,13 @@ fn measure(
                 Ok(Ok(line)) => {
                     print!("{line}");
                     std::io::stdout().flush()?;
+                    if let Some(mut counters) = progress_counters(&line) {
+                        counters["elapsed_millis"] = json!(started.elapsed().as_millis());
+                        if first_progress.is_none() {
+                            first_progress = Some(counters.clone());
+                        }
+                        last_progress = Some(counters);
+                    }
                     if let Some(slot) = progress_slot(&line) {
                         observed = Some(observed.unwrap_or(slot).max(slot));
                         if stop_at.is_none() && slot >= p.target_slot {
@@ -658,7 +679,7 @@ fn measure(
         error = Some("unexpected checksum sidecar in diagnostic output".to_owned());
     }
     let success = error.is_none() && controlled_success(target, external, code);
-    let payload = json!({"schema":"jetstreamer-private-epoch225-bounded-resource-v1","epoch":225,"unit":p.unit,"invocation_id":invocation,"plan":{"path":bindings["plan_path"],"sha256":bindings["plan_sha256"]},"runner_sha256":bindings["self_sha256"],"node_sha256":p.node.sha256,"worker_sha256":WORKER,"snapshot_sha256":SNAPSHOT,"target_slot":p.target_slot,"observed_slot":observed,"target_reached":target,"child_pid":pid,"child_return_code":code,"external_signal":external,"elapsed_millis":started.elapsed().as_millis(),"capture":capture,"cgroup_before":before,"cgroup_after":metrics(cgroup)?,"free_before":free_before,"free_after":free_bytes(&p.run_root)?,"success":success,"error":error,"authority":{"ordinary_replay_authorized":false,"full_cold_epoch_peak_qualified":false,"publication_authorized":false,"runtime_promotion_authorized":false,"canonical_sidecar_authorized":false,"remote_mutations":false,"r2_mutations":false}});
+    let payload = json!({"schema":"jetstreamer-private-epoch225-bounded-resource-v1","epoch":225,"unit":p.unit,"invocation_id":invocation,"plan":{"path":bindings["plan_path"],"sha256":bindings["plan_sha256"]},"runner_sha256":bindings["self_sha256"],"node_sha256":p.node.sha256,"worker_sha256":WORKER,"snapshot_sha256":SNAPSHOT,"target_slot":p.target_slot,"observed_slot":observed,"target_reached":target,"first_progress":first_progress,"last_progress":last_progress,"child_pid":pid,"child_return_code":code,"external_signal":external,"elapsed_millis":started.elapsed().as_millis(),"capture":capture,"cgroup_before":before,"cgroup_after":metrics(cgroup)?,"free_before":free_before,"free_after":free_bytes(&p.run_root)?,"success":success,"error":error,"authority":{"ordinary_replay_authorized":false,"full_cold_epoch_peak_qualified":false,"publication_authorized":false,"runtime_promotion_authorized":false,"canonical_sidecar_authorized":false,"remote_mutations":false,"r2_mutations":false}});
     persist(
         &p.run_root.join(if success {
             "receipts/resource.json"
@@ -776,6 +797,11 @@ mod tests {
         assert_eq!(
             progress_slot("program log: progress slot 97202500/97631459"),
             None
+        );
+        assert!(progress_counters(line).is_none());
+        assert_eq!(
+            progress_counters(&format!("{line} txs=123 accounts=456")).unwrap(),
+            json!({"slot":TARGET,"transactions":123,"account_updates":456})
         );
     }
     #[test]
