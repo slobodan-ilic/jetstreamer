@@ -20,6 +20,10 @@ struct Plan {
     resource_audit: Bound,
     full_verifier: Bound,
     current_plugin: Bound,
+    #[serde(default)]
+    plugin_capacity_probe_required: bool,
+    #[serde(default)]
+    parallel_scans: bool,
     threads: u64,
     output_directory: PathBuf,
     publication_authorized: bool,
@@ -166,9 +170,58 @@ fn run_child(tool: &Bound, args: &[String], output: &Path) -> Result<Value> {
     )
 }
 
+fn run_phases<F>(parallel: bool, work: F) -> Result<[Value; 3]>
+where
+    F: Fn(usize) -> Result<Value> + Sync,
+{
+    if !parallel {
+        return Ok([work(0)?, work(1)?, work(2)?]);
+    }
+    // A fixed three-way fanout only. Joining all results preserves completed
+    // independent phase evidence even when one sibling fails.
+    std::thread::scope(|scope| {
+        let handles = [
+            scope.spawn(|| work(0)),
+            scope.spawn(|| work(1)),
+            scope.spawn(|| work(2)),
+        ];
+        let [full, ordered, plugin] = handles.map(|handle| {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("private verifier phase panicked"))
+                .and_then(|result| result)
+        });
+        Ok([full?, ordered?, plugin?])
+    })
+}
+
 fn validate_result(bytes: &[u8], args: &[String]) -> Result<()> {
     let text = std::str::from_utf8(bytes)?;
-    if args.iter().any(|arg| arg == "--verify-only") {
+    if args.len() == 1 && args[0] == "--archive-capacity-probe" {
+        let results: Vec<_> = text.lines().filter(|line| line.starts_with('{')).collect();
+        ensure!(
+            results.len() == 1,
+            "missing or ambiguous plugin capacity result"
+        );
+        let value: Value = serde_json::from_str(results[0])?;
+        ensure!(
+            value["schema"] == "jetstreamer-horizon-plugin-capacity-probe-v1"
+                && value["decoded_records"] == 71_524u64
+                && value["account_data_bytes"] == 1_144_384u64
+                && value["maximum_pre_updates"]
+                    .as_u64()
+                    .is_some_and(|n| n >= 71_524)
+                && value["maximum_pre_update_data_bytes"]
+                    .as_u64()
+                    .is_some_and(|n| n >= 1_144_384)
+                && value["publication_authorized"] == false
+                && value["production_completion_authorized"] == false
+                && value["local_retirement_authorized"] == false
+                && value["remote_mutations"] == false
+                && value["r2_mutations"] == false,
+            "plugin capacity probe shape, bound, or authority mismatch"
+        );
+    } else if args.iter().any(|arg| arg == "--verify-only") {
         let epoch = args
             .first()
             .context("plugin epoch missing")?
@@ -233,6 +286,7 @@ pub(super) fn run() -> Result<()> {
         plan.schema == "jetstreamer-horizon-private-resource-verification-plan-v1"
             && (200..=300).contains(&plan.epoch)
             && (1..=32).contains(&plan.threads)
+            && (!plan.parallel_scans || (plan.plugin_capacity_probe_required && plan.threads <= 8))
             && !plan.publication_authorized
             && !plan.production_completion_authorized
             && !plan.remote_mutations
@@ -248,6 +302,15 @@ pub(super) fn run() -> Result<()> {
         !receipt.try_exists()?,
         "private verification receipt already exists"
     );
+    let plugin_capacity = if plan.plugin_capacity_probe_required {
+        Some(run_child(
+            &plan.current_plugin,
+            &["--archive-capacity-probe".into()],
+            &plan.output_directory.join("plugin-capacity.log"),
+        )?)
+    } else {
+        None
+    };
     let audit_bytes = bound_bytes(&plan.resource_audit)?;
     let audit: Value = serde_json::from_slice(&audit_bytes)?;
     validate_audit(&audit, plan.epoch)?;
@@ -318,42 +381,66 @@ pub(super) fn run() -> Result<()> {
         .context("archive path not UTF-8")?
         .to_owned();
     let threads = plan.threads.to_string();
-    eprintln!("epoch {}: private full PoH verification", plan.epoch);
-    let full = run_child(
-        &plan.full_verifier,
-        &[
-            path.clone(),
-            "--full".into(),
-            "--internal-full".into(),
-            "--threads".into(),
-            threads.clone(),
-        ],
-        &plan.output_directory.join("full.log"),
-    )?;
-    check_hash()?;
-    eprintln!(
-        "epoch {}: private ordered coverage/link verification",
-        plan.epoch
+    let full_args = vec![
+        path.clone(),
+        "--full".into(),
+        "--internal-full".into(),
+        "--threads".into(),
+        threads.clone(),
+    ];
+    let ordered_args = vec![path, "--threads".into(), threads.clone()];
+    let plugin_args = vec![
+        format!("{}:{}", plan.epoch, plan.epoch),
+        parent.to_str().context("archive parent not UTF-8")?.into(),
+        "--threads".into(),
+        threads,
+        "--verify-only".into(),
+    ];
+    let phases = [
+        ("full", &plan.full_verifier, full_args),
+        ("ordered", &plan.full_verifier, ordered_args),
+        ("plugin", &plan.current_plugin, plugin_args),
+    ];
+    let invocation = std::env::var("INVOCATION_ID").ok();
+    ensure!(
+        !plan.parallel_scans || invocation.as_deref().is_some_and(|v| is_lower_hex(v, 32)),
+        "parallel private verification requires a systemd invocation binding"
     );
-    let ordered = run_child(
-        &plan.full_verifier,
-        &[path, "--threads".into(), threads.clone()],
-        &plan.output_directory.join("ordered.log"),
-    )?;
-    check_hash()?;
-    eprintln!("epoch {}: private current-plugin verification", plan.epoch);
-    let plugin = run_child(
-        &plan.current_plugin,
-        &[
-            format!("{}:{}", plan.epoch, plan.epoch),
-            parent.to_str().context("archive parent not UTF-8")?.into(),
-            "--threads".into(),
-            threads,
-            "--verify-only".into(),
-        ],
-        &plan.output_directory.join("plugin.log"),
-    )?;
-    check_hash()?;
+    let [full, ordered, plugin] = run_phases(plan.parallel_scans, |index| {
+        let (name, tool, arguments) = &phases[index];
+        eprintln!("epoch {}: private {name} verification", plan.epoch);
+        let result = run_child(
+            tool,
+            arguments,
+            &plan.output_directory.join(format!("{name}.log")),
+        )
+        .inspect_err(|error| {
+            eprintln!(
+                "epoch {}: private {name} verification failed: {error:#}",
+                plan.epoch
+            );
+        })?;
+        check_hash()?;
+        fleet::persist(
+            &plan.output_directory.join(format!("phase-{name}.json")),
+            &json!({
+                "schema":"jetstreamer-horizon-private-resource-verification-phase-v1",
+                "status":"passed", "phase":name, "epoch":plan.epoch,
+                "archive_path":archive, "archive_sha256":expected_sha,
+                "archive_length":identity.length, "archive_device":identity.device,
+                "archive_inode":identity.inode, "archive_sha256_after_verified":true,
+                "resource_audit":plan.resource_audit.path,
+                "resource_audit_sha256":plan.resource_audit.sha256,
+                "plan":bound_plan.path,"plan_sha256":bound_plan.sha256,
+                "verifier_sha256":args[4],
+                "systemd_invocation_id":invocation,"verification":result,
+                "publication_authorized":false,"production_completion_authorized":false,
+                "local_retirement_authorized":false,"remote_mutations":false,"r2_mutations":false
+            }),
+        )?;
+        eprintln!("epoch {}: private {name} phase receipt durable", plan.epoch);
+        Ok(result)
+    })?;
     ensure!(
         bound_bytes(&plan.resource_audit)? == audit_bytes,
         "resource audit receipt changed"
@@ -363,6 +450,8 @@ pub(super) fn run() -> Result<()> {
         "archive_device":identity.device,"archive_inode":identity.inode,
         "resource_audit":plan.resource_audit.path,"resource_audit_sha256":plan.resource_audit.sha256,
         "full_verifier":full,"ordered_verifier":ordered,"current_plugin":plugin,
+        "plugin_capacity_probe":plugin_capacity,
+        "parallel_scans":plan.parallel_scans,
         "archive_sha256_before_after_verified":true,"plan":bound_plan.path,"plan_sha256":bound_plan.sha256,
         "tool_sha256":args[4],"publication_authorized":false,"production_completion_authorized":false,
         "local_retirement_authorized":false,"remote_mutations":false,"r2_mutations":false});
@@ -397,6 +486,67 @@ pub(super) fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_preflight_requires_observed_records_bytes_bounds_and_no_authority() {
+        let args = vec!["--archive-capacity-probe".into()];
+        let good = json!({"schema":"jetstreamer-horizon-plugin-capacity-probe-v1",
+            "decoded_records":71524,"account_data_bytes":1144384,
+            "maximum_pre_updates":524288,"maximum_pre_update_data_bytes":134217728,
+            "publication_authorized":false,"production_completion_authorized":false,
+            "local_retirement_authorized":false,"remote_mutations":false,"r2_mutations":false});
+        validate_result(good.to_string().as_bytes(), &args).unwrap();
+        for (key, value) in [
+            ("decoded_records", json!(65536)),
+            ("account_data_bytes", json!(0)),
+            ("maximum_pre_updates", json!(65536)),
+            ("maximum_pre_update_data_bytes", json!(1024)),
+            ("publication_authorized", json!(true)),
+            ("production_completion_authorized", json!(true)),
+            ("local_retirement_authorized", json!(true)),
+            ("remote_mutations", json!(true)),
+            ("r2_mutations", json!(true)),
+        ] {
+            let mut bad = good.clone();
+            bad[key] = value;
+            assert!(
+                validate_result(bad.to_string().as_bytes(), &args).is_err(),
+                "{key}"
+            );
+        }
+        let ambiguous = format!("{good}\n{good}\n");
+        assert!(validate_result(ambiguous.as_bytes(), &args).is_err());
+        assert!(validate_result(b"old binary usage error", &args).is_err());
+    }
+
+    #[test]
+    fn fixed_parallel_fanout_overlaps_all_three_phases_and_preserves_result_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let started = AtomicUsize::new(0);
+        let results = run_phases(true, |index| {
+            started.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while started.load(Ordering::SeqCst) < 3 {
+                ensure!(Instant::now() < deadline, "phases did not overlap");
+                std::thread::yield_now();
+            }
+            Ok(json!(index))
+        })
+        .unwrap();
+        assert_eq!(results, [json!(0), json!(1), json!(2)]);
+        let visited = AtomicUsize::new(0);
+        assert!(
+            run_phases(true, |index| {
+                visited.fetch_add(1, Ordering::SeqCst);
+                ensure!(index != 0, "retained sibling failure");
+                Ok(json!(index))
+            })
+            .is_err()
+        );
+        assert_eq!(visited.load(Ordering::SeqCst), 3);
+    }
+
     #[test]
     fn executable_hash_streams_past_json_bound_without_relaxing_json_policy() {
         let root = tempfile::tempdir().unwrap();

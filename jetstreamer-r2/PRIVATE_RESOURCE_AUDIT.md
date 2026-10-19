@@ -59,6 +59,26 @@ Executable ownership, immutability, regular-file identity and namespace stabilit
 remain mandatory. A failed attempt preserves its logs: use a new output directory
 for a corrected retry. Logs alone are not the final verification/floor receipt.
 
+For a new audit, set `plugin_capacity_probe_required: true`. Before any archive
+reread, the exact plugin must pass `--archive-capacity-probe`: an in-memory
+roundtrip of the observed 71,524 pre-update records and 1,144,384 nonempty data
+bytes. It reports the linked decoder's finite count/arena limits and denies
+publication and remote mutation. A usage error, old decoder, missing/ambiguous
+result, changed data, insufficient bound or authorizing result fails closed.
+This avoids discovering an inherited binary's smaller decoder limit only after
+hours of otherwise successful full/ordered scans. It is not archive verification.
+
+After fresh admission for the **sum** of verifier CPU/RAM/I/O demand, a plan may
+also set `parallel_scans: true`. This requires the capacity preflight and limits
+each scan to at most eight threads. Exactly three independent scans run together;
+the default remains serial for older plans. Bind the service's total resource
+ceilings accordingly, preserve replay reserves/priority, and never restart a
+healthy producer to make room. Each successful scan gets a separate no-clobber
+phase receipt only after log validation and its own archive SHA-256/ETag reread.
+The fixed fanout joins all siblings and preserves their evidence on a failure.
+Phase receipts do not by themselves authorize a floor, publication or reuse;
+all three scans and the final combined receipt remain mandatory.
+
 Only after all three scans pass does it write a single-sample century-floor
 receipt, with checked arithmetic and digest-bound references to both the private
 remote readback audit and independent verification. The growth-claim consumer
