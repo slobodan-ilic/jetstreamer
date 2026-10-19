@@ -25,16 +25,20 @@
 //! verifies all within-archive structure and PoH while the former independently
 //! proves the boundaries that individual jobs cannot share.
 
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use jetstreamer_horizon::account_updates::AccountUpdateView;
 use jetstreamer_horizon::archive::{
-    ArchiveReader, BlockNotification, EntryRecord, EpochMeta, PayloadByteStats, SlotVisitor,
+    ArchiveReader, ArchiveWriter, ArchiveWriterConfig, BlockNotification, Compression, EntryRecord,
+    EpochMeta, PayloadByteStats, SlotVisitor,
 };
+use jetstreamer_horizon::block_metas::BlockMeta;
 use jetstreamer_horizon::transactions::Transaction;
+use solana_address::Address;
 use solana_hash::Hash;
 
 // Reuse the historical runtime's differential-tested SHA-NI implementation
@@ -1034,6 +1038,7 @@ fn usage() -> ! {
     eprintln!(
         "       verify_archive --chain <path>... [--segment] [--full] [--anchor SLOT HASH] [--threads N]"
     );
+    eprintln!("       verify_archive --capacity-probe");
     eprintln!("  --full              recompute every block's PoH hash");
     eprintln!(
         "  --internal-full     with --full, verify all within-archive invariants without requiring an external boundary anchor; requires a separate successful --chain pass"
@@ -1045,6 +1050,70 @@ fn usage() -> ! {
     );
     eprintln!("  --threads N          parallelism within each whole-file scan");
     std::process::exit(2);
+}
+
+/// Prove that this exact verifier build can decode the historical pre-update
+/// shape that exceeded the old 131,072-record inline capacity. The probe stays
+/// in memory and never reads or mutates a production archive.
+fn run_capacity_probe() -> i32 {
+    const OBSERVED_PRE_UPDATES: usize = 131_073;
+    const SLOT: u64 = 88_560_000;
+
+    let mut writer = ArchiveWriter::new(
+        Cursor::new(Vec::new()),
+        205,
+        SLOT,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .expect("capacity probe writer initialization");
+    writer.begin_slot(SLOT).expect("capacity probe slot");
+    for write_version in 0..OBSERVED_PRE_UPDATES as u64 {
+        writer
+            .write_orphan_update(&AccountUpdateView {
+                pubkey: Address::new_from_array([7; 32]),
+                lamports: write_version,
+                owner: Address::new_from_array([9; 32]),
+                executable: false,
+                rent_epoch: 0,
+                write_version,
+                data: &[],
+            })
+            .expect("capacity probe post-update write");
+    }
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = SLOT;
+    writer
+        .end_slot(&meta, &[])
+        .expect("capacity probe slot completion");
+    let (archive, _) = writer.finish().expect("capacity probe archive completion");
+
+    #[derive(Default)]
+    struct CountPreUpdates(usize);
+    impl SlotVisitor for CountPreUpdates {
+        fn on_pre_account_update(&mut self, _slot: u64, _update: &AccountUpdateView<'_>) {
+            self.0 += 1;
+        }
+    }
+
+    let mut reader = ArchiveReader::open(Cursor::new(archive.into_inner()))
+        .expect("capacity probe archive open");
+    let mut count = CountPreUpdates::default();
+    reader
+        .read_slots(0, u64::MAX, &mut count)
+        .expect("capacity probe archive decode");
+    if count.0 != OBSERVED_PRE_UPDATES {
+        eprintln!(
+            "CAPACITY PROBE FAIL: decoded {} pre updates, expected {OBSERVED_PRE_UPDATES}",
+            count.0
+        );
+        return 1;
+    }
+    println!("CAPACITY PROBE OK: decoded {OBSERVED_PRE_UPDATES} pre updates (old limit 131072)");
+    0
 }
 
 fn parse_anchor(args: &[String], index: &mut usize) -> ChainPoint {
@@ -1147,6 +1216,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         usage();
+    }
+    if args.as_slice() == ["--capacity-probe"] {
+        std::process::exit(run_capacity_probe());
     }
     let mut full = false;
     let mut internal_full = false;
@@ -1312,8 +1384,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jetstreamer_horizon::archive::{ArchiveWriter, ArchiveWriterConfig};
-    use jetstreamer_horizon::block_metas::BlockMeta;
+
+    #[test]
+    fn exact_verifier_capacity_probe_accepts_observed_131073_pre_updates() {
+        assert_eq!(run_capacity_probe(), 0);
+    }
 
     #[test]
     fn explicit_internal_pass_may_omit_an_external_anchor() {
