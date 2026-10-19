@@ -1,3 +1,5 @@
+mod epoch224_qualification;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
@@ -19050,6 +19052,20 @@ async fn main() {
             exit(2);
         }
     };
+    if cfg!(feature = "epoch224-v1-6-25-qualification")
+        && let Err(error) = epoch224_qualification::validate_launch(
+            start_epoch,
+            end_epoch,
+            qualification.map(|plan| (plan.bootstrap_slot, plan.end_inclusive)),
+            root_checkpoint_cohort,
+            recover_staged_only
+                || recover_staged_cohort_only
+                || recover_unreceipted_root_cohort_only,
+        )
+    {
+        eprintln!("error: {error}");
+        exit(2);
+    }
     if let Some(plan) = qualification {
         info!(
             "focused qualification requested: epoch {}, bootstrap {}, replay {}..={}, output {}",

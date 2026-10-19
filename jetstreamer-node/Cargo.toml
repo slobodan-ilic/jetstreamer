@@ -17,6 +17,9 @@ epoch224-account-delta-diagnostic = []
 # Build-bound comparison of exact upstream Solana v1.6.25 at the epoch-224
 # bootstrap divergence. This never changes the default v1.6.20 route.
 epoch224-v1-6-25-diagnostic = []
+# Private complete-span epoch-224 qualification after the bounded comparison.
+# The node requires the focused qualification CLI and never publishes a sidecar.
+epoch224-v1-6-25-qualification = []
 
 [dependencies]
 agave-snapshots.workspace = true
