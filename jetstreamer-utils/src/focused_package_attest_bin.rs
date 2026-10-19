@@ -701,7 +701,11 @@ fn validate_receipt_path(path: &Path, epoch: u64) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .context("invalid receipt name")?;
-    let prefix = format!("epoch{epoch}-complete-span-store8-immutable-package-ca2e38b-");
+    let prefix = if epoch == 224 {
+        "epoch224-complete-span-v1-6-25-immutable-package-01879c4-".to_string()
+    } else {
+        format!("epoch{epoch}-complete-span-store8-immutable-package-ca2e38b-")
+    };
     ensure!(
         name.starts_with(&prefix) && name.ends_with(".json"),
         "unexpected receipt name"
@@ -718,6 +722,10 @@ fn validate_receipt_path(path: &Path, epoch: u64) -> Result<()> {
 }
 
 fn canonical_package_path(epoch: u64) -> String {
+    if epoch == 224 {
+        return "/var/lib/jetstreamer/horizon-focused-224-complete-span-v1-6-25-01879c4-v1"
+            .to_string();
+    }
     // Epochs 207 and 209 were resealed after their original packages were found
     // to carry obsolete complete-span evidence. Keep that correction narrowly
     // allowlisted so a plan cannot select an arbitrary package revision.
@@ -738,9 +746,27 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         "plan schema mismatch"
     );
     ensure!(
-        (203..=212).contains(&plan.epoch),
+        (203..=212).contains(&plan.epoch) || plan.epoch == 224,
         "epoch outside approved focused range"
     );
+    if plan.epoch == 224 {
+        ensure!(
+            plan.schema == PLAN_SCHEMA_V3,
+            "epoch 224 requires century-floor evidence"
+        );
+        ensure!(
+            plan.snapshot_name
+                == "snapshot-96767522-3SdyhqCuei4esVf8imz8A2rPB1z83sAK3KHbtKefJDS7.tar.zst"
+                && plan.snapshot_sha256
+                    == "dc7f2ac03813bc609629885af82222ac5af070cc6187b7bce08e10944fd214e1"
+                && plan.checkpoint_sha256
+                    == "916a4d9414db22338d55eef537cb630fa47f86dc993c7d8be585cd2afa4bb8a4"
+                && plan.epoch_end_slot == 97_199_999
+                && plan.terminal_root_slot == 97_631_459
+                && plan.successor_tail_slots == 431_460,
+            "epoch 224 snapshot or complete-span checkpoint binding mismatch"
+        );
+    }
     match plan.schema.as_str() {
         PLAN_SCHEMA_V1 => {
             ensure!(
@@ -1713,6 +1739,48 @@ mod tests {
             plugin_receipt_name: format!("epoch-{epoch}.plugin.ok"),
             plugin_receipt_sha256: "c".repeat(64),
         }
+    }
+
+    #[test]
+    fn epoch224_attestation_is_exact_and_requires_century_floor() {
+        let mut plan = valid_plan(224);
+        plan.schema = PLAN_SCHEMA_V3.into();
+        plan.snapshot_name =
+            "snapshot-96767522-3SdyhqCuei4esVf8imz8A2rPB1z83sAK3KHbtKefJDS7.tar.zst".into();
+        plan.snapshot_sha256 =
+            "dc7f2ac03813bc609629885af82222ac5af070cc6187b7bce08e10944fd214e1".into();
+        plan.checkpoint_sha256 =
+            "916a4d9414db22338d55eef537cb630fa47f86dc993c7d8be585cd2afa4bb8a4".into();
+        plan.terminal_root_slot = 97_631_459;
+        plan.successor_tail_slots = 431_460;
+        plan.receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch224-complete-span-v1-6-25-immutable-package-01879c4-test.json".into();
+        plan.century_floor_evidence = Some("/sealed/century-floor.json".into());
+        plan.century_floor_evidence_sha256 = Some("f".repeat(64));
+        assert!(validate_plan(&plan).is_ok());
+        plan.century_floor_evidence = None;
+        assert!(validate_plan(&plan).is_err());
+        plan.century_floor_evidence = Some("/sealed/century-floor.json".into());
+        plan.successor_tail_slots -= 1;
+        assert!(validate_plan(&plan).is_err());
+        plan.successor_tail_slots += 1;
+        plan.snapshot_sha256 = "a".repeat(64);
+        assert!(validate_plan(&plan).is_err());
+        plan.snapshot_sha256 =
+            "dc7f2ac03813bc609629885af82222ac5af070cc6187b7bce08e10944fd214e1".into();
+        plan.schema = PLAN_SCHEMA_V1.into();
+        assert!(validate_plan(&plan).is_err());
+        plan.schema = PLAN_SCHEMA_V3.into();
+        plan.terminal_root_slot -= 1;
+        assert!(validate_plan(&plan).is_err());
+        plan.terminal_root_slot += 1;
+        plan.checkpoint_sha256 = "b".repeat(64);
+        assert!(validate_plan(&plan).is_err());
+        plan.checkpoint_sha256 =
+            "916a4d9414db22338d55eef537cb630fa47f86dc993c7d8be585cd2afa4bb8a4".into();
+        plan.package = "/var/lib/jetstreamer/arbitrary".into();
+        assert!(validate_plan(&plan).is_err());
+        assert!(validate_plan(&valid_plan(223)).is_err());
+        assert!(validate_plan(&valid_plan(225)).is_err());
     }
 
     fn valid_floor_evidence() -> CenturyFloorEvidence {
