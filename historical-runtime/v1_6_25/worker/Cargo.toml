@@ -18,6 +18,8 @@ diagnostic-singleton = []
 # execution but refuses input after the first previously observed downstream
 # mismatch, so the candidate cannot become an unbounded replay accidentally.
 epoch224-v1-6-25-diagnostic = []
+# Private epoch-224 complete-span checkpoint qualification. This is not an era promotion.
+epoch224-v1-6-25-qualification = []
 
 [dependencies]
 bincode = "=1.3.1"

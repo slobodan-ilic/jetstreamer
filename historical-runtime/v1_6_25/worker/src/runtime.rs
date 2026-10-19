@@ -43,6 +43,9 @@ const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 100_656_000;
 // its entries so this diagnostic can never turn into an unbounded epoch replay.
 const DIAGNOSTIC_MAX_ENTRY_SLOT_EXCLUSIVE: u64 = 96_767_527;
 const EPOCH224_V1_6_25_DIAGNOSTIC_SNAPSHOT_SLOT: u64 = 96_767_522;
+// Complete epoch 224, then stop at the first compatible canonical root in
+// epoch 225. The suffix is qualification evidence only, never publication.
+const EPOCH224_V1_6_25_QUALIFICATION_END_EXCLUSIVE: u64 = 97_631_460;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const WAVE_METRICS_ENV: &str = "JETSTREAMER_HISTORICAL_WAVE_METRICS";
 const DIAGNOSTIC_SINGLETON_ENV: &str = "JETSTREAMER_HISTORICAL_DIAGNOSTIC_SINGLETON";
@@ -809,8 +812,10 @@ impl RuntimeState {
 }
 
 fn validate_candidate_snapshot_slot(slot: u64) -> Result<(), String> {
-    if cfg!(feature = "epoch224-v1-6-25-diagnostic")
-        && slot != EPOCH224_V1_6_25_DIAGNOSTIC_SNAPSHOT_SLOT
+    if cfg!(any(
+        feature = "epoch224-v1-6-25-diagnostic",
+        feature = "epoch224-v1-6-25-qualification"
+    )) && slot != EPOCH224_V1_6_25_DIAGNOSTIC_SNAPSHOT_SLOT
     {
         return Err(format!(
             "build-bound epoch-224 v1.6.25 diagnostic requires snapshot slot {}",
@@ -827,18 +832,29 @@ fn validate_candidate_snapshot_slot(slot: u64) -> Result<(), String> {
 }
 
 fn validate_candidate_entry_slot(slot: u64) -> Result<(), String> {
+    let min_supported_entry_slot = effective_min_supported_entry_slot();
     let max_supported_slot_exclusive = effective_max_supported_entry_slot_exclusive();
-    if slot < MIN_SUPPORTED_ENTRY_SLOT || slot >= max_supported_slot_exclusive {
+    if slot < min_supported_entry_slot || slot >= max_supported_slot_exclusive {
         return Err(format!(
             "Solana v1.6.25 candidate entry slot {} is outside {}..{}",
-            slot, MIN_SUPPORTED_ENTRY_SLOT, max_supported_slot_exclusive
+            slot, min_supported_entry_slot, max_supported_slot_exclusive
         ));
     }
     Ok(())
 }
 
+fn effective_min_supported_entry_slot() -> u64 {
+    if cfg!(feature = "epoch224-v1-6-25-qualification") {
+        EPOCH224_V1_6_25_DIAGNOSTIC_SNAPSHOT_SLOT + 1
+    } else {
+        MIN_SUPPORTED_ENTRY_SLOT
+    }
+}
+
 fn effective_max_supported_entry_slot_exclusive() -> u64 {
-    if cfg!(any(
+    if cfg!(feature = "epoch224-v1-6-25-qualification") {
+        EPOCH224_V1_6_25_QUALIFICATION_END_EXCLUSIVE
+    } else if cfg!(any(
         feature = "diagnostic-singleton",
         feature = "epoch224-v1-6-25-diagnostic"
     )) {
@@ -1498,7 +1514,10 @@ mod tests {
 
     #[test]
     fn candidate_range_is_closed_at_both_ends() {
-        if cfg!(feature = "epoch224-v1-6-25-diagnostic") {
+        if cfg!(any(
+            feature = "epoch224-v1-6-25-diagnostic",
+            feature = "epoch224-v1-6-25-qualification"
+        )) {
             assert!(
                 validate_candidate_snapshot_slot(EPOCH224_V1_6_25_DIAGNOSTIC_SNAPSHOT_SLOT).is_ok()
             );
@@ -1518,13 +1537,16 @@ mod tests {
         assert!(validate_candidate_snapshot_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE).is_err());
 
         let entry_end = effective_max_supported_entry_slot_exclusive();
-        assert!(validate_candidate_entry_slot(MIN_SUPPORTED_ENTRY_SLOT).is_ok());
+        let entry_start = effective_min_supported_entry_slot();
+        assert!(validate_candidate_entry_slot(entry_start).is_ok());
         assert!(validate_candidate_entry_slot(entry_end - 1).is_ok());
-        assert!(validate_candidate_entry_slot(MIN_SUPPORTED_ENTRY_SLOT - 1).is_err());
+        assert!(validate_candidate_entry_slot(entry_start - 1).is_err());
         assert!(validate_candidate_entry_slot(entry_end).is_err());
         assert_eq!(
             entry_end,
-            if cfg!(any(
+            if cfg!(feature = "epoch224-v1-6-25-qualification") {
+                EPOCH224_V1_6_25_QUALIFICATION_END_EXCLUSIVE
+            } else if cfg!(any(
                 feature = "diagnostic-singleton",
                 feature = "epoch224-v1-6-25-diagnostic"
             )) {
