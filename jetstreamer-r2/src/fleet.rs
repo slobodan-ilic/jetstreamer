@@ -282,7 +282,7 @@ fn status_matches(
         && producer["NRestarts"] == "0"
 }
 
-fn persist(path: &Path, value: &Value) -> Result<()> {
+pub(super) fn persist(path: &Path, value: &Value) -> Result<()> {
     ensure!(path.is_absolute(), "fleet output must be absolute");
     let parent = path.parent().context("fleet output has no parent")?;
     let meta = fs::symlink_metadata(parent)?;
