@@ -658,6 +658,11 @@ remain external launch prerequisites. Run only the sealed binary as the isolated
 The probe sends no replay entries, creates no archive or sidecar, and does not authorize a suffix,
 checkpoint substitution, assembly, compatibility promotion, publication, retirement, or R2 mutation.
 In particular, success does not remove focused replay's exact-terminal-checkpoint requirement.
+For a failed, guard-stopped restore-only probe, the Rust failed-diagnostic retirer's explicit
+`restore_only_probe` plan profile may retire only that isolated probe's `scratch` child. It requires
+a sealed zero-entry failure outcome, retained snapshot/worker inputs, terminal invocation evidence,
+no successful checkpoint receipt, a complete process-reference scan, and no-clobber retirement
+receipts. It preserves the run root, logs, receipts, prefix archive, and all remote objects.
 
 The final sealed root cohort replays epochs 298-301 in a private lane. A fresh campaign manifest
 must bind `--last-epoch=301 --publish-through-epoch=300`; after all four archives and the epoch-301

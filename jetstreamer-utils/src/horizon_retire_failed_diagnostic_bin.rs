@@ -1,8 +1,10 @@
 //! Plan-bound retirement of reproducible state from one failed Horizon diagnostic.
 //!
-//! The tool accepts only the two known disposable subtrees of a retained run root,
-//! proves the bound producer is terminal, revalidates sealed outcome evidence, and
-//! performs a complete command/maps/cwd/root/exe/fd reference scan before deletion.
+//! The legacy profile accepts only its two known disposable subtrees. An explicit
+//! restore-only epoch213 profile accepts only its isolated scratch directory and
+//! requires a zero-entry stopped probe with retained inputs and no archive.
+//! Both profiles prove terminal identity, revalidate sealed outcome evidence, and
+//! scan command/maps/cwd/root/exe/fd references before deletion.
 
 use {
     anyhow::{Context, Result, anyhow, ensure},
@@ -12,6 +14,7 @@ use {
     std::{
         collections::{BTreeMap, BTreeSet},
         env,
+        ffi::OsStr,
         fs::{self, File, OpenOptions},
         io::{Read, Write},
         os::unix::{
@@ -27,12 +30,15 @@ use {
 const PLAN_SCHEMA: &str = "jetstreamer-horizon-failed-diagnostic-retirement-plan-v1";
 const RECEIPT_SCHEMA: &str = "jetstreamer-horizon-failed-diagnostic-retirement-receipt-v1";
 const OUTCOME_SCHEMA: &str = "jetstreamer-horizon-epoch224-singleton-diagnostic-outcome-v1";
+const RESTORE_OUTCOME_SCHEMA: &str = "jetstreamer-horizon-native-restore-probe-failure-v1";
 const MAX_JSON_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Plan {
     schema: String,
+    #[serde(default)]
+    restore_only_probe: bool,
     private_root: PathBuf,
     run_root: PathBuf,
     targets: Vec<PathBuf>,
@@ -224,6 +230,36 @@ fn path_or_descendant(candidate: &Path, root: &Path) -> bool {
     candidate == root || candidate.starts_with(root)
 }
 
+fn disposable_targets(plan: &Plan) -> Result<BTreeSet<PathBuf>> {
+    if plan.restore_only_probe {
+        let name = plan
+            .run_root
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("");
+        ensure!(
+            plan.run_root.parent() == Some(plan.private_root.as_path())
+                && name.starts_with("checkpoint-restore-probe-213-")
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && plan
+                    .producer
+                    .unit
+                    .starts_with("horizon-qualify-213-native-restore-probe-")
+                && plan
+                    .guard
+                    .unit
+                    .starts_with("horizon-native-restore-probe-213-guard-"),
+            "restore-only retirement must bind an isolated epoch213 native probe"
+        );
+        Ok(BTreeSet::from([plan.run_root.join("scratch")]))
+    } else {
+        Ok(BTreeSet::from([
+            plan.run_root.join("output/compact-indexes"),
+            plan.run_root.join("replay-state"),
+        ]))
+    }
+}
+
 fn validate_plan(plan: &Plan) -> Result<()> {
     ensure!(plan.schema == PLAN_SCHEMA, "plan schema mismatch");
     ensure!(
@@ -235,13 +271,10 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         plan.run_root.starts_with(&plan.private_root),
         "run root escapes private root"
     );
-    let expected = BTreeSet::from([
-        plan.run_root.join("output/compact-indexes"),
-        plan.run_root.join("replay-state"),
-    ]);
+    let expected = disposable_targets(plan)?;
     let actual = plan.targets.iter().cloned().collect::<BTreeSet<_>>();
     ensure!(
-        plan.targets.len() == 2 && actual == expected,
+        plan.targets.len() == expected.len() && actual == expected,
         "target set is not the exact disposable diagnostic set"
     );
     ensure!(
@@ -628,6 +661,38 @@ fn now_millis() -> Result<u128> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
 }
 
+fn validate_restore_outcome(plan: &Plan, outcome: &Value) -> Result<()> {
+    ensure!(
+        outcome
+            .pointer("/scope/restore_only")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && outcome
+                .pointer("/scope/replay_entries_sent")
+                .and_then(Value::as_u64)
+                == Some(0)
+            && outcome
+                .pointer("/scope/archive_created")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && outcome
+                .pointer("/scope/snapshot_source_retained")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && outcome
+                .pointer("/scope/worker_source_retained")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && outcome
+                .pointer("/scope/guard_stop_completed")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && outcome.pointer("/run_root").and_then(Value::as_str) == plan.run_root.to_str(),
+        "restore-only outcome must preserve reproducibility and prove a zero-entry stopped probe"
+    );
+    Ok(())
+}
+
 fn stable_evidence(plan: &Plan) -> Result<Value> {
     let run_metadata = fs::symlink_metadata(&plan.run_root)?;
     ensure!(
@@ -643,9 +708,22 @@ fn stable_evidence(plan: &Plan) -> Result<Value> {
     );
     let outcome: Value = serde_json::from_slice(&outcome_bytes)?;
     ensure!(
-        outcome.pointer("/schema").and_then(Value::as_str) == Some(OUTCOME_SCHEMA),
+        outcome.pointer("/schema").and_then(Value::as_str)
+            == Some(if plan.restore_only_probe {
+                RESTORE_OUTCOME_SCHEMA
+            } else {
+                OUTCOME_SCHEMA
+            }),
         "outcome schema mismatch"
     );
+    if plan.restore_only_probe {
+        validate_restore_outcome(plan, &outcome)?;
+        ensure!(
+            matches!(fs::symlink_metadata(plan.run_root.join("receipts/native-checkpoint.json")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "failed restore probe has a checkpoint receipt; review its successful result separately"
+        );
+    }
     ensure!(
         outcome
             .pointer("/authority/scratch_retirement_authorized_after_clean_process_reference_scan")
@@ -788,6 +866,122 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restore_plan() -> Plan {
+        let root = PathBuf::from(
+            "/home/ubuntu/.jetstreamer-private/checkpoint-restore-probe-213-example-v1",
+        );
+        Plan {
+            schema: PLAN_SCHEMA.into(),
+            restore_only_probe: true,
+            private_root: "/home/ubuntu/.jetstreamer-private".into(),
+            targets: vec![root.join("scratch")],
+            producer: UnitExpectation {
+                unit: "horizon-qualify-213-native-restore-probe-example-v1.service".into(),
+                invocation_id: "a".repeat(32),
+                active_state: "failed".into(),
+                sub_state: "failed".into(),
+                result: "signal".into(),
+                exec_main_status: 15,
+            },
+            guard: UnitExpectation {
+                unit: "horizon-native-restore-probe-213-guard-example-v1.service".into(),
+                invocation_id: "b".repeat(32),
+                active_state: "inactive".into(),
+                sub_state: "dead".into(),
+                result: "success".into(),
+                exec_main_status: 0,
+            },
+            inactive_units: vec!["horizon-native-restore-probe-213-guard-example-v1.timer".into()],
+            outcome: Evidence {
+                path: root.join("outcome.json"),
+                sha256: "a".repeat(64),
+            },
+            evidence: vec![],
+            intent_receipt: root.join("intent.json"),
+            completion_receipt: root.join("complete.json"),
+            authority: Authority {
+                local_failed_diagnostic_retirement_authorized: true,
+                preserve_run_root: true,
+                archive_publication_authorized: false,
+                remote_mutations: false,
+                r2_mutations: false,
+            },
+            run_root: root,
+        }
+    }
+
+    #[test]
+    fn native_restore_retirement_is_limited_to_exact_scratch() {
+        let mut plan = restore_plan();
+        validate_plan(&plan).unwrap();
+        for target in [
+            plan.run_root.clone(),
+            plan.run_root.join("receipts"),
+            plan.run_root.join("scratch-old"),
+            plan.run_root.join("scratch/child"),
+        ] {
+            plan.targets = vec![target];
+            assert!(validate_plan(&plan).is_err());
+        }
+    }
+
+    #[test]
+    fn native_restore_flag_cannot_retire_an_ordinary_replay() {
+        let mut plan = restore_plan();
+        plan.producer.unit = "horizon-qualify-213-replay.service".into();
+        assert!(validate_plan(&plan).is_err());
+        let mut plan = restore_plan();
+        plan.run_root = plan.private_root.join("production-213-singleton");
+        plan.targets = vec![plan.run_root.join("scratch")];
+        assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn legacy_retirement_still_requires_both_original_disposable_trees() {
+        let mut plan = restore_plan();
+        plan.restore_only_probe = false;
+        assert!(validate_plan(&plan).is_err());
+        plan.targets = vec![
+            plan.run_root.join("output/compact-indexes"),
+            plan.run_root.join("replay-state"),
+        ];
+        validate_plan(&plan).unwrap();
+        plan.targets.pop();
+        assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn restore_outcome_rejects_every_missing_or_false_reproducibility_gate() {
+        let plan = restore_plan();
+        let valid = json!({"run_root": plan.run_root, "scope": {
+            "restore_only": true, "replay_entries_sent": 0, "archive_created": false,
+            "snapshot_source_retained": true, "worker_source_retained": true,
+            "guard_stop_completed": true}});
+        validate_restore_outcome(&plan, &valid).unwrap();
+        for field in [
+            "restore_only",
+            "replay_entries_sent",
+            "archive_created",
+            "snapshot_source_retained",
+            "worker_source_retained",
+            "guard_stop_completed",
+        ] {
+            let mut missing = valid.clone();
+            missing["scope"].as_object_mut().unwrap().remove(field);
+            assert!(validate_restore_outcome(&plan, &missing).is_err());
+            let mut changed = valid.clone();
+            changed["scope"][field] = match field {
+                "replay_entries_sent" => json!(1),
+                "archive_created" => json!(true),
+                _ => json!(false),
+            };
+            assert!(validate_restore_outcome(&plan, &changed).is_err());
+        }
+        let mut wrong_root = valid;
+        wrong_root["run_root"] = json!("/home/ubuntu/.jetstreamer-private/other");
+        assert!(validate_restore_outcome(&plan, &wrong_root).is_err());
+    }
 
     #[test]
     fn exact_boundary_reference_does_not_match_sibling() {
