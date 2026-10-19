@@ -646,6 +646,19 @@ v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers the complete
 epoch-266-301 execution envelope, with publication ending at epoch 300 and epoch 301 retained as
 the private verification tail.
 
+`jetstreamer-checkpoint-restore-probe` is a private, restore-only test for the retained
+epoch-213 prefix. It uses the unchanged pinned v1.6.16 worker and the existing bounded historical
+client to load the SHA-256-bound slot-92,447,542 snapshot, then compares every consensus checkpoint
+field with the prefix's sealed terminal manifest. Validator-local write cursors are recorded
+separately; bootstrap writes or any consensus mismatch fail closed. The hash-bound immutable plan
+requires explicit private scratch, a no-clobber receipt path, and a free-space bound protecting
+the century floor plus the diagnostic budget. Fresh fleet admission and an invocation-bound guard
+remain external launch prerequisites. Run only the sealed binary as the isolated replay user:
+`jetstreamer-checkpoint-restore-probe PLAN --plan-sha256 HEX --self-sha256 HEX`.
+The probe sends no replay entries, creates no archive or sidecar, and does not authorize a suffix,
+checkpoint substitution, assembly, compatibility promotion, publication, retirement, or R2 mutation.
+In particular, success does not remove focused replay's exact-terminal-checkpoint requirement.
+
 The final sealed root cohort replays epochs 298-301 in a private lane. A fresh campaign manifest
 must bind `--last-epoch=301 --publish-through-epoch=300`; after all four archives and the epoch-301
 root gate pass, its importer may transactionally publish only epochs 298-300. Epoch 301 remains
