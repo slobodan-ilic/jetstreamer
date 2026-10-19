@@ -185,6 +185,50 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   recovery path may accept an already-absent status only when the exact authenticated publication
   receipt proves that object previously existed and the ready pair still passes every gate.
 
+### Campaign fleet reconciliation
+
+- Maintain one authoritative fleet ledger for the complete assigned campaign, not merely a list of
+  the ranges that happened to appear in the latest live-resource observer config. Reconcile it in
+  the same 30-minute control cycle as the coordinated replay/resource observation and status-object
+  refresh; do not add another polling loop. A user-requested status check runs the same reconciliation
+  once out of band. Write each result as a durable no-clobber private receipt that binds the observer
+  receipt, the previous fleet receipt, the authenticated R2 inventory, and every service identity it
+  reports.
+- Classify every campaign epoch into exactly one operational state: `remote-ready`, `live-replay`,
+  `post-replay-pipeline`, `staged-admissible`, `blocked-qualification`, `failed-needs-repair`, or
+  `not-yet-staged`. For every non-ready epoch record the concrete next action and the evidence or
+  gate that permits or blocks it. Keep a separate, explicit active list containing only live replay,
+  verifier, uploader, or readback invocations whose exact systemd identity is currently present.
+  A plan, unit file, status object, prior receipt, or estimated completion time is never proof that
+  an epoch is active.
+- Census all producer/controller claims in the assigned range on every reconciliation, including
+  terminal, failed, quarantined, and newly started units that are absent from the observer config.
+  Bind live entries to exact controller and producer invocation IDs, zero-restart state, claimed
+  epoch range, scratch/output paths, and the current observer receipt. Compare the census with the
+  prior ledger so a disappeared invocation, restart, new claim, freed lane, or stalled downstream
+  stage becomes an explicit transition rather than silently falling out of monitoring.
+- Authenticated-read every in-range `epoch-N.epoch-status.json` that exists and compare its epoch,
+  sample timestamp, controller/producer binding from the local publication receipt when available,
+  and corresponding live claim. Report its freshness separately from its ETA. If no matching live
+  invocation exists, classify the object as stale/orphaned operational metadata, exclude that epoch
+  from the active list, and never present its remaining-milliseconds value or projected finish time
+  as current. Under the existing lifecycle rule, leave such an object unchanged until a valid
+  replacement live claim publishes a newer sample or the ready-pair gate authorizes `status-delete`;
+  its presence does not authorize deletion or a blind replay restart.
+- Push every reconciled epoch forward in the same control cycle when a safe next action is already
+  authorized: dispatch ready verification/upload/readback stages, perform fresh admission for the
+  next disjoint staged epoch when capacity and integrity gates pass, and promptly backfill a lane
+  freed by clean completion. For a failed producer, capture and bind terminal evidence immediately,
+  remove it from the active list, preserve or retire artifacts under the normal rules, and begin the
+  required diagnosis or qualified replacement path. Do not defer an executable action merely to
+  the next status report, and do not weaken a compatibility, resource, integrity, or publication
+  gate to keep the fleet looking busy.
+- User-facing progress summaries must be generated from the newest accepted fleet ledger. Show at
+  least the active epoch or range, current phase, last fresh sample time, progress/ETA when valid,
+  and next action. Also call out failed, stale-status, or admission-blocked epochs that materially
+  affect what lands next. Never infer that the numerically next epoch is about to upload merely
+  because an old status object's ETA has elapsed.
+
 ## Resolve the work
 
 - On a fresh host, or whenever any requested epoch is outside the checked-in runtime registry,
@@ -1027,7 +1071,8 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
   cohort, or durable watcher. Enforce 1,800 seconds as a hard minimum between autonomous routine
   replay/resource observations; do not manually poll inside that window without a user request.
   Use that same identity-stable observation to refresh every claimed epoch's
-  `epoch-N.epoch-status.json`; do not poll separately for the table or for R2 metadata. After arming
+  `epoch-N.epoch-status.json` and to reconcile the authoritative campaign fleet ledger; do not poll
+  separately for the table, active list, or R2 metadata. After arming
   a persistent timer or watcher, do not poll it in short empty loops or emit repeated no-change
   status turns. Let it run unattended and inspect it once the cadence interval has elapsed or its
   scheduled event should have completed. A user request for a status update always authorizes one
