@@ -687,6 +687,14 @@ copying the target archive's reported digest. This binds the complete envelope, 
 restart snapshot identities and both raw/normalized write-version namespaces. Missing or
 different provenance fails before the slot scan. The option rejects partial, internal-only and
 chain modes and grants no runtime, canonical-import or publication admission.
+For the exact private epoch-213 experiment, the read-only
+`jetstreamer-epoch213-provenance-expectation PREFIX_MANIFEST SUFFIX_MANIFEST OUTPUT
+--self-sha256 HEX` tool derives that commitment without opening the assembled target. It requires
+the two exact digest-bound, root-owned immutable source manifests and writes a no-clobber,
+fsynced receipt beneath a root-private parent. Its fixed coverage, runtime, source archive,
+restart snapshot, canonical terminal and raw-cursor mappings cannot admit another experiment.
+The receipt proves source-manifest scope only, not source archive hashes, final PoH, current-plugin
+output, runtime promotion or publication. Keep all those gates independent.
 
 The dedicated `epoch213-checkpoint-continuation-diagnostic` node build exposes only the private
 epoch-213 continuation experiment. Invoke it with `213 /PRIVATE_RUN_ROOT/ledger --verify
