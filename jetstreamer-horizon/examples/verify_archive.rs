@@ -698,6 +698,7 @@ fn run_scan(
         let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
         let mut r = ArchiveReader::open(BufReader::with_capacity(1 << 20, file))
             .unwrap_or_else(|e| panic!("open archive: {e}"));
+        validate_structured_provenance(&r);
         let h = r.header().clone();
         let coverage_ok = r
             .has_complete_slot_coverage()
@@ -1057,6 +1058,21 @@ fn usage() -> ! {
     );
     eprintln!("  --threads N          parallelism within each whole-file scan");
     std::process::exit(2);
+}
+
+/// Container decoding deliberately leaves optional provenance opaque. An
+/// integrity verifier must parse it explicitly, including V4 restart mappings.
+/// Structural acceptance is not canonical runtime or publication admission.
+fn validate_structured_provenance<R: Read + std::io::Seek>(reader: &ArchiveReader<R>) {
+    if let Some(provenance) = reader
+        .provenance()
+        .unwrap_or_else(|error| panic!("validate archive provenance: {error}"))
+    {
+        println!(
+            "archive provenance V{}: structurally valid (not runtime/publication admission)",
+            provenance.version()
+        );
+    }
 }
 
 /// Prove that this exact verifier build can decode the historical pre-update
@@ -1483,6 +1499,7 @@ fn main() {
 
     let start = Instant::now();
     let mut reader = ArchiveReader::open(source).unwrap_or_else(|e| panic!("open archive: {e}"));
+    validate_structured_provenance(&reader);
     // The decoder's hard chain check aborts on the first mismatch; verify chain
     // continuity softly in the visitor instead, so the whole archive is read in
     // one pass and every break is reported (not just the first).
@@ -1549,6 +1566,62 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readback_scan_rejects_unknown_provenance_before_scanning_slots() {
+        use jetstreamer_horizon::archive::{
+            ARCHIVE_PROVENANCE_MAGIC, ArchiveProvenanceV1, BootstrapStateKind, RuntimeAdmission,
+            TransactionMetadataPolicy,
+        };
+        let provenance = ArchiveProvenanceV1 {
+            generation_profile: "test-generation".into(),
+            runtime_profile: "test-runtime".into(),
+            runtime_admission: RuntimeAdmission::Candidate,
+            runtime_revision: "test-revision".into(),
+            runtime_toolchain: "test-toolchain".into(),
+            genesis_hash: Hash::new_from_array([5; 32]),
+            bootstrap_state_kind: BootstrapStateKind::SnapshotArchive,
+            bootstrap_slot: 9,
+            bootstrap_state_hash: Hash::new_from_array([7; 32]),
+            requested_slot_start: 10,
+            requested_slot_count: 1,
+            transaction_metadata: TransactionMetadataPolicy::observed(),
+        };
+        let mut writer = ArchiveWriter::new_with_provenance(
+            Vec::new(),
+            1,
+            10,
+            1,
+            ArchiveWriterConfig::default(),
+            &provenance.into(),
+        )
+        .unwrap();
+        writer.write_skipped_slot(10).unwrap();
+        let (mut bytes, _) = writer.finish().unwrap();
+        let reader = ArchiveReader::open(Cursor::new(bytes.clone())).unwrap();
+        validate_structured_provenance(&reader);
+        let offset = bytes
+            .windows(ARCHIVE_PROVENANCE_MAGIC.len())
+            .position(|window| window == ARCHIVE_PROVENANCE_MAGIC)
+            .unwrap()
+            + ARCHIVE_PROVENANCE_MAGIC.len();
+        bytes[offset..offset + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        // Container framing still opens: the explicit verifier gate, not a
+        // bucket checksum or unrelated decode failure, must reject this file.
+        let reader = ArchiveReader::open(Cursor::new(bytes.clone())).unwrap();
+        assert!(reader.provenance().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bad-provenance.jet");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| {
+                run_scan(path.to_str().unwrap(), 1, false, None, false)
+            })
+            .is_err()
+        );
+        let legacy = ArchiveReader::open(Cursor::new(write_archive(1, 10, &[None]))).unwrap();
+        validate_structured_provenance(&legacy);
+    }
 
     #[test]
     fn exact_verifier_capacity_probe_accepts_observed_131073_pre_updates() {

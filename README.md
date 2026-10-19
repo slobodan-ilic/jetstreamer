@@ -674,6 +674,9 @@ metadata and update ordering. A worker/runtime change, carried-state restart, bo
 coverage gap, missing snapshot digest or inconsistent write mapping fails closed. Existing V3
 cross-runtime behavior is unchanged, and V4 cannot be silently projected into uninterrupted V2
 provenance. Ordinary V4 archive-reuse and publication admission remain disabled.
+The independent readback verifier explicitly validates optional structured provenance before
+scanning slots; malformed or unknown envelopes fail closed. Structural V4 acceptance is not
+canonical checkpoint, current-plugin, runtime-route or publication admission.
 
 The dedicated `epoch213-checkpoint-continuation-diagnostic` node build exposes only the private
 epoch-213 continuation experiment. Invoke it with `213 /PRIVATE_RUN_ROOT/ledger --verify
