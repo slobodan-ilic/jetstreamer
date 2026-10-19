@@ -663,6 +663,8 @@ For a failed, guard-stopped restore-only probe, the Rust failed-diagnostic retir
 a sealed zero-entry failure outcome, retained snapshot/worker inputs, terminal invocation evidence,
 no successful checkpoint receipt, a complete process-reference scan, and no-clobber retirement
 receipts. It preserves the run root, logs, receipts, prefix archive, and all remote objects.
+Only a collected transient guard may use the exact hash-bound stop-intent/completion chain as
+terminal evidence; the producer still requires a current matching terminal systemd identity.
 
 The final sealed root cohort replays epochs 298-301 in a private lane. A fresh campaign manifest
 must bind `--last-epoch=301 --publish-through-epoch=300`; after all four archives and the epoch-301

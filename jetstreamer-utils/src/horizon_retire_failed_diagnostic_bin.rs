@@ -46,6 +46,10 @@ struct Plan {
     guard: UnitExpectation,
     inactive_units: Vec<String>,
     outcome: Evidence,
+    #[serde(default)]
+    guard_stop_intent: Option<Evidence>,
+    #[serde(default)]
+    guard_stop_completion: Option<Evidence>,
     evidence: Vec<Evidence>,
     intent_receipt: PathBuf,
     completion_receipt: PathBuf,
@@ -310,7 +314,18 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         valid_sha256(&plan.outcome.sha256),
         "invalid outcome SHA-256"
     );
-    for item in std::iter::once(&plan.outcome).chain(plan.evidence.iter()) {
+    if plan.restore_only_probe {
+        ensure!(
+            plan.guard_stop_intent.is_some() && plan.guard_stop_completion.is_some(),
+            "restore-only cleanup requires exact guard stop intent and completion"
+        );
+    } else {
+        ensure!(
+            plan.guard_stop_intent.is_none() && plan.guard_stop_completion.is_none(),
+            "legacy cleanup does not accept restore-only guard evidence"
+        );
+    }
+    for item in bound_evidence(plan) {
         ensure!(
             item.path.is_absolute()
                 && item.path.starts_with(&plan.private_root)
@@ -344,6 +359,14 @@ fn validate_plan(plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+fn bound_evidence(plan: &Plan) -> Vec<&Evidence> {
+    std::iter::once(&plan.outcome)
+        .chain(plan.guard_stop_intent.iter())
+        .chain(plan.guard_stop_completion.iter())
+        .chain(plan.evidence.iter())
+        .collect()
+}
+
 fn parse_systemctl(stdout: &[u8]) -> Result<BTreeMap<String, String>> {
     let mut fields = BTreeMap::new();
     for line in std::str::from_utf8(stdout)?.lines() {
@@ -358,7 +381,19 @@ fn parse_systemctl(stdout: &[u8]) -> Result<BTreeMap<String, String>> {
     Ok(fields)
 }
 
-fn sample_unit(expectation: &UnitExpectation) -> Result<UnitState> {
+fn collected_guard(state: &UnitState) -> bool {
+    state.load_state == "not-found"
+        && state.invocation_id.is_empty()
+        && state.active_state == "inactive"
+        && state.sub_state == "dead"
+        && state.main_pid == 0
+        && state.restarts == 0
+        && state.result == "success"
+        && state.exec_main_code == 0
+        && state.exec_main_status == 0
+}
+
+fn sample_unit(expectation: &UnitExpectation, allow_collected_guard: bool) -> Result<UnitState> {
     let output = Command::new("systemctl")
         .args(["show", &expectation.unit, "--property=LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,ExecMainCode,ExecMainStatus"])
         .output()?;
@@ -392,6 +427,11 @@ fn sample_unit(expectation: &UnitExpectation) -> Result<UnitState> {
         exec_main_code: signed("ExecMainCode")?,
         exec_main_status: signed("ExecMainStatus")?,
     };
+    // Only the restore-only guard may be collected, after its exact durable
+    // stop chain was verified. Never synthesize its old invocation as live state.
+    if allow_collected_guard && collected_guard(&state) {
+        return Ok(state);
+    }
     ensure!(state.load_state == "loaded", "bound unit is not loaded");
     ensure!(
         state.invocation_id == expectation.invocation_id,
@@ -693,6 +733,47 @@ fn validate_restore_outcome(plan: &Plan, outcome: &Value) -> Result<()> {
     Ok(())
 }
 
+fn read_bound_json(item: &Evidence) -> Result<Value> {
+    let bytes = read_secure(&item.path, MAX_JSON_BYTES, 0)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes)) == item.sha256,
+        "guard stop evidence SHA-256 mismatch"
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn validate_restore_stop_chain(plan: &Plan, intent: &Value, completion: &Value) -> Result<()> {
+    let intent_path = &plan
+        .guard_stop_intent
+        .as_ref()
+        .context("missing stop intent")?
+        .path;
+    ensure!(
+        intent["schema"] == "jetstreamer-horizon-standalone-stop-intent-v1"
+            && intent["producer_invocation_id"] == plan.producer.invocation_id
+            && intent["sample"]["guard_invocation_id"] == plan.guard.invocation_id
+            && intent["sample"]["producer_invocation_id"] == plan.producer.invocation_id
+            && intent["sample"]["producer"]["invocation_id"] == plan.producer.invocation_id
+            && intent["sample"]["producer"]["restarts"] == 0
+            && completion["schema"] == "jetstreamer-horizon-standalone-stop-completion-v1"
+            && completion["producer_invocation_id"] == plan.producer.invocation_id
+            && completion["intent"].as_str() == intent_path.to_str()
+            && completion["plan_sha256"].as_str().is_some_and(valid_sha256)
+            && completion["plan_sha256"] == intent["plan_sha256"]
+            && completion["terminal"]["invocation_id"] == plan.producer.invocation_id
+            && completion["terminal"]["pid"] == 0
+            && completion["terminal"]["restarts"] == 0
+            && completion["terminal"]["active"] == plan.producer.active_state
+            && completion["terminal"]["sub"] == plan.producer.sub_state
+            && completion["terminal"]["result"] == plan.producer.result
+            && completion["scratch_deleted"] == false
+            && completion["r2_mutations"] == false
+            && completion["remote_mutations"] == false,
+        "restore-only guard stop chain does not bind the exact terminal attempt"
+    );
+    Ok(())
+}
+
 fn stable_evidence(plan: &Plan) -> Result<Value> {
     let run_metadata = fs::symlink_metadata(&plan.run_root)?;
     ensure!(
@@ -718,6 +799,17 @@ fn stable_evidence(plan: &Plan) -> Result<Value> {
     );
     if plan.restore_only_probe {
         validate_restore_outcome(plan, &outcome)?;
+        let intent = read_bound_json(
+            plan.guard_stop_intent
+                .as_ref()
+                .context("missing stop intent")?,
+        )?;
+        let completion = read_bound_json(
+            plan.guard_stop_completion
+                .as_ref()
+                .context("missing stop completion")?,
+        )?;
+        validate_restore_stop_chain(plan, &intent, &completion)?;
         ensure!(
             matches!(fs::symlink_metadata(plan.run_root.join("receipts/native-checkpoint.json")),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound),
@@ -747,7 +839,7 @@ fn stable_evidence(plan: &Plan) -> Result<Value> {
     );
     let mut evidence = Vec::new();
     let mut seen = BTreeSet::new();
-    for item in std::iter::once(&plan.outcome).chain(plan.evidence.iter()) {
+    for item in bound_evidence(plan) {
         ensure!(seen.insert(item.path.clone()), "duplicate evidence path");
         let bytes = read_secure(&item.path, MAX_JSON_BYTES, 0)?;
         let observed = format!("{:x}", Sha256::digest(&bytes));
@@ -758,8 +850,8 @@ fn stable_evidence(plan: &Plan) -> Result<Value> {
         );
         evidence.push(json!({"path": item.path, "sha256": observed}));
     }
-    let producer = sample_unit(&plan.producer)?;
-    let guard = sample_unit(&plan.guard)?;
+    let producer = sample_unit(&plan.producer, false)?;
+    let guard = sample_unit(&plan.guard, plan.restore_only_probe)?;
     let mut inactive = Vec::new();
     for unit in &plan.inactive_units {
         inactive.push(require_inactive_unit(unit)?);
@@ -897,6 +989,14 @@ mod tests {
                 path: root.join("outcome.json"),
                 sha256: "a".repeat(64),
             },
+            guard_stop_intent: Some(Evidence {
+                path: root.join("guard-stop-intent.json"),
+                sha256: "c".repeat(64),
+            }),
+            guard_stop_completion: Some(Evidence {
+                path: root.join("guard-stop-completion.json"),
+                sha256: "d".repeat(64),
+            }),
             evidence: vec![],
             intent_receipt: root.join("intent.json"),
             completion_receipt: root.join("complete.json"),
@@ -941,6 +1041,8 @@ mod tests {
     fn legacy_retirement_still_requires_both_original_disposable_trees() {
         let mut plan = restore_plan();
         plan.restore_only_probe = false;
+        plan.guard_stop_intent = None;
+        plan.guard_stop_completion = None;
         assert!(validate_plan(&plan).is_err());
         plan.targets = vec![
             plan.run_root.join("output/compact-indexes"),
@@ -981,6 +1083,66 @@ mod tests {
         let mut wrong_root = valid;
         wrong_root["run_root"] = json!("/home/ubuntu/.jetstreamer-private/other");
         assert!(validate_restore_outcome(&plan, &wrong_root).is_err());
+    }
+
+    #[test]
+    fn collected_guard_never_accepts_a_replacement_or_live_unit() {
+        let mut state = UnitState {
+            unit: "guard.service".into(),
+            invocation_id: "".into(),
+            load_state: "not-found".into(),
+            active_state: "inactive".into(),
+            sub_state: "dead".into(),
+            result: "success".into(),
+            main_pid: 0,
+            restarts: 0,
+            exec_main_code: 0,
+            exec_main_status: 0,
+        };
+        assert!(collected_guard(&state));
+        state.invocation_id = "a".repeat(32);
+        assert!(!collected_guard(&state));
+        state.invocation_id.clear();
+        state.main_pid = 1;
+        assert!(!collected_guard(&state));
+        state.main_pid = 0;
+        state.load_state = "loaded".into();
+        assert!(!collected_guard(&state));
+    }
+
+    #[test]
+    fn exact_guard_stop_chain_is_required_even_after_collection() {
+        let plan = restore_plan();
+        let intent = json!({"schema": "jetstreamer-horizon-standalone-stop-intent-v1",
+            "producer_invocation_id": plan.producer.invocation_id, "plan_sha256": "e".repeat(64),
+            "sample": {"guard_invocation_id": plan.guard.invocation_id,
+                "producer_invocation_id": plan.producer.invocation_id,
+                "producer": {"invocation_id": plan.producer.invocation_id, "restarts": 0}}});
+        let completion = json!({"schema": "jetstreamer-horizon-standalone-stop-completion-v1",
+            "producer_invocation_id": plan.producer.invocation_id, "plan_sha256": "e".repeat(64),
+            "intent": plan.guard_stop_intent.as_ref().unwrap().path,
+            "terminal": {"invocation_id": plan.producer.invocation_id, "pid": 0, "restarts": 0,
+                "active": "failed", "sub": "failed", "result": "signal"},
+            "scratch_deleted": false, "r2_mutations": false, "remote_mutations": false});
+        validate_restore_stop_chain(&plan, &intent, &completion).unwrap();
+        for pointer in [
+            "/producer_invocation_id",
+            "/plan_sha256",
+            "/intent",
+            "/terminal/invocation_id",
+            "/terminal/pid",
+            "/terminal/restarts",
+            "/terminal/active",
+            "/terminal/result",
+            "/r2_mutations",
+        ] {
+            let mut bad = completion.clone();
+            *bad.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(validate_restore_stop_chain(&plan, &intent, &bad).is_err());
+        }
+        let mut bad_intent = intent;
+        bad_intent["sample"]["guard_invocation_id"] = json!("f".repeat(32));
+        assert!(validate_restore_stop_chain(&plan, &bad_intent, &completion).is_err());
     }
 
     #[test]
