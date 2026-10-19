@@ -52,6 +52,13 @@ and `--verify-only` plugin scan, requires successful exit codes and exact
 nonpartial success summaries, and preserves no-clobber logs and a private
 verification receipt. No child receives R2 credentials.
 
+Both executables are authenticated before the first archive reread and again
+around their scans. Binary hashes are streamed with constant memory under a
+separate 1 GiB executable limit; the 128 MiB JSON evidence limit is unchanged.
+Executable ownership, immutability, regular-file identity and namespace stability
+remain mandatory. A failed attempt preserves its logs: use a new output directory
+for a corrected retry. Logs alone are not the final verification/floor receipt.
+
 Only after all three scans pass does it write a single-sample century-floor
 receipt, with checked arithmetic and digest-bound references to both the private
 remote readback audit and independent verification. The growth-claim consumer

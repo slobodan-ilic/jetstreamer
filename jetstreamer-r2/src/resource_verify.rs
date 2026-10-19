@@ -47,13 +47,64 @@ fn bound_bytes(bound: &Bound) -> Result<Vec<u8>> {
 }
 
 fn verify_executable(bound: &Bound) -> Result<()> {
-    bound_bytes(bound)?;
+    ensure!(
+        bound.path.is_absolute() && fs::canonicalize(&bound.path)? == bound.path,
+        "noncanonical verifier executable path"
+    );
     let meta = fs::symlink_metadata(&bound.path)?;
     ensure!(
-        meta.mode() & 0o222 == 0 && meta.mode() & 0o111 != 0,
+        meta.is_file()
+            && meta.nlink() == 1
+            && meta.uid() == 0
+            && meta.mode() & 0o222 == 0
+            && meta.mode() & 0o111 != 0,
         "verifier must be immutable and executable"
     );
+    let digest = stream_hash_stable_file(&bound.path, identity(&meta), 1024 * 1024 * 1024)?;
+    ensure!(
+        is_lower_hex(&bound.sha256, 64) && digest == bound.sha256,
+        "verifier executable hash mismatch"
+    );
+    let after = fs::symlink_metadata(&bound.path)?;
+    ensure!(
+        after.uid() == meta.uid()
+            && after.mode() == meta.mode()
+            && identity(&after) == identity(&meta),
+        "verifier permissions or identity changed"
+    );
     Ok(())
+}
+
+// Executables are not JSON evidence: the current plugin exceeds 128 MiB. Keep
+// JSON's allocation bound unchanged and hash binaries with constant memory.
+fn stream_hash_stable_file(path: &Path, expected: FileIdentity, maximum: u64) -> Result<String> {
+    ensure!(
+        expected.length <= maximum,
+        "verifier executable exceeds size bound"
+    );
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    ensure!(
+        identity(&file.metadata()?) == expected,
+        "verifier executable changed while opening"
+    );
+    let mut digest = Sha256::new();
+    let read_limit = maximum
+        .checked_add(1)
+        .context("executable size limit overflow")?;
+    let count = std::io::copy(&mut (&mut file).take(read_limit), &mut digest)?;
+    ensure!(
+        count == expected.length && count <= maximum,
+        "verifier executable length changed while hashing"
+    );
+    let after = file.metadata()?;
+    ensure!(
+        identity(&after) == expected && regular_identity(path)? == expected,
+        "verifier executable changed while hashing"
+    );
+    Ok(hex_lower(&digest.finalize()))
 }
 
 fn validate_audit(value: &Value, epoch: u64) -> Result<()> {
@@ -189,6 +240,9 @@ pub(super) fn run() -> Result<()> {
         "invalid verification plan bounds or authority"
     );
     resource_audit::private_directory(&plan.output_directory)?;
+    // Fail before expensive archive rereads if either sealed executable is invalid.
+    verify_executable(&plan.full_verifier)?;
+    verify_executable(&plan.current_plugin)?;
     let receipt = plan.output_directory.join("verification.json");
     ensure!(
         !receipt.try_exists()?,
@@ -343,6 +397,31 @@ pub(super) fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn executable_hash_streams_past_json_bound_without_relaxing_json_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large-plugin");
+        let mut file = File::create(&path).unwrap();
+        let length = 128 * 1024 * 1024 + 1;
+        file.set_len(length).unwrap();
+        file.write_all(b"plugin").unwrap();
+        file.sync_all().unwrap();
+        let expected = regular_identity(&path).unwrap();
+        assert!(read_stable_bounded(&path, 128 * 1024 * 1024, "JSON evidence").is_err());
+        let actual = stream_hash_stable_file(&path, expected, 1024 * 1024 * 1024).unwrap();
+        let mut independent = Sha256::new();
+        std::io::copy(&mut File::open(&path).unwrap(), &mut independent).unwrap();
+        assert_eq!(actual, hex_lower(&independent.finalize()));
+        assert!(stream_hash_stable_file(&path, expected, length - 1).is_err());
+        file.set_len(length + 1).unwrap();
+        assert!(stream_hash_stable_file(&path, expected, 1024 * 1024 * 1024).is_err());
+        let link = root.path().join("symlink");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(
+            stream_hash_stable_file(&link, regular_identity(&path).unwrap(), 1024 * 1024 * 1024)
+                .is_err()
+        );
+    }
     #[test]
     fn audit_evidence_requires_all_integrity_gates_and_denies_completion() {
         let good = json!({"schema":"jetstreamer-horizon-private-resource-audit-receipt-v1",
