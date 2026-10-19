@@ -58,6 +58,8 @@ const STATUS_RECEIPT_SCHEMA: &str =
 const STATUS_DELETION_RECEIPT_SCHEMA: &str =
     "jetstreamer-horizon-r2-status-authenticated-deletion-receipt-v1";
 
+mod fleet;
+
 #[derive(Debug)]
 struct Config {
     command: Command,
@@ -3002,6 +3004,9 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().nth(1).as_deref() == Some("fleet-reconcile") {
+        return fleet::run().await;
+    }
     let config = parse_args()?;
     ensure!(
         config.command == Command::Inventory || config.directory.is_dir(),
