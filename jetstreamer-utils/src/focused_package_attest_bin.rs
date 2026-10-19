@@ -753,7 +753,7 @@ fn validate_plan(plan: &Plan) -> Result<()> {
                 "v1 plan cannot carry century-floor evidence"
             );
         }
-        PLAN_SCHEMA_V2 | PLAN_SCHEMA_V3 => {
+        PLAN_SCHEMA_V2 => {
             ensure!(
                 plan.epoch == 203,
                 "external capability evidence is approved only for epoch 203"
@@ -775,28 +775,51 @@ fn validate_plan(plan: &Plan) -> Result<()> {
                     .is_some_and(is_sha256),
                 "invalid capability receipt SHA-256"
             );
-            if plan.schema == PLAN_SCHEMA_V2 {
-                ensure!(
-                    plan.century_floor_evidence.is_none()
-                        && plan.century_floor_evidence_sha256.is_none(),
-                    "v2 plan cannot carry century-floor evidence"
-                );
-            } else {
-                let evidence = plan
-                    .century_floor_evidence
+            ensure!(
+                plan.century_floor_evidence.is_none()
+                    && plan.century_floor_evidence_sha256.is_none(),
+                "v2 plan cannot carry century-floor evidence"
+            );
+        }
+        PLAN_SCHEMA_V3 => {
+            if plan.epoch == 203 {
+                let capability = plan
+                    .capability_receipt
                     .as_ref()
-                    .context("v3 plan lacks century-floor evidence")?;
+                    .context("epoch-203 v3 plan lacks capability receipt")?;
                 ensure!(
-                    evidence.is_absolute(),
-                    "v3 century-floor evidence path is not absolute"
+                    capability
+                        == Path::new(
+                            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-package-capability-ca2e38b-rust-20261017-v1.json"
+                        ),
+                    "unexpected epoch-203 capability receipt"
                 );
                 ensure!(
-                    plan.century_floor_evidence_sha256
+                    plan.capability_receipt_sha256
                         .as_deref()
                         .is_some_and(is_sha256),
-                    "invalid century-floor evidence SHA-256"
+                    "invalid capability receipt SHA-256"
+                );
+            } else {
+                ensure!(
+                    plan.capability_receipt.is_none() && plan.capability_receipt_sha256.is_none(),
+                    "external capability evidence is approved only for epoch 203"
                 );
             }
+            let evidence = plan
+                .century_floor_evidence
+                .as_ref()
+                .context("v3 plan lacks century-floor evidence")?;
+            ensure!(
+                evidence.is_absolute(),
+                "v3 century-floor evidence path is not absolute"
+            );
+            ensure!(
+                plan.century_floor_evidence_sha256
+                    .as_deref()
+                    .is_some_and(is_sha256),
+                "invalid century-floor evidence SHA-256"
+            );
         }
         _ => unreachable!(),
     }
@@ -1103,11 +1126,11 @@ fn validate_external_capability(
     plan: &Plan,
     members: &BTreeMap<String, FileIdentity>,
 ) -> Result<Option<CapabilityEvidence>> {
-    if plan.schema == PLAN_SCHEMA_V1 {
+    if plan.schema == PLAN_SCHEMA_V1 || (plan.schema == PLAN_SCHEMA_V3 && plan.epoch != 203) {
         return Ok(None);
     }
     ensure!(
-        matches!(plan.schema.as_str(), PLAN_SCHEMA_V2 | PLAN_SCHEMA_V3),
+        matches!(plan.schema.as_str(), PLAN_SCHEMA_V2 | PLAN_SCHEMA_V3) && plan.epoch == 203,
         "plan schema mismatch"
     );
     let path = plan
@@ -1797,6 +1820,19 @@ mod tests {
             Some("/var/lib/jetstreamer/focused-attester/century-floor.json".into());
         legacy.century_floor_evidence_sha256 = Some("1".repeat(64));
         assert!(validate_plan(&legacy).is_err());
+
+        let mut ordinary = valid_plan(210);
+        ordinary.schema = PLAN_SCHEMA_V3.to_string();
+        ordinary.century_floor_evidence =
+            Some("/var/lib/jetstreamer/focused-attester/century-floor.json".into());
+        ordinary.century_floor_evidence_sha256 = Some("1".repeat(64));
+        assert!(validate_plan(&ordinary).is_ok());
+
+        ordinary.capability_receipt = Some(
+            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-package-capability-ca2e38b-rust-20261017-v1.json".into(),
+        );
+        ordinary.capability_receipt_sha256 = Some("f".repeat(64));
+        assert!(validate_plan(&ordinary).is_err());
     }
 
     #[test]
@@ -1868,5 +1904,20 @@ mod tests {
         assert!(validate_text_receipt(valid_text.as_bytes(), &sample.archive_sha256).is_ok());
         let mismatch = format!("{} {} {}\n", "f".repeat(64), "d".repeat(64), "e".repeat(64));
         assert!(validate_text_receipt(mismatch.as_bytes(), &sample.archive_sha256).is_err());
+    }
+
+    #[test]
+    fn ordinary_v3_plan_uses_internal_manifest_capability() {
+        let mut plan = valid_plan(210);
+        plan.schema = PLAN_SCHEMA_V3.to_string();
+        plan.century_floor_evidence =
+            Some("/var/lib/jetstreamer/focused-attester/century-floor.json".into());
+        plan.century_floor_evidence_sha256 = Some("1".repeat(64));
+        assert!(validate_plan(&plan).is_ok());
+        assert!(
+            validate_external_capability(&plan, &BTreeMap::new())
+                .unwrap()
+                .is_none()
+        );
     }
 }
