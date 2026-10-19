@@ -248,6 +248,8 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   and treat an otherwise admissible idle lane as a condition to explain and resolve. Increasing
   beyond the proven point remains a one-lane experiment requiring a clean coordinated sample at
   least 1,800 seconds after the preceding routine sample.
+  Use that reference's measured-budget and time-to-sidecar policies to qualify capacity estimates
+  and choose among admissible candidates; numerical epoch order alone is not a throughput policy.
 - Define the filesystem safety floor for a campaign century from resulting `.jet` sizes, not from
   snapshots, replay scratch, or a fixed multi-terabyte constant. For the current century use epochs
   200 through 300 inclusive. Select each epoch at most once and include only canonical complete
@@ -325,6 +327,11 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 ## Produce and verify
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
+- Before cold-replaying an epoch with a retained verified prefix, read
+  [references/checkpoint-continuation.md](references/checkpoint-continuation.md). Prefer a qualified
+  checkpoint continuation when its complete validation-to-sidecar path is faster and freshly
+  admissible. A snapshot, matching accounts hash, partial archive, or private assembly success alone
+  does not establish that qualification or authorize publication.
 - Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Use `Restart=on-failure` with a bounded retry delay only when every invocation gets isolated diagnostic output and scratch, or a proven launcher preserves the failed invocation's artifacts before opening the next output. A replay normally creates or truncates its `.jet` at startup, so never let an automatic retry reuse the same diagnostic archive path. Use a fail-closed non-restarting unit and relaunch manually after evidence capture when attempt isolation is unavailable. Do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs, configured RAM reserves, and the current century `.jet`-derived disk floor.
 - A controller with a long polling interval must wake that wait when SIGTERM/SIGINT requests
   shutdown; setting a flag while leaving a restartable sleep in place can consume the entire systemd

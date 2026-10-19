@@ -31,6 +31,29 @@ sample binds every live invocation and scratch tree before and after measurement
 restarts, preserves the century `.jet`-derived filesystem floor, and remains below the VMA stops.
 Do not transfer a proven count between materially different machines or lane shapes without new evidence.
 
+## Qualify measured admission budgets
+
+When an unqualified or inherited capacity estimate is the only reason a staged singleton cannot
+launch, record the missing bound and stage the smallest useful bounded experiment to resolve it.
+Do not leave an indefinite hold with no evidence-gathering next action. The experiment itself must
+fit fresh admission, use isolated private output and scratch, and have a sealed work/time bound,
+invocation-bound reserve/VMA guard, and terminal evidence capture. Do not disturb healthy replays.
+
+Measure restore baseline separately from settled replay growth: physical and apparent scratch,
+file count, VMAs, CPU, memory peak/events, I/O pressure, transactions and account updates. Bind the
+exact worker, parent, snapshot, runtime settings, and source interval. Use multiple comparable
+windows and account for nonlinear growth, compaction, archive assembly, verification scratch, and
+overlapping delivery work when proposing a conservative incremental-peak envelope. A short canary,
+low current use, or a cheap 457-slot continuation is not a full cold-epoch resource bound.
+
+Promote a smaller scheduling or growth estimate only through reviewed, sealed evidence and fresh
+admission that protects all older invocation-bound remaining-growth claims and the century floor.
+Keep hard memory/CPU limits, reserves and VMA stops unchanged. Do not edit claims beneath a live
+controller or equate a successful performance experiment with compatibility/plugin qualification.
+If the evidence cannot bound the candidate, retain the conservative budget and specify the next
+bounded measurement or clean-completion event that can resolve admission. Once it does fit, use
+the normal work-conserving backfill path rather than waiting for another status report.
+
 ## Keep the host work-conserving
 
 - Maintain one disjoint next candidate in a dormant, no-trigger state whenever missing compatible
@@ -58,6 +81,26 @@ Do not transfer a proven count between materially different machines or lane sha
 
 Use event-driven systemd dependencies or timers for completion, guard, verifier, and uploader work
 instead of frequent polling. Routine coordinated observations remain at least 1,800 seconds apart.
+
+## Prioritize time to verified sidecar
+
+Dispatch available independent verification, upload and readback work promptly; do not start extra
+replay at the expense of starving already-complete archives in the delivery queue. Among disjoint,
+compatible candidates that pass fresh admission, compare expected time until the authenticated
+R2 sidecar commit, not merely epoch number or replay slots per second. Include input staging,
+restore, remaining replay, archive close/import, independent full/current-plugin checks, required
+boundaries, upload, whole-object readback and delivery-queue contention. Prefer qualified retained
+work or checkpoint continuations when that end-to-end path is shorter.
+
+Record the ranked shortlist, estimate basis and uncertainty, resource fit, selected candidate, and
+why alternatives wait in the fleet's next-action evidence. Use actual phase timings and ready-pair
+completion cadence to revise the ranking at the existing coordinated observation, not through an
+extra polling loop. Label scheduling uncertainty without changing the mandatory definite numeric
+status-JSON estimates; a ranking is never a substitute for an admission or integrity gate.
+Keep the lowest unsupported assigned epoch on an explicit active qualification/recovery path;
+short-job scheduling must not silently skip it or indefinitely starve older admitted work. Preserve
+healthy legacy cohorts and cross-host ownership, stay within the assigned publication range, and
+keep the epoch-301 verification tail private.
 
 ## Scale beyond the proven point
 
