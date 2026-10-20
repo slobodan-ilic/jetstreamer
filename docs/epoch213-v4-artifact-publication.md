@@ -3,7 +3,7 @@
 `jetstreamer-epoch213-publish` is a narrow artifact admission, not ordinary V4
 reuse or historical-runtime registry promotion. It accepts only the original
 epoch-213 checkpoint-continuation producer and the independently verified output
-of the pinned `ccbe0f1` private full/plugin runner. It performs local publication
+of the pinned journal-bound private full/plugin runner. It performs local publication
 only, never an R2 operation or local retirement.
 
 Do not launch before the private verifier finishes successfully. The original
