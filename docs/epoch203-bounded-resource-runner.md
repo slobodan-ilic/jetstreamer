@@ -75,6 +75,27 @@ prefix fits, or that its native restart tuple has been verified. The epoch213
 continuation runner remains restricted to its exact epoch213 artifacts; it cannot
 execute or publish an epoch203 continuation.
 
+`jetstreamer-epoch203-resource-compare` provides a read-only, exact-attempt
+comparison after the single-thread run's successful `receipts/resource.json`
+exists. Seal it and a `jetstreamer-private-epoch203-resource-comparison-plan-v1`
+plan with `baseline_path`, `baseline_sha256` and `candidate_path`. Invoke the
+binary as root with `PLAN --plan-sha256 HEX --self-sha256 HEX
+--candidate-sha256 HEX`. The baseline digest and both attempt identities are
+build-bound; the candidate path is restricted to the current r1 run. A missing
+candidate receipt is a closed gate, not permission to substitute a live sample
+or a failure receipt.
+
+The comparator hashes stable, bounded, root-owned input files without following
+symlinks, validates the exact same snapshot/node/worker and bounded target,
+rejects failed or externally interrupted runs and memory/scratch safety events,
+and prints private comparison JSON to stdout. Preserve that output through the
+normal sealed-evidence workflow; the tool writes no files and performs no remote
+operations. It reports total latency, first-progress latency, actual progress
+window boundaries/rates, terminal work totals, physical scratch, file counts and
+memory peak. Different first markers or target overshoot are visible, not
+normalized away. It makes no production thread selection, nonlinear peak claim,
+replay admission, runtime promotion, canonical sidecar or publication decision.
+
 Fleet reconciliation accepts only the distinct
 `jetstreamer-private-epoch203-bounded-resource-launch-v1` receipt for this run.
 It pins the worker and runner digests, bootstrap/target/root, unchanged v1.6.16
