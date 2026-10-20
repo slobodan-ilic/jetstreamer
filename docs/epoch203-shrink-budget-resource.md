@@ -28,3 +28,30 @@ resource admission pass. Existing profiles that pin worker `3f5e8efe…` do
 not authorize this worker. Never relabel old receipts or hot-patch/restart a
 healthy sealed producer. A bounded comparison still cannot promote the
 runtime route, create a canonical sidecar or publish any archive.
+
+## Fleet receipt contract (dormant)
+
+The candidate fleet contract uses launch schema
+`jetstreamer-private-epoch203-shrink-budget-resource-launch-v1`, the
+`horizon-qualify-203-bounded-resource-shrink-budget-` unit namespace and
+`bounded-resource-203-shrink-budget-` private-root namespace. It accepts only
+the sealed 16-thread runner `d7b3f0c7…`, worker `4aeca563…`, parent
+`025757b9…`, and unchanged generation-bound bootstrap. The separate
+single-thread candidate remains unsupported by this fleet contract.
+
+The receipt must explicitly record `storage_maintenance_changed: true`,
+`upstream_shrink_budget_cap: true`, and `runtime_semantics_changed: false`.
+It binds target 87,720,000, terminal root 88,127,580, 256-GiB scratch bound,
+21,600-second runtime and 416-GiB experimental envelope. Every full-prefix,
+full-peak, ordinary replay, runtime promotion, sidecar and publication claim
+remains false. These fields document the bounded experiment; none establishes
+fresh resource admission or real-data qualification.
+
+Same-sample fleet reconciliation additionally requires the separately sealed
+standalone guard `d039ddf0…`, its exact invocation-bound plan, one readable
+worker, clean first sandboxed fire, and the exact private
+`receipts/target-stop.json` handoff with 180-second maximum drainage. Baseline
+guard/worker/runner receipts, a different target path and longer drainage are
+rejected. The fleet checker is read-only and does not launch the experiment.
+Keep both the current live metadata binary and running guards unchanged until
+an independently qualified deployment transition is actually required.
