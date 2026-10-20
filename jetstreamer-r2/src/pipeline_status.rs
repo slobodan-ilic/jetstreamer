@@ -34,14 +34,15 @@ fn unit_name(value: &str) -> bool {
 
 impl Binding {
     pub fn validate(&self, epoch: u64, phase: &str) -> Result<()> {
-        let prefix = match (self.claim_phase.as_str(), phase) {
-            ("local-publication", "publication") => format!("horizon-publish-{epoch}-"),
-            ("upload-readback", "upload" | "readback") => format!("horizon-upload-{epoch}-"),
+        match (self.claim_phase.as_str(), phase) {
+            ("full-verification" | "plugin-verification", "verification")
+            | ("local-publication", "publication")
+            | ("upload-readback", "upload" | "readback") => (),
             _ => bail!("pipeline and status phases disagree"),
         };
         ensure!(
             unit_name(&self.unit)
-                && self.unit.starts_with(&prefix)
+                && fleet::pipeline_unit_range(&self.claim_phase, &self.unit)?.contains(&epoch)
                 && unit_name(&self.origin_unit)
                 && hex_id(&self.invocation_id, 32)
                 && hex_id(&self.origin_invocation_id, 32)
@@ -94,7 +95,7 @@ struct Plan {
     receipt_directory: PathBuf,
 }
 
-fn bound_json(bound: &Bound) -> Result<Value> {
+fn bound_bytes(bound: &Bound) -> Result<Vec<u8>> {
     ensure!(
         bound.path.is_absolute() && hex_id(&bound.sha256, 64),
         "invalid pipeline evidence binding"
@@ -109,7 +110,71 @@ fn bound_json(bound: &Bound) -> Result<Value> {
         hex_lower(&Sha256::digest(&bytes)) == bound.sha256,
         "pipeline status evidence hash mismatch"
     );
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(bytes)
+}
+
+fn bound_json(bound: &Bound) -> Result<Value> {
+    Ok(serde_json::from_slice(&bound_bytes(bound)?)?)
+}
+
+// A legacy controller need not have the newer diagnostic launch schema. Its
+// authenticated replay status receipt and exact historical v2 observer prove
+// the original invocation without inventing a launch event or resetting elapsed
+// time to the downstream verifier's start. The manager journal remains the
+// independent authoritative clock used below.
+fn validate_replay_origin(
+    origin_path: &Path,
+    epoch: u64,
+    binding: &Binding,
+    receipt: &StatusPublicationReceipt,
+    observer_bytes: &[u8],
+) -> Result<()> {
+    validate_status_publication_receipt_bytes(
+        origin_path
+            .parent()
+            .context("origin receipt has no parent")?,
+        origin_path,
+        &serde_json::to_vec(receipt)?,
+        &receipt.bucket,
+        epoch,
+    )?;
+    ensure!(
+        receipt.schema == STATUS_RECEIPT_SCHEMA
+            && receipt.pipeline_binding.is_none()
+            && receipt.status.phase == "replay"
+            && receipt.producer_invocation_id == binding.origin_invocation_id,
+        "elapsed-time origin is not the authenticated original replay"
+    );
+    let sample = validate_observer_binding(
+        observer_bytes,
+        &receipt.observer_receipt_sha256,
+        epoch,
+        &receipt.controller_invocation_id,
+        &receipt.producer_invocation_id,
+    )?;
+    ensure!(
+        receipt.status.sampled_at_utc == sample,
+        "origin status and observer times differ"
+    );
+    let observer: Value = serde_json::from_slice(observer_bytes)?;
+    let replay = observer["replays"]
+        .as_array()
+        .context("origin observer omits replays")?
+        .iter()
+        .find(|replay| {
+            replay["range"]
+                .as_str()
+                .and_then(|range| parse_observer_claim_range(range).ok())
+                .is_some_and(|range| range.contains(&epoch))
+        })
+        .context("origin replay claim missing")?;
+    for point in ["producer_before", "producer_after"] {
+        ensure!(
+            observer_string(replay, &[point, "unit"])? == binding.origin_unit,
+            "origin observer names a different producer unit"
+        );
+    }
+    Ok(())
 }
 
 fn start_millis(records: &[Value], unit: &str, invocation: &str) -> Result<u64> {
@@ -230,7 +295,12 @@ fn validate_scope(plan: &Plan, observer: &Value, fleet: &Value, now: u64) -> Res
         !active.iter().any(|e| e["epoch"] == plan.epoch
             && !matches!(
                 e["phase"].as_str(),
-                Some("local-publication" | "upload-readback")
+                Some(
+                    "full-verification"
+                        | "plugin-verification"
+                        | "local-publication"
+                        | "upload-readback"
+                )
             )),
         "pipeline overlaps a replay or private qualification claim"
     );
@@ -269,8 +339,15 @@ fn census(plan: &Plan, fleet: &Value) -> Result<BTreeMap<String, Value>> {
     for peer in &plan.peer_units {
         ensure!(
             unit_name(peer)
-                && (peer.starts_with(&format!("horizon-publish-{}-", plan.epoch))
-                    || peer.starts_with(&format!("horizon-upload-{}-", plan.epoch)))
+                && [
+                    "full-verification",
+                    "plugin-verification",
+                    "local-publication",
+                    "upload-readback"
+                ]
+                .iter()
+                .any(|phase| fleet::pipeline_unit_range(phase, peer)
+                    .is_ok_and(|range| range.contains(&plan.epoch)))
                 && peers.insert(peer.clone()),
             "pipeline peer is duplicate or names another epoch"
         );
@@ -335,17 +412,36 @@ pub(super) async fn run() -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let sample = validate_scope(&plan, &observer, &fleet, now)?;
     let origin = bound_json(&plan.origin_launch)?;
-    ensure!(
-        origin["epoch"] == plan.epoch
-            && origin["launched"] == true
-            && origin["evidence"]["units"]
-                .as_array()
-                .is_some_and(
-                    |units| units.iter().any(|u| u["unit"] == plan.binding.origin_unit
-                        && u["invocation_id"] == plan.binding.origin_invocation_id)
-                ),
-        "elapsed-time origin is not the exact launched epoch producer"
-    );
+    if origin["schema"] == STATUS_RECEIPT_SCHEMA {
+        let receipt: StatusPublicationReceipt = serde_json::from_value(origin)?;
+        let prior_observer = bound_bytes(&Bound {
+            path: receipt.observer_receipt.clone(),
+            sha256: receipt.observer_receipt_sha256.clone(),
+        })?;
+        validate_replay_origin(
+            &plan.origin_launch.path,
+            plan.epoch,
+            &plan.binding,
+            &receipt,
+            &prior_observer,
+        )?;
+        ensure!(
+            receipt.status.sampled_at_utc <= sample && receipt.verified_unix_seconds <= now,
+            "origin replay receipt is from the future"
+        );
+    } else {
+        ensure!(
+            origin["epoch"] == plan.epoch
+                && origin["launched"] == true
+                && origin["evidence"]["units"]
+                    .as_array()
+                    .is_some_and(|units| units
+                        .iter()
+                        .any(|u| u["unit"] == plan.binding.origin_unit
+                            && u["invocation_id"] == plan.binding.origin_invocation_id)),
+            "elapsed-time origin is not the exact launched epoch producer"
+        );
+    }
     for evidence in &plan.estimate_evidence {
         bound_json(evidence)?;
     }
@@ -474,6 +570,153 @@ mod tests {
             assert!(!b.live_matches(&bad));
         }
     }
+
+    #[test]
+    fn verifier_status_is_scoped_to_its_real_stage_and_cohort() {
+        let mut b = binding();
+        for (phase, unit) in [
+            (
+                "full-verification",
+                "horizon-full-verify-216-219-test.service",
+            ),
+            (
+                "plugin-verification",
+                "horizon-plugin-verify-216-219-test.service",
+            ),
+        ] {
+            b.claim_phase = phase.into();
+            b.unit = unit.into();
+            b.validate(218, "verification").unwrap();
+            assert!(b.validate(215, "verification").is_err());
+            assert!(b.validate(220, "verification").is_err());
+            assert!(b.validate(218, "replay").is_err());
+            assert!(b.validate(218, "upload").is_err());
+        }
+        b.unit = "horizon-full-verify-216-219-test.service".into();
+        assert!(b.validate(218, "verification").is_err());
+    }
+
+    #[test]
+    fn legacy_replay_origin_requires_authenticated_status_and_exact_observer() {
+        let mut b = binding();
+        let mut receipt = super::super::tests::status_publication_receipt(213);
+        b.origin_invocation_id = receipt.producer_invocation_id.clone();
+        let observer = json!({"schema":"jetstreamer-horizon-live-resource-sample-v2",
+            "recorded_at_utc":receipt.status.sampled_at_utc,
+            "mutation":{"producer_or_controller_signals_sent":false,"service_state_changed":false,
+                "remote_mutations":false,"r2_mutations":false},
+            "replays":[{"range":"213-213","invocation_binding_stable":true,
+                "controller_before":{"invocation_id":receipt.controller_invocation_id,"restarts":0},
+                "controller_after":{"invocation_id":receipt.controller_invocation_id,"restarts":0},
+                "producer_before":{"unit":b.origin_unit,"invocation_id":receipt.producer_invocation_id,"restarts":0},
+                "producer_after":{"unit":b.origin_unit,"invocation_id":receipt.producer_invocation_id,"restarts":0},
+                "useful_work":{"journal_invocation_id":receipt.producer_invocation_id}}]});
+        let bytes = serde_json::to_vec(&observer).unwrap();
+        receipt.observer_receipt_sha256 = hex_lower(&Sha256::digest(&bytes));
+        let path = status_receipt_path(Path::new("/private"), &receipt.status);
+        validate_replay_origin(&path, 213, &b, &receipt, &bytes).unwrap();
+        for change in [
+            "authenticated",
+            "invocation",
+            "phase",
+            "timestamp",
+            "digest",
+        ] {
+            let mut bad = receipt.clone();
+            match change {
+                "authenticated" => bad.authenticated_readback = false,
+                "invocation" => bad.producer_invocation_id = "a".repeat(32),
+                "phase" => bad.status.phase = "verification".into(),
+                "timestamp" => bad.status.sampled_at_utc = "2026-10-17T01:11:00Z".into(),
+                "digest" => bad.observer_receipt_sha256 = "b".repeat(64),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_replay_origin(&path, 213, &b, &bad, &bytes).is_err(),
+                "{change}"
+            );
+        }
+        for change in ["unit", "restart", "range"] {
+            let mut bad = observer.clone();
+            match change {
+                "unit" => bad["replays"][0]["producer_after"]["unit"] = json!("other.service"),
+                "restart" => bad["replays"][0]["producer_after"]["restarts"] = json!(1),
+                "range" => bad["replays"][0]["range"] = json!("214-214"),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&bad).unwrap();
+            let mut bad_receipt = receipt.clone();
+            bad_receipt.observer_receipt_sha256 = hex_lower(&Sha256::digest(&bytes));
+            assert!(
+                validate_replay_origin(&path, 213, &b, &bad_receipt, &bytes).is_err(),
+                "{change}"
+            );
+        }
+        assert!(validate_replay_origin(&path, 214, &b, &receipt, &bytes).is_err());
+    }
+
+    #[test]
+    fn verification_status_receipt_remains_completion_cleanup_compatible() {
+        let directory = Path::new("/private/receipts");
+        let mut receipt = super::super::tests::status_publication_receipt(213);
+        receipt.schema = PIPELINE_STATUS_RECEIPT_SCHEMA.into();
+        receipt.controller_invocation_id.clear();
+        receipt.producer_invocation_id.clear();
+        receipt.status.phase = "verification".into();
+        let mut b = binding();
+        b.claim_phase = "full-verification".into();
+        b.unit = "horizon-full-verify-213-test.service".into();
+        receipt.pipeline_binding = Some(b);
+        let path = status_receipt_path(directory, &receipt.status);
+        assert_eq!(
+            validate_status_publication_receipt_bytes(
+                directory,
+                &path,
+                &serde_json::to_vec(&receipt).unwrap(),
+                "bucket",
+                213
+            )
+            .unwrap(),
+            receipt
+        );
+        receipt.status.phase = "replay".into();
+        assert!(
+            validate_status_publication_receipt_bytes(
+                directory,
+                &path,
+                &serde_json::to_vec(&receipt).unwrap(),
+                "bucket",
+                213
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only, root-only proof for this host's sealed epoch206 historical origin"]
+    fn host_206_legacy_origin_uses_authenticated_replay_and_manager_start() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let origin = Bound {
+            path: "/home/ubuntu/.jetstreamer-private/r2-status-receipts/epoch-206.status-20261020090442.json".into(),
+            sha256: "1a3a8391276fc934f89fd1978720aead34f4b604e80dd7cacdddc3ea964c4ffc".into(),
+        };
+        let receipt: StatusPublicationReceipt =
+            serde_json::from_value(bound_json(&origin).unwrap()).unwrap();
+        let mut b = binding();
+        b.origin_unit =
+            "jetstreamer-root-sweep-horizon-206-cf9b7e9-v1-e206-206-lane-c-1.service".into();
+        b.origin_invocation_id = "6581c697673e4dc4becca771e99786ac".into();
+        let bytes = bound_bytes(&Bound {
+            path: receipt.observer_receipt.clone(),
+            sha256: receipt.observer_receipt_sha256.clone(),
+        })
+        .unwrap();
+        validate_replay_origin(&origin.path, 206, &b, &receipt, &bytes).unwrap();
+        let start = manager_start(&b.origin_unit, &b.origin_invocation_id).unwrap();
+        assert!(
+            start > 0 && start < fleet::utc_seconds(&receipt.status.sampled_at_utc).unwrap() * 1000
+        );
+    }
     #[test]
     fn elapsed_start_requires_one_exact_root_manager_event() {
         let event = json!({"UNIT":"origin.service","INVOCATION_ID":"id","_PID":"1","_UID":"0",
@@ -570,6 +813,14 @@ mod tests {
                 "InvocationID":plan.binding.invocation_id,"NRestarts":"0","MainPID":"123","ExecStart":plan.binding.expected_exec_start
             }}],"epochs":[{"epoch":213,"state":"post-replay-pipeline"}]});
         validate_scope(&plan, &observer, &fleet, t + 5).unwrap();
+        let mut parallel = fleet.clone();
+        let mut peer = parallel["active"][0].clone();
+        peer["phase"] = json!("full-verification");
+        peer["unit"]["Id"] = json!("horizon-full-verify-213-test.service");
+        parallel["active"].as_array_mut().unwrap().push(peer);
+        validate_scope(&plan, &observer, &parallel, t + 5).unwrap();
+        parallel["active"][1]["phase"] = json!("diagnostic-qualification");
+        assert!(validate_scope(&plan, &observer, &parallel, t + 5).is_err());
         let mut unclaimed = fleet.clone();
         unclaimed["active"] = json!([]);
         assert!(validate_scope(&plan, &observer, &unclaimed, t + 5).is_err());

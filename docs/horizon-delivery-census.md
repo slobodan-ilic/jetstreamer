@@ -22,8 +22,26 @@ In particular, an uploader named for 298–301 cannot claim epoch 300 under a
 
 These are observational claims, not launch, compatibility, verification,
 publication or status-JSON authority. They do not replace any archive receipt or
-make a ready pair. Use a separately supported, qualified status publisher for
-the actual downstream phase; never relabel a terminated replay as live or use
-this census extension to bypass that publisher's bindings. Keep all changes in
+make a ready pair. The identity-bound `status-publish-pipeline` publisher accepts
+`verification` only for a bound full/plugin verifier, `publication` for local
+publication, and `upload`/`readback` for the uploader. Independent live stages may
+coexist, but every non-handoff unit must still match the exact fleet census.
+Never relabel a terminated replay as live. Keep all changes in
 the existing coordinated 30-minute cycle, or an explicitly authorized event or
 user-requested status cycle, rather than running another resource poll.
+
+For a legacy controller lacking the newer diagnostic launch receipt, the
+publisher's `origin_launch` input may instead bind the exact authenticated replay
+status-publication receipt. The publisher revalidates that receipt's canonical
+key/path, epoch, replay phase, producer ID and authenticated readback, rehashes its
+historical v2 observer, and checks both original producer unit names and stable
+zero-restart identities. Elapsed time still comes from that original invocation's
+unique root manager-journal start, not the status timestamp or verifier start.
+This historical evidence is only an elapsed-time origin; it never supplies a
+current live claim or current resource/admission evidence.
+
+Before publishing a verification-phase status, migrate the relevant completion
+cleanup service to a sealed binary that validates the same extended binding.
+An older cleanup binary must not be assumed to understand a newer receipt merely
+because its schema name is unchanged. Keep the old receipts and prove the new
+receipt decoder and source bindings without mutating remote objects first.

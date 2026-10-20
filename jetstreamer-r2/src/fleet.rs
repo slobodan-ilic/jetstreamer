@@ -45,7 +45,10 @@ struct PipelineClaim {
 
 // Unit names describe scope, not authority. Every live claim still needs the
 // exact invocation/command, immutable evidence and an independent delivery gate.
-fn pipeline_unit_range(phase: &str, unit: &str) -> Result<std::ops::RangeInclusive<u64>> {
+pub(super) fn pipeline_unit_range(
+    phase: &str,
+    unit: &str,
+) -> Result<std::ops::RangeInclusive<u64>> {
     let prefix = match phase {
         "full-verification" => "horizon-full-verify-",
         "plugin-verification" => "horizon-plugin-verify-",
