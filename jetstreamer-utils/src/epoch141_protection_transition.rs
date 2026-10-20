@@ -109,6 +109,16 @@ fn observer_live(state: &Value, name: &str, invocation: &str) -> bool {
         && state["main_pid"].as_u64().is_some_and(|n| n > 0)
 }
 
+fn command_names_executable(args: &[&str], path: &str) -> bool {
+    // systemctl renders a direct shebang command with path=/... and
+    // argv[]=/..., while an interpreter's script is a bare subsequent argv.
+    args.iter().any(|arg| {
+        *arg == path
+            || arg.strip_prefix("path=") == Some(path)
+            || arg.strip_prefix("argv[]=") == Some(path)
+    })
+}
+
 fn required_floor(claims: &BTreeMap<String, Claim>, floor: u64, margin: u64) -> Result<u64> {
     ensure!(
         claims.keys().map(String::as_str).eq(RANGES),
@@ -318,8 +328,9 @@ pub(super) fn validate(
             .split_whitespace()
             .collect();
         ensure!(
-            args.contains(
-                &c.guard_executable
+            command_names_executable(
+                &args,
+                c.guard_executable
                     .path
                     .to_str()
                     .context("non-UTF8 guard path")?
@@ -451,5 +462,23 @@ mod tests {
         let mut bad = good;
         bad["main_pid"] = "123".into();
         assert!(!observer_live(&bad, "owner.service", &invocation));
+    }
+
+    #[test]
+    fn exact_guard_executable_accepts_real_systemctl_shebang_and_interpreter_shapes() {
+        let path = "/sealed/guard.py";
+        for command in [
+            "{ path=/sealed/guard.py ; argv[]=/sealed/guard.py --minimum-free-bytes=1 ; }",
+            "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /sealed/guard.py --minimum-free-bytes=1 ; }",
+        ] {
+            let args: Vec<_> = command.split_whitespace().collect();
+            assert!(command_names_executable(&args, path));
+            assert!(!command_names_executable(&args, "/sealed/guard.py-other"));
+            assert!(!command_names_executable(&args, "/sealed/guard"));
+        }
+        assert!(!command_names_executable(
+            &["--note=/sealed/guard.py"],
+            path
+        ));
     }
 }
