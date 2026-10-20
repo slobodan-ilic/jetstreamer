@@ -81,6 +81,10 @@ path = "src/epoch141_ledger_native_bin.rs"
 required-features = ["sst-capability-tests"]
 
 [[bin]]
+name = "jetstreamer-epoch140-checkpoint-journal"
+path = "src/epoch140_checkpoint_journal_bin.rs"
+
+[[bin]]
 name = "jetstreamer-horizon-boundary-bridge"
 path = "src/horizon_boundary_bridge_bin.rs"
 
