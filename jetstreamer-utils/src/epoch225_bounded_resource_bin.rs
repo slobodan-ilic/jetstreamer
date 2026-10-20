@@ -28,7 +28,20 @@ const TARGET: u64 = 97_202_500;
 const TERMINAL: u64 = 97_631_459;
 const MINIMUM_FREE: u64 = 3_185_678_193_366;
 const MAX_SCRATCH: u64 = 256 << 30;
+#[cfg(not(feature = "epoch225-v1-6-25-diagnostic"))]
 const WORKER: &str = "f39140b9a9659e7c6e8207076a2d0c560a6b69df42cc92e19a421cf46c2b761c";
+#[cfg(feature = "epoch225-v1-6-25-diagnostic")]
+const WORKER: &str = "74f805991023434932080b6db20385d36ec26d8a1dd9bbd7a33848099145859a";
+const WORKER_ENV: &str = if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
+    "JETSTREAMER_HISTORICAL_WORKER_V1_6_25"
+} else {
+    "JETSTREAMER_HISTORICAL_WORKER_V1_6_20"
+};
+const OTHER_WORKER_ENV: &str = if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
+    "JETSTREAMER_HISTORICAL_WORKER_V1_6_20"
+} else {
+    "JETSTREAMER_HISTORICAL_WORKER_V1_6_25"
+};
 const SNAPSHOT: &str = "094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d";
 const GENESIS: &str = "133f7eaefcd59466f3b291aadd1b0d3522432072cf5b539445218c6c125ea945";
 static EXTERNAL_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -212,7 +225,8 @@ fn command(p: &Plan) -> Command {
         .env("JETSTREAMER_HISTORICAL_TRACE", "1")
         .env("RUST_LOG", "info")
         .env("SOLANA_RAYON_THREADS", "16")
-        .env("JETSTREAMER_HISTORICAL_WORKER_V1_6_20", &p.worker)
+        .env(WORKER_ENV, &p.worker)
+        .env_remove(OTHER_WORKER_ENV)
         .env_remove("HORIZON_S3_ENDPOINT")
         .env_remove("HORIZON_ACCESS_KEY_ID")
         .env_remove("HORIZON_SECRET_ACCESS_KEY")
@@ -772,11 +786,9 @@ mod tests {
             .get_envs()
             .map(|(k, v)| (k.to_str().unwrap(), v.and_then(|s| s.to_str())))
             .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(
-            env["JETSTREAMER_HISTORICAL_WORKER_V1_6_20"],
-            Some("/sealed/worker")
-        );
+        assert_eq!(env[WORKER_ENV], Some("/sealed/worker"));
         assert_eq!(env["SOLANA_RAYON_THREADS"], Some("16"));
+        assert_eq!(env[OTHER_WORKER_ENV], None);
         assert_eq!(env["JETSTREAMER_HISTORICAL_TRACE"], Some("1"));
         assert_eq!(env["HORIZON_SECRET_ACCESS_KEY"], None);
     }

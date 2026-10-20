@@ -11,6 +11,8 @@ documentation.workspace = true
 
 [features]
 sst-capability-tests = ["dep:rocksdb"]
+# Pins the separate bounded epoch225 upstream-comparison worker, not an era.
+epoch225-v1-6-25-diagnostic = []
 
 [lib]
 name = "jetstreamer_utils"

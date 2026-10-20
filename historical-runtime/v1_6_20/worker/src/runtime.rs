@@ -1359,6 +1359,33 @@ fn normalize_instruction_error(error: InstructionError) -> WireInstructionError 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch225_wire_fixture_called_program_writability() {
+        let wire = bs58::decode(
+            include_str!("../../../fixtures/epoch225-writable-token-program.base58").trim(),
+        )
+        .into_vec()
+        .unwrap();
+        let transaction: Transaction = bincode::deserialize(&wire).unwrap();
+        assert_eq!(transaction.signatures[0].to_string(), "4tURm7ubHwvAth4yE8T87NRXh84akr9AhbDYWckdMsgoQVn4TQiBkkLvjBfcM78PVWzn7R4cboadPBgBduENRY7d");
+        let key = transaction.message.account_keys[6];
+        assert_eq!(
+            key.to_string(),
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        );
+        assert!(transaction
+            .message
+            .instructions
+            .iter()
+            .any(|i| i.program_id_index == 6));
+        assert!(transaction.message.is_key_passed_to_program(6));
+        assert!(transaction.message.is_non_loader_key(&key, 6));
+        assert_eq!(transaction.message.is_writable(6, true), true);
+        let attribution = writable_key_attribution(&[transaction], true).unwrap();
+        assert_eq!(attribution.contains_key(key.as_ref()), true);
+    }
+
     use solana_runtime::{
         accounts_index::AccountSecondaryIndexes, genesis_utils::create_genesis_config_with_leader,
     };
