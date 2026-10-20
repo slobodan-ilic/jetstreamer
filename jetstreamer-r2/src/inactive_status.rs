@@ -220,7 +220,7 @@ fn owner_units(publication: &StatusPublicationReceipt) -> Result<Vec<(String, St
     ])
 }
 
-fn queued_job_units(bytes: &[u8]) -> Result<Vec<&str>> {
+pub(super) fn queued_job_units(bytes: &[u8]) -> Result<Vec<&str>> {
     let mut names = Vec::new();
     for line in std::str::from_utf8(bytes)?
         .lines()

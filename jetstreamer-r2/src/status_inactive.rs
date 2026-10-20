@@ -235,16 +235,36 @@ fn cleared_controller_proof(name: &str, invocation: &str) -> Result<Vec<Value>> 
         .collect())
 }
 
+fn valid_unit_name(name: &str) -> bool {
+    if !name.ends_with(".service") || name.starts_with('-') || name.len() > 255 {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'\\' {
+            if at + 3 >= bytes.len()
+                || bytes[at + 1] != b'x'
+                || !bytes[at + 2].is_ascii_hexdigit()
+                || !bytes[at + 3].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            at += 4;
+        } else {
+            if !bytes[at].is_ascii_alphanumeric() && !b"-_.@:".contains(&bytes[at]) {
+                return false;
+            }
+            at += 1;
+        }
+    }
+    true
+}
+
 fn unit(name: &str) -> Result<Value> {
-    ensure!(
-        name.ends_with(".service")
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.@".contains(&b)),
-        "invalid unit name"
-    );
+    ensure!(valid_unit_name(name), "invalid unit name");
     let out = Command::new("systemctl").args(["show", name, "--no-pager",
-        "--property=Id,LoadState,ActiveState,SubState,InvocationID,NRestarts,MainPID,ExecStart,TriggeredBy,Result"]).output()?;
+        "--property=Id,LoadState,ActiveState,SubState,InvocationID,NRestarts,MainPID,ExecStart,ExecStartPre,ExecStartPost,TriggeredBy,Result"]).output()?;
     let mut v = serde_json::Map::new();
     for line in std::str::from_utf8(&out.stdout)?.lines() {
         let (k, val) = line.split_once('=').context("invalid systemctl property")?;
@@ -295,6 +315,28 @@ fn names_epoch(text: &str, epoch: u64) -> bool {
         }
     }
     false
+}
+
+fn start_commands(value: &Value) -> Result<String> {
+    let mut commands = Vec::new();
+    for field in ["ExecStartPre", "ExecStart", "ExecStartPost"] {
+        if let Some(command) = value[field].as_str() {
+            commands.push(command);
+        }
+    }
+    if commands.iter().all(|command| command.trim().is_empty()) {
+        // Valid stop-only oneshots such as blk-availability have no start
+        // command and remain active/exited with no PID. Do not mistake that
+        // explicit inert shape for an unreadable live command.
+        ensure!(
+            terminal(value)
+                || (value["MainPID"] == "0"
+                    && value["ActiveState"] == "active"
+                    && value["SubState"] == "exited"),
+            "unit command missing for non-inert state"
+        );
+    }
+    Ok(commands.join(" "))
 }
 
 fn validate_fleet(
@@ -397,9 +439,7 @@ fn live_census(plan: &Plan, fleet: &Value) -> Result<Value> {
     for d in discovered {
         let name = d["unit"].as_str().context("unit discovery omits name")?;
         let current = unit(name)?;
-        let command = current["ExecStart"]
-            .as_str()
-            .context("unit command missing")?;
+        let command = start_commands(&current)?;
         let command_bytes = command
             .split_ascii_whitespace()
             .collect::<Vec<_>>()
@@ -434,12 +474,18 @@ fn live_census(plan: &Plan, fleet: &Value) -> Result<Value> {
         claims.insert(name.to_string(), current);
     }
     let jobs = Command::new("systemctl")
-        .args(["list-jobs", "--output=json", "--no-pager"])
+        .args([
+            "list-jobs",
+            "--no-legend",
+            "--no-pager",
+            "--plain",
+            "--full",
+        ])
         .output()?;
     ensure!(jobs.status.success(), "queued-job census failed");
-    let queued: Vec<Value> = serde_json::from_slice(&jobs.stdout)?;
+    let queued = inactive_status::queued_job_units(&jobs.stdout)?;
     for j in &queued {
-        let name = j["unit"].as_str().context("queued unit omitted")?;
+        let name = *j;
         if !name.ends_with(".service") {
             ensure!(
                 !names_epoch(name, plan.epoch),
@@ -448,9 +494,7 @@ fn live_census(plan: &Plan, fleet: &Value) -> Result<Value> {
             continue;
         }
         let command = unit(name)?;
-        let command = command["ExecStart"]
-            .as_str()
-            .context("queued command missing")?;
+        let command = start_commands(&command)?;
         let command_bytes = command
             .split_ascii_whitespace()
             .collect::<Vec<_>>()
@@ -833,6 +877,39 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_census_accepts_real_systemd_hex_escapes_without_options_or_paths() {
+        assert!(valid_unit_name(
+            r"systemd-fsck@dev-disk-by\x2duuid-4227\x2d4B65.service"
+        ));
+        for invalid in [
+            "--foo.service",
+            "../foo.service",
+            r"foo\x.service",
+            r"foo\xzz.service",
+            "foo\n.service",
+        ] {
+            assert!(!valid_unit_name(invalid), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn stop_only_inert_services_are_not_unreadable_live_commands() {
+        let mut value = json!({"MainPID":"0","ActiveState":"active","SubState":"exited"});
+        assert_eq!(start_commands(&value).unwrap(), "");
+        value["MainPID"] = json!("123");
+        assert!(start_commands(&value).is_err());
+        value["ExecStart"] = json!("");
+        assert!(start_commands(&value).is_err());
+        value["ExecStartPre"] = json!("/sealed/jetstreamer-node 183 /output");
+        let command = start_commands(&value)
+            .unwrap()
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join("\0");
+        assert!(replay_command_claims(command.as_bytes(), 183));
+    }
 
     #[test]
     fn cleared_controller_id_requires_exact_last_manager_lifecycle_and_stop() {
