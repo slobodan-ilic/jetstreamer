@@ -48,6 +48,7 @@ struct Plan {
     output_receipt: PathBuf,
     stop_intent: PathBuf,
     stop_completion: PathBuf,
+    initial_guard_receipt: PathBuf,
     minimum_free_bytes: u64,
     maximum_runtime_seconds: u64,
 }
@@ -97,6 +98,7 @@ fn validate_plan(plan: &Plan, executable: &Path, executable_sha256: &str) -> Res
         &plan.output_receipt,
         &plan.stop_intent,
         &plan.stop_completion,
+        &plan.initial_guard_receipt,
     ] {
         private_parent(p)?;
         ensure!(
@@ -129,6 +131,19 @@ fn validate_plan(plan: &Plan, executable: &Path, executable_sha256: &str) -> Res
             && !plan.stop_intent.starts_with(&plan.staging_directory)
             && !plan.stop_completion.starts_with(&plan.staging_directory),
         "overlapping output paths"
+    );
+    ensure!(
+        !plan
+            .initial_guard_receipt
+            .starts_with(&plan.staging_directory)
+            && [
+                &plan.output_receipt,
+                &plan.stop_intent,
+                &plan.stop_completion
+            ]
+            .iter()
+            .all(|p| **p != plan.initial_guard_receipt),
+        "guard receipt overlaps other outputs"
     );
     let metadata: Value = serde_json::from_slice(&bound_file(
         &plan.metadata_receipt.path,
@@ -255,6 +270,13 @@ fn configure_sdk(command: &mut Command) {
         .env("CLOUDSDK_CONFIG", CLOUD_CONFIG)
         .env("CLOUDSDK_CORE_DISABLE_PROMPTS", "1")
         .env("CLOUDSDK_CORE_DISABLE_FILE_LOGGING", "1")
+        .env("CLOUDSDK_STORAGE_PROCESS_COUNT", "1")
+        .env("CLOUDSDK_STORAGE_THREAD_COUNT", "1")
+        .env("CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_THRESHOLD", "0")
+        .env(
+            "CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_MAX_COMPONENTS",
+            "1",
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -286,19 +308,25 @@ fn staged_bytes(directory: &Path) -> Result<u64> {
 }
 
 fn guard(plan: &Plan, start: Instant) -> Result<()> {
+    guard_snapshot(plan, start).map(|_| ())
+}
+
+fn guard_snapshot(plan: &Plan, start: Instant) -> Result<(u64, u64)> {
     ensure!(
         start.elapsed().as_secs() < plan.maximum_runtime_seconds,
         "download runtime bound reached"
     );
+    let available = free_bytes(&plan.staging_directory)?;
     ensure!(
-        free_bytes(&plan.staging_directory)? >= plan.minimum_free_bytes,
+        available >= plan.minimum_free_bytes,
         "protected actual-free-space stop floor reached"
     );
+    let staged = staged_bytes(&plan.staging_directory)?;
     ensure!(
-        staged_bytes(&plan.staging_directory)? <= SIZE + SLACK,
+        staged <= SIZE + SLACK,
         "download staging byte bound exceeded"
     );
-    Ok(())
+    Ok((available, staged))
 }
 
 fn digest_reader(
@@ -336,6 +364,50 @@ fn digest_reader(
     ))
 }
 
+fn create_staging(path: &Path) -> Result<File> {
+    fs::create_dir(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    let directory = File::open(path)?;
+    ensure!(
+        unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&directory), 1001, 1003) } == 0,
+        "cannot assign SDK staging directory"
+    );
+    File::open(path.parent().context("missing staging parent")?)?.sync_all()?;
+    Ok(directory)
+}
+
+fn freeze_input(
+    directory: &File,
+    destination: &Path,
+    expected_size: u64,
+) -> Result<(File, fs::Metadata)> {
+    // Freeze the directory before opening/hashing the file. Existing SDK children
+    // were killed while the leader still held its PID/PGID, before being reaped.
+    ensure!(
+        unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(directory), 0, 0) } == 0,
+        "cannot freeze staging directory"
+    );
+    directory.sync_all()?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(destination)?;
+    let m = file.metadata()?;
+    ensure!(
+        m.is_file() && m.nlink() == 1 && m.uid() == 1001 && m.len() == expected_size,
+        "downloaded file has unsafe identity or wrong length"
+    );
+    ensure!(
+        unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&file), 0, 0) } == 0,
+        "cannot freeze downloaded file owner"
+    );
+    file.set_permissions(fs::Permissions::from_mode(0o444))?;
+    file.sync_all()?;
+    directory.sync_all()?;
+    let before_hash = file.metadata()?;
+    Ok((file, before_hash))
+}
+
 fn download(plan: &Plan, invocation: &str, plan_sha256: &str, self_sha256: &str) -> Result<()> {
     let parent = plan
         .staging_directory
@@ -363,14 +435,7 @@ fn download(plan: &Plan, invocation: &str, plan_sha256: &str, self_sha256: &str)
         16 * 1024 * 1024,
         false,
     )?;
-    fs::create_dir(&plan.staging_directory)?;
-    fs::set_permissions(&plan.staging_directory, fs::Permissions::from_mode(0o700))?;
-    let directory = File::open(&plan.staging_directory)?;
-    ensure!(
-        unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&directory), 1001, 1003) } == 0,
-        "cannot assign SDK staging directory"
-    );
-    File::open(parent)?.sync_all()?;
+    let directory = create_staging(&plan.staging_directory)?;
     let destination = plan.staging_directory.join("rocksdb.tar.bz2");
     let mut command = Command::new(GCLOUD);
     command
@@ -391,31 +456,56 @@ fn download(plan: &Plan, invocation: &str, plan_sha256: &str, self_sha256: &str)
             .spawn()
             .context("spawn exact-generation SDK transfer")?,
     ));
+    let mut initial_guard_recorded = false;
     loop {
-        if let Err(error) = guard(plan, start) {
-            // Intent is durable before stopping the one owned download group.
-            // Drop still stops the group if writing the intent itself fails.
+        let (available, staged) = match guard_snapshot(plan, start) {
+            Ok(sample) => sample,
+            Err(error) => {
+                // Intent is durable before stopping the one owned download group.
+                // Drop still stops the group if writing the intent itself fails.
+                write_receipt(
+                    &plan.stop_intent,
+                    &json!({
+                        "schema":"jetstreamer-epoch141-ledger-download-stop-intent-v1",
+                        "invocation_id":invocation,"plan_sha256":plan_sha256,
+                        "child_pid":child.0.as_ref().context("missing child")?.id(),
+                        "reason":error.to_string(),"partial_preserved":true,
+                        "replay_launch_authorized":false,"r2_mutations":false
+                    }),
+                )?;
+                child.finish()?;
+                write_receipt(
+                    &plan.stop_completion,
+                    &json!({
+                        "schema":"jetstreamer-epoch141-ledger-download-stop-completion-v1",
+                        "invocation_id":invocation,"plan_sha256":plan_sha256,
+                        "owned_child_reaped":true,"partial_preserved":true,
+                        "replay_launch_authorized":false,"r2_mutations":false
+                    }),
+                )?;
+                return Err(error);
+            }
+        };
+        if !initial_guard_recorded {
             write_receipt(
-                &plan.stop_intent,
+                &plan.initial_guard_receipt,
                 &json!({
-                    "schema":"jetstreamer-epoch141-ledger-download-stop-intent-v1",
-                    "invocation_id":invocation,"plan_sha256":plan_sha256,
+                    "schema":"jetstreamer-epoch141-ledger-download-initial-guard-v1",
+                    "invocation_id":invocation,"plan_sha256":plan_sha256,"self_sha256":self_sha256,
                     "child_pid":child.0.as_ref().context("missing child")?.id(),
-                    "reason":error.to_string(),"partial_preserved":true,
-                    "replay_launch_authorized":false,"r2_mutations":false
+                    "available_bytes":available,
+                    "minimum_free_bytes":plan.minimum_free_bytes,
+                    "staged_bytes":staged,
+                    "maximum_staged_bytes":SIZE + SLACK,
+                    "maximum_runtime_seconds":plan.maximum_runtime_seconds,
+                    "guard_interval_seconds":1,"trip":false,
+                    "recorded_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+                    "replay_launch_authorized":false,"publication_authorized":false,
+                    "remote_mutations":false,"r2_mutations":false
                 }),
             )?;
-            child.finish()?;
-            write_receipt(
-                &plan.stop_completion,
-                &json!({
-                    "schema":"jetstreamer-epoch141-ledger-download-stop-completion-v1",
-                    "invocation_id":invocation,"plan_sha256":plan_sha256,
-                    "owned_child_reaped":true,"partial_preserved":true,
-                    "replay_launch_authorized":false,"r2_mutations":false
-                }),
-            )?;
-            return Err(error);
+            initial_guard_recorded = true;
+            println!("epoch141 owned download guard armed; private initial receipt durable");
         }
         if child.exited()? {
             break;
@@ -426,30 +516,7 @@ fn download(plan: &Plan, invocation: &str, plan_sha256: &str, self_sha256: &str)
         child.finish()?.success(),
         "generation-bound SDK download failed; private partial preserved"
     );
-    // Freeze the directory before opening/hashing the file. Existing SDK children
-    // were killed while the leader still held its PID/PGID, before being reaped.
-    ensure!(
-        unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&directory), 0, 0) } == 0,
-        "cannot freeze staging directory"
-    );
-    directory.sync_all()?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(&destination)?;
-    let m = file.metadata()?;
-    ensure!(
-        m.is_file() && m.nlink() == 1 && m.uid() == 1001 && m.len() == SIZE,
-        "downloaded file has unsafe identity or wrong length"
-    );
-    ensure!(
-        unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&file), 0, 0) } == 0,
-        "cannot freeze downloaded file owner"
-    );
-    file.set_permissions(fs::Permissions::from_mode(0o444))?;
-    file.sync_all()?;
-    directory.sync_all()?;
-    let before_hash = file.metadata()?;
+    let (mut file, before_hash) = freeze_input(&directory, &destination, SIZE)?;
     let (bytes, crc32c, md5, sha256) = digest_reader(&mut file, || guard(plan, start))?;
     ensure!(
         bytes == SIZE && crc32c == CRC && md5 == MD5,
@@ -571,6 +638,28 @@ mod tests {
     }
 
     #[test]
+    fn sdk_transfer_is_sequential_and_slicing_is_disabled() {
+        let mut command = Command::new("/usr/bin/true");
+        configure_sdk(&mut command);
+        let environment: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(k, v)| (k.to_str().unwrap(), v.unwrap().to_str().unwrap()))
+            .collect();
+        for (key, value) in [
+            ("CLOUDSDK_STORAGE_PROCESS_COUNT", "1"),
+            ("CLOUDSDK_STORAGE_THREAD_COUNT", "1"),
+            ("CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_THRESHOLD", "0"),
+            (
+                "CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_MAX_COMPONENTS",
+                "1",
+            ),
+            ("CLOUDSDK_CONFIG", CLOUD_CONFIG),
+        ] {
+            assert_eq!(environment.get(key), Some(&value));
+        }
+    }
+
+    #[test]
     fn staged_links_directories_and_large_lengths_fail_closed() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("one");
@@ -596,6 +685,7 @@ mod tests {
             output_receipt: PathBuf::from("/unused-receipt"),
             stop_intent: PathBuf::from("/unused-intent"),
             stop_completion: PathBuf::from("/unused-completion"),
+            initial_guard_receipt: PathBuf::from("/unused-guard"),
             minimum_free_bytes: 0,
             maximum_runtime_seconds: 60,
         };
@@ -653,9 +743,95 @@ mod tests {
                 .any(|line| line.starts_with("Groups:") && line.split_whitespace().count() == 1)
         );
         assert_eq!(unsafe { libc::getpgid(pid as i32) }, pid as i32);
+        assert!(
+            status
+                .lines()
+                .any(|line| line == "CapEff:\t0000000000000000")
+        );
+        assert!(
+            status
+                .lines()
+                .any(|line| line == "CapAmb:\t0000000000000000")
+        );
         assert_eq!(child.finish().unwrap().signal(), Some(9));
         assert!(child.0.is_none());
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    #[ignore = "root sandbox with explicit fresh filesystem probe root; disposable 9-byte fixture only"]
+    fn root_actual_filesystem_copy_freeze_digest_and_receipt() {
+        use std::io::Write;
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let root = PathBuf::from(env::var("JETSTREAMER_EPOCH141_PATH_PROBE_ROOT").unwrap());
+        assert!(root.is_absolute());
+        assert_eq!(root.canonicalize().unwrap(), root);
+        let m = fs::symlink_metadata(&root).unwrap();
+        assert!(m.is_dir() && m.uid() == 0 && m.mode() & 0o777 == 0o711);
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+        let source = root.join("source.fixture");
+        let mut fixture = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&source)
+            .unwrap();
+        fixture.write_all(b"123456789").unwrap();
+        fixture
+            .set_permissions(fs::Permissions::from_mode(0o444))
+            .unwrap();
+        fixture.sync_all().unwrap();
+        let staging = root.join("staging");
+        let directory = create_staging(&staging).unwrap();
+        assert_eq!(fs::metadata(&staging).unwrap().uid(), 1001);
+        let destination = staging.join("rocksdb.tar.bz2");
+        let mut command = Command::new("/usr/bin/cp");
+        command.arg(&source).arg(&destination);
+        configure_sdk(&mut command);
+        let mut child = OwnedDownload(Some(command.spawn().unwrap()));
+        let start = Instant::now();
+        while !child.exited().unwrap() {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(child.finish().unwrap().success());
+        assert_eq!(fs::metadata(&destination).unwrap().uid(), 1001);
+        let (mut file, before) = freeze_input(&directory, &destination, 9).unwrap();
+        let (bytes, crc, md5, sha256) = digest_reader(&mut file, || Ok(())).unwrap();
+        assert_eq!(bytes, 9);
+        assert_eq!(crc, "4waSgw==");
+        assert_eq!(md5, "JfnnlDI7RTiF9RgfG2JNCw==");
+        assert_eq!(
+            sha256,
+            "15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225"
+        );
+        assert_eq!(before.uid(), 0);
+        assert_eq!(before.mode() & 0o777, 0o444);
+        assert_eq!(before.nlink(), 1);
+        assert_eq!(identity(&before), identity(&file.metadata().unwrap()));
+        assert_eq!(
+            identity(&before),
+            identity(&fs::symlink_metadata(&destination).unwrap())
+        );
+        assert_eq!(fs::metadata(&staging).unwrap().uid(), 0);
+        assert_eq!(fs::metadata(&staging).unwrap().mode() & 0o777, 0o700);
+        let receipts = root.join("receipts");
+        fs::create_dir(&receipts).unwrap();
+        fs::set_permissions(&receipts, fs::Permissions::from_mode(0o700)).unwrap();
+        let receipt = receipts.join("probe.json");
+        write_receipt(
+            &receipt,
+            &json!({
+                "schema":"jetstreamer-epoch141-ledger-download-path-probe-v1",
+                "invocation_id":env::var("INVOCATION_ID").unwrap(),
+                "root":root,"device":before.dev(),"inode":before.ino(),
+                "fixture_bytes":bytes,"sha256":sha256,"crc32c_base64":crc,"md5_base64":md5,
+                "source_transfer_performed":false,"replay_launch_authorized":false,
+                "publication_authorized":false,"remote_mutations":false,"r2_mutations":false
+            }),
+        )
+        .unwrap();
+        assert!(write_receipt(&receipt, &json!({"overwrite":true})).is_err());
     }
 
     #[test]
