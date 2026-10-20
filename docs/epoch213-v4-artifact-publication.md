@@ -3,7 +3,7 @@
 `jetstreamer-epoch213-publish` is a narrow artifact admission, not ordinary V4
 reuse or historical-runtime registry promotion. It accepts only the original
 epoch-213 checkpoint-continuation producer and the independently verified output
-of the pinned `ccbe0f1` private full/plugin runner. It performs local publication
+of the pinned journal-bound private full/plugin runner. It performs local publication
 only, never an R2 operation or local retirement.
 
 Do not launch before the private verifier finishes successfully. The original
@@ -32,7 +32,7 @@ digest/length are known:
   "initial_anchor": {"path": "/absolute/sealed/rpc-evidence.json", "sha256": "fc635af1c740bd0a1a9a81b141631e49a43d625b0dffffc1d187d3106f2845e8"},
   "archive_sha256": "EXACT_VERIFIED_ARCHIVE_SHA256",
   "archive_bytes": 1,
-  "publication_stage": "/var/lib/jetstreamer/horizon-213-publication-stage-UNIQUE",
+  "publication_stage": "/var/lib/jetstreamer/horizon-213-publication-work-UNIQUE/stage",
   "receipt_directory": "/absolute/root-private/publication",
   "full_receipt_directory": "/absolute/root-private/full/receipts",
   "plugin_receipt_directory": "/absolute/root-private/plugin/receipts",
@@ -48,6 +48,30 @@ All three receipt directories must already exist as distinct canonical,
 root-owned mode-0700 directories. The publication stage must be absent. A
 nonempty or previous attempt is never overwritten or silently repaired.
 
+Pre-create only the dedicated
+`horizon-213-publication-work-UNIQUE` parent as root-owned mode 0755 on the public
+archive's filesystem. Keep its `stage` child absent. The parent must permit
+traversal after the permanent UID1000 drop while remaining non-writable to that
+UID; the newly created stage is owner-only. The legacy direct-child stage
+namespace is no longer admitted because it would broaden the write scope.
+
+Do not split the verified-copy, work and public directories across separate
+`ReadWritePaths=` bind mounts. Linux returns EXDEV for rename across distinct
+mount identities even when `st_dev` is equal. The publisher now checks statx
+mount IDs before opening sinks, changing ownership or moving bytes. A failed
+split-mount disposable fixture established this independently of any archive.
+
+Use a rename-compatible systemd namespace (`ProtectSystem=full`,
+`ProtectHome=no`, no writable bind mounts on those paths) and the publisher's
+mandatory process-local Landlock ABI >=3 write policy. It permits file writes,
+creation, removal and references only beneath the exact verified-copy directory,
+dedicated work parent, three receipt directories and public directory. Other
+filesystem writes are denied even while root; the policy survives the permanent
+credential drop. There is no unsupported-kernel fallback. Landlock does not
+mediate chmod/chown, so the existing exact-path, inode, ownership and capability
+checks remain independently required. Original retained inputs can additionally
+be mounted read-only without splitting any of the three rename directories.
+
 The publisher rehashes the bound private verification receipt, its plan, producer
 outcome, independent provenance expectation, pinned verifier/pipeline executables,
 and exact scan logs. It requires the strict full command including the initial
@@ -62,9 +86,9 @@ Run a persistent non-restarting root service with a bounded execution timeout an
 minimal capabilities for the source traversal and UID/GID transition. It needs
 effective `CAP_DAC_OVERRIDE`, `CAP_CHOWN`, `CAP_FOWNER`, `CAP_SETUID`, and
 `CAP_SETGID` where the service sandbox otherwise removes them. Validate the exact
-sandbox with the private capability probe below. Keep the original archive/logs
-read-only except for the one authorized private verification copy and new stage;
-grant writes to the named receipt directories and `/home/ubuntu/horizon` only.
+sandbox with the private capability probe below. The probe must report its
+Landlock ABI, exact write roots, matching rename mount ID and an actual denied
+out-of-scope write, as well as a successful fixture transaction after the drop.
 No R2 credentials are needed. Invoke:
 
 ```text

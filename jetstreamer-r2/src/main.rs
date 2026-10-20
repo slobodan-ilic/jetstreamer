@@ -3247,6 +3247,34 @@ mod tests {
         );
         assert!(validate_observer_binding(&bytes, &digest, 220, &controller, &producer).is_err());
 
+        let mut with_diagnostic = observer.clone();
+        let mut diagnostic = observer["replays"][0].clone();
+        diagnostic["range"] = Value::from("203-203");
+        with_diagnostic["diagnostic_replays"] = serde_json::json!([{
+            "status": "observed", "observation": diagnostic,
+            "ordinary_replay_claim": false, "current_sidecar_eta_valid": false
+        }]);
+        let diagnostic_bytes = serde_json::to_vec(&with_diagnostic).unwrap();
+        let diagnostic_digest = hex_lower(&Sha256::digest(&diagnostic_bytes));
+        validate_observer_binding(
+            &diagnostic_bytes,
+            &diagnostic_digest,
+            218,
+            &controller,
+            &producer,
+        )
+        .unwrap();
+        assert!(
+            validate_observer_binding(
+                &diagnostic_bytes,
+                &diagnostic_digest,
+                203,
+                &controller,
+                &producer
+            )
+            .is_err()
+        );
+
         let mut singleton_observer = observer.clone();
         singleton_observer["replays"][0]["range"] = Value::from("218");
         let singleton_bytes = serde_json::to_vec(&singleton_observer).unwrap();
