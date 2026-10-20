@@ -102,15 +102,23 @@ fn validate_same_sample_admission(
         .collect();
     ensure!(added.len() == 1, "admission has no unique added unit");
     let claim = added[0];
-    // The initial profile is deliberately limited to the qualified bounded225
-    // runner/guard contract, not arbitrary same-sample producer additions.
-    ensure!(
-        claim.epoch == 225
-            && claim
-                .unit
-                .starts_with("horizon-qualify-225-bounded-resource-"),
-        "unsupported admission transition profile"
-    );
+    // Only these separately pinned private measurement contracts may report
+    // one same-sample admission; this never grants launch authority.
+    let expected_guard = match claim.epoch {
+        225 if claim
+            .unit
+            .starts_with("horizon-qualify-225-bounded-resource-") =>
+        {
+            "61e189bb50d58fa446b84f016d3b19433c30f490c6d470907130f113a01b644a"
+        }
+        203 if claim
+            .unit
+            .starts_with("horizon-qualify-203-bounded-resource-") =>
+        {
+            "cc3536dfcc268c913feccf1603a25e3cdbdf2807289c9061e04884027d1b1560"
+        }
+        _ => anyhow::bail!("unsupported admission transition profile"),
+    };
     let timestamp = guard["recorded_unix_seconds"]
         .as_u64()
         .context("guard omits time")?;
@@ -127,8 +135,7 @@ fn validate_same_sample_admission(
     );
     ensure!(
         guard["schema"] == "jetstreamer-horizon-standalone-guard-sample-v1"
-            && guard["guard_sha256"]
-                == "61e189bb50d58fa446b84f016d3b19433c30f490c6d470907130f113a01b644a"
+            && guard["guard_sha256"] == expected_guard
             && guard["producer_invocation_id"] == claim.invocation_id
             && guard["producer"]["invocation_id"] == claim.invocation_id
             && guard["producer"]["cgroup"] == format!("/system.slice/{}", claim.unit)
@@ -190,11 +197,14 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
     let bounded_resource =
         receipt["schema"] == "jetstreamer-private-epoch225-bounded-resource-launch-v1";
     let bounded_v1625 = receipt["schema"] == "jetstreamer-private-epoch225-v1625-bounded-launch-v1";
+    let bounded_203 =
+        receipt["schema"] == "jetstreamer-private-epoch203-bounded-resource-launch-v1";
     ensure!(
         (continuation
             || bootstrap_resource
             || bounded_resource
             || bounded_v1625
+            || bounded_203
             || receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1")
             && receipt["launched"] == true
             && receipt["remote_mutations"] == false
@@ -228,6 +238,32 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
                 == "f39140b9a9659e7c6e8207076a2d0c560a6b69df42cc92e19a421cf46c2b761c"
             && receipt["replay_entries_authorized"] == false
             && receipt["full_cold_epoch_peak_qualified"] == false
+            && receipt["canonical_sidecar_authorized"] == false
+            && receipt["publication_authorized"] == false
+    } else if bounded_203 {
+        claim.epoch == 203
+            && claim
+                .unit
+                .starts_with("horizon-qualify-203-bounded-resource-")
+            && claim.unit.ends_with(".service")
+            && receipt["epoch"] == 203
+            && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+            && receipt["snapshot_slot"] == 87_695_515u64
+            && receipt["snapshot_sha256"]
+                == "e45584858d0c825f095a43ff5e5909e62a68d197d39c042a76727454525228c4"
+            && receipt["worker_sha256"]
+                == "3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a"
+            && receipt["runner_sha256"]
+                == "bc9a75b420210a93b6ab65d28bd82d1fe2748c95541394bfae2e0f0f5153bf12"
+            && receipt["runtime"] == "solana-v1.6.16"
+            && receipt["runtime_semantics_changed"] == false
+            && receipt["target_slot"] == 87_720_000u64
+            && receipt["terminal_root_slot"] == 88_127_580u64
+            && receipt["bounded_replay_authorized"] == true
+            && receipt["ordinary_replay_authorized"] == false
+            && receipt["full_cold_epoch_peak_qualified"] == false
+            && receipt["canonical_prefix_qualified"] == false
+            && receipt["runtime_promotion_authorized"] == false
             && receipt["canonical_sidecar_authorized"] == false
             && receipt["publication_authorized"] == false
     } else if bounded_resource || bounded_v1625 {
@@ -1022,6 +1058,97 @@ mod tests {
                 .is_err()
             );
         }
+    }
+    #[test]
+    fn bounded_203_has_an_exact_nonpromoting_launch_schema() {
+        let claim = DiagnosticClaim {
+            epoch: 203,
+            unit: "horizon-qualify-203-bounded-resource-store8-test.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/private/203".into(),
+            launch_receipt: BoundFile {
+                path: "/private/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let receipt = json!({"schema":"jetstreamer-private-epoch203-bounded-resource-launch-v1","launched":true,"epoch":203,"private_run_root":claim.scratch_path,"snapshot_slot":87695515,"snapshot_sha256":"e45584858d0c825f095a43ff5e5909e62a68d197d39c042a76727454525228c4","worker_sha256":"3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a","runner_sha256":"bc9a75b420210a93b6ab65d28bd82d1fe2748c95541394bfae2e0f0f5153bf12","runtime":"solana-v1.6.16","runtime_semantics_changed":false,"target_slot":87720000,"terminal_root_slot":88127580,"bounded_replay_authorized":true,"ordinary_replay_authorized":false,"canonical_prefix_qualified":false,"full_cold_epoch_peak_qualified":false,"runtime_promotion_authorized":false,"canonical_sidecar_authorized":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false,"evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,"restarts":0,"load_state":"loaded","active_state":"active","sub_state":"running","main_pid":123,"result":"success"}]}});
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        for (key, value) in [
+            (
+                "schema",
+                json!("jetstreamer-private-epoch225-bounded-resource-launch-v1"),
+            ),
+            ("snapshot_slot", json!(87695516)),
+            ("worker_sha256", json!("0".repeat(64))),
+            ("runner_sha256", json!("0".repeat(64))),
+            ("runtime_semantics_changed", json!(true)),
+            ("target_slot", json!(88127580)),
+            ("terminal_root_slot", json!(88559361)),
+            ("canonical_prefix_qualified", json!(true)),
+            ("runtime_promotion_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+            ("full_cold_epoch_peak_qualified", json!(true)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[key] = value;
+            assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{key}");
+        }
+    }
+    #[test]
+    fn bounded_203_same_sample_event_requires_its_own_guard_and_preserves_cadence() {
+        let (previous, mut plan, mut guard, mut gp) = admission_fixture();
+        plan.diagnostics[1].epoch = 203;
+        plan.diagnostics[1].unit =
+            "horizon-qualify-203-bounded-resource-store8-test.service".into();
+        guard["producer"]["cgroup"] = json!(format!("/system.slice/{}", plan.diagnostics[1].unit));
+        gp["unit"] = json!(plan.diagnostics[1].unit);
+        assert!(
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &gp,
+                1792455200
+            )
+            .is_err()
+        );
+        guard["guard_sha256"] =
+            json!("cc3536dfcc268c913feccf1603a25e3cdbdf2807289c9061e04884027d1b1560");
+        validate_same_sample_admission(
+            &previous,
+            &plan,
+            "2026-10-20T00:04:42Z",
+            &guard,
+            &gp,
+            1792455200,
+        )
+        .unwrap();
+        let mut transitioned = previous.clone();
+        transitioned["admission_transition_guard"] = json!({"path":"/already-used.json"});
+        assert!(
+            validate_same_sample_admission(
+                &transitioned,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &gp,
+                1792455200
+            )
+            .is_err()
+        );
+        assert!(
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &gp,
+                1792457000
+            )
+            .is_err()
+        );
+        assert!(validate_previous_fleet(&previous, 201, 300, "2026-10-20T00:04:42Z").is_err());
     }
     #[test]
     fn bounded_225_replay_is_diagnostic_only_and_cannot_expand_its_target() {

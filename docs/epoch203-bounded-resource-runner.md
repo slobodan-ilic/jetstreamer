@@ -54,3 +54,12 @@ Even success grants no full cold-epoch peak qualification, runtime promotion,
 canonical sidecar, public import, R2 operation or scratch retirement. A canonical
 prefix, separately qualified 419-slot suffix and complete anchored/plugin scans
 remain necessary for the proposed two-stage publication path.
+
+Fleet reconciliation accepts only the distinct
+`jetstreamer-private-epoch203-bounded-resource-launch-v1` receipt for this run.
+It pins the worker and runner digests, bootstrap/target/root, unchanged v1.6.16
+semantics, live zero-restart invocation, and explicit false prefix/peak/promotion/
+publication authorities. One same-sample admission report may use this profile's
+exact newly sealed guard after its real sandboxed worker/maps proof. It still
+must preserve all diagnostic history and cannot chain another event or authorize
+another resource observation. Normal reconciliation must advance its observer.
