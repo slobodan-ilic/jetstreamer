@@ -14,7 +14,7 @@ use {
             process::CommandExt,
         },
         path::{Path, PathBuf},
-        process::{Command, Stdio},
+        process::{Child, Command, ExitStatus, Stdio},
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
@@ -146,6 +146,41 @@ fn capture<R: Read>(mut pipe: R) -> std::io::Result<Vec<u8>> {
     Ok(output)
 }
 
+fn drop_cli_identity(command: &mut Command) {
+    // pre_exec runs after Command's built-in UID/GID operations. Perform this
+    // complete ordered drop here, while the parent still has its capabilities.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setgroups(0, std::ptr::null()) != 0
+                || libc::setgid(1003) != 0
+                || libc::setuid(1001) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn wait_bounded(child: &mut Child, timeout: Duration) -> Result<ExitStatus> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            // CAP_KILL is required when this root parent owns a UID1001 child
+            // under a minimal capability bounding set. Reap before returning.
+            child
+                .kill()
+                .context("kill timed-out unprivileged SDK child (requires CAP_KILL)")?;
+            child.wait()?;
+            anyhow::bail!("generation-bound metadata lookup timed out");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn observe_gcloud() -> Result<Vec<u8>> {
     let mut command = Command::new("/usr/lib/google-cloud-sdk/bin/gcloud");
     command
@@ -169,18 +204,7 @@ fn observe_gcloud() -> Result<Vec<u8>> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Do not leave root supplementary groups on the unprivileged CLI child.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setgroups(0, std::ptr::null()) != 0
-                || libc::setgid(1003) != 0
-                || libc::setuid(1001) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    drop_cli_identity(&mut command);
     let mut child = command
         .spawn()
         .context("spawn generation-bound metadata lookup")?;
@@ -188,18 +212,7 @@ fn observe_gcloud() -> Result<Vec<u8>> {
     let stderr = child.stderr.take().context("stderr unavailable")?;
     let out = thread::spawn(move || capture(stdout));
     let err = thread::spawn(move || capture(stderr));
-    let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if start.elapsed() >= Duration::from_secs(60) {
-            child.kill()?;
-            child.wait()?;
-            anyhow::bail!("generation-bound metadata lookup timed out");
-        }
-        thread::sleep(Duration::from_millis(25));
-    };
+    let status = wait_bounded(&mut child, Duration::from_secs(60))?;
     let output = out
         .join()
         .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??;
@@ -369,7 +382,7 @@ mod tests {
         }
     }
     #[test]
-    fn capture_is_bounded_and_receipt_is_noclobber() {
+    fn capture_is_bounded_and_unsafe_parent_cannot_overwrite() {
         assert_eq!(
             capture(std::io::repeat(7)).unwrap().len() as u64,
             MAX_METADATA + 1
@@ -380,5 +393,43 @@ mod tests {
         fs::write(&path, b"preserve").unwrap();
         assert!(write_receipt(&path, &json!({})).is_err());
         assert_eq!(fs::read(path).unwrap(), b"preserve");
+    }
+
+    #[test]
+    #[ignore = "root capability sandbox only; kills and reaps its own disposable child"]
+    fn root_sandbox_kills_unprivileged_child_and_refuses_receipt_overwrite() {
+        use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let mut command = Command::new("/usr/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        drop_cli_identity(&mut command);
+        let mut child = command.spawn().unwrap();
+        let status = fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap();
+        assert!(
+            status
+                .lines()
+                .any(|line| line == "Uid:\t1001\t1001\t1001\t1001")
+        );
+        assert!(
+            status
+                .lines()
+                .any(|line| line.starts_with("Groups:") && line.split_whitespace().count() == 1)
+        );
+        let start = Instant::now();
+        let error = wait_bounded(&mut child, Duration::from_millis(100)).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(child.try_wait().unwrap().unwrap().signal(), Some(9));
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("receipt.json");
+        write_receipt(&path, &json!({"preserve":true})).unwrap();
+        let original = fs::read(&path).unwrap();
+        assert!(write_receipt(&path, &json!({"replace":true})).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 }

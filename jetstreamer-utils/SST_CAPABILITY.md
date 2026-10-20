@@ -115,7 +115,11 @@ raw-response digest. It does not authenticate downloaded compressed bytes,
 establish original-backup completeness or grant resource admission, collection,
 replay, publication or R2 authority. Use a persistent non-restarting oneshot with
 the operator configuration writable for token refresh, a 90-second start timeout
-and only the UID/GID-drop capabilities. Do not apply the older metadata observer's
+and the UID/GID-drop plus `CAP_KILL` capabilities. The latter lets the root parent
+kill and reap its own unprivileged SDK child at the bound. An ignored root-only
+sandbox test exercises the actual shared UID drop and timeout path with a
+disposable sleep child, and proves no-clobber receipt writes beneath a valid
+root-private directory. Do not apply the older metadata observer's
 epoch203–212 capability assumptions to epoch141.
 
 `horizon_legacy_shred::assemble_v1_4_25_padded_batches` provides bounded,
