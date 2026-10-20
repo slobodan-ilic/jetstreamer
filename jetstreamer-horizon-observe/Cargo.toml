@@ -13,6 +13,10 @@ keywords.workspace = true
 name = "jetstreamer-horizon-status-estimate"
 path = "src/status_estimate.rs"
 
+[[bin]]
+name = "jetstreamer-horizon-routine-cycle"
+path = "src/routine_cycle.rs"
+
 [dependencies]
 anyhow.workspace = true
 libc.workspace = true

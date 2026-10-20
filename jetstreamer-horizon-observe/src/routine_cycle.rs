@@ -1,0 +1,1190 @@
+//! One routine metadata cycle, never a sampler, replay controller or uploader.
+use {
+    anyhow::{Context, Result, ensure},
+    serde::{Deserialize, Serialize},
+    serde_json::{Value, json},
+    sha2::{Digest, Sha256},
+    std::{
+        collections::{BTreeMap, BTreeSet},
+        env,
+        fs::{self, File, OpenOptions},
+        io::{Read, Write},
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+        time::{SystemTime, UNIX_EPOCH},
+    },
+};
+
+const PLAN_SCHEMA: &str = "jetstreamer-horizon-routine-cycle-plan-v1";
+const LIMIT: u64 = 16 << 20;
+const BUCKET: &str = "solana-archive-with-accounts-data";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Bound {
+    path: PathBuf,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Tools {
+    sealer: Bound,
+    estimator: Bound,
+    r2: Bound,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Plan {
+    schema: String,
+    sample_target_utc: String,
+    endpoint_sha256: String,
+    bucket: String,
+    observer: PathBuf,
+    observer_config: Bound,
+    previous_observer: Bound,
+    model_template: Bound,
+    fleet_template: Bound,
+    previous_estimates: Bound,
+    previous_fleet: Bound,
+    tools: Tools,
+    expected_epochs: Vec<u64>,
+    cycle_directory: PathBuf,
+    estimate_output: PathBuf,
+    fleet_output: PathBuf,
+    #[serde(default)]
+    additional_gate_evidence: BTreeMap<String, Vec<Bound>>,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn sha(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+fn is_sha(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn utc_seconds(s: &str) -> Result<u64> {
+    ensure!(s.len() == 20 && s.is_ascii(), "noncanonical UTC");
+    for (i, b) in s.bytes().enumerate() {
+        let expected = match i {
+            4 | 7 => Some(b'-'),
+            10 => Some(b'T'),
+            13 | 16 => Some(b':'),
+            19 => Some(b'Z'),
+            _ => None,
+        };
+        ensure!(
+            expected.map_or_else(|| b.is_ascii_digit(), |e| b == e),
+            "noncanonical UTC"
+        );
+    }
+    let n = |a, b| s[a..b].parse::<i32>();
+    let mut t: libc::tm = unsafe { std::mem::zeroed() };
+    t.tm_year = n(0, 4)? - 1900;
+    t.tm_mon = n(5, 7)? - 1;
+    t.tm_mday = n(8, 10)?;
+    t.tm_hour = n(11, 13)?;
+    t.tm_min = n(14, 16)?;
+    t.tm_sec = n(17, 19)?;
+    let fields = (
+        t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
+    );
+    let result = unsafe { libc::timegm(&mut t) };
+    ensure!(
+        fields
+            == (
+                t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec
+            ),
+        "nonexistent UTC"
+    );
+    Ok(u64::try_from(result)?)
+}
+fn stamp(s: &str) -> String {
+    s.chars().filter(|c| *c != '-' && *c != ':').collect()
+}
+
+fn read_checked(path: &Path, max: u64, owner: u32, immutable: bool) -> Result<Vec<u8>> {
+    ensure!(
+        path.is_absolute() && path.canonicalize()? == path,
+        "noncanonical input path"
+    );
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let a = f.metadata()?;
+    ensure!(
+        a.is_file()
+            && a.nlink() == 1
+            && a.uid() == owner
+            && a.mode() & if immutable { 0o222 } else { 0o022 } == 0
+            && a.len() <= max,
+        "unsafe input ownership, mode, links or length"
+    );
+    let mut bytes = Vec::new();
+    (&mut f).take(max + 1).read_to_end(&mut bytes)?;
+    let b = f.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    ensure!(
+        bytes.len() as u64 == a.len()
+            && a.dev() == b.dev()
+            && a.ino() == b.ino()
+            && a.len() == b.len()
+            && a.mtime() == b.mtime()
+            && a.mtime_nsec() == b.mtime_nsec()
+            && a.ctime() == b.ctime()
+            && a.ctime_nsec() == b.ctime_nsec()
+            && !named.file_type().is_symlink()
+            && named.dev() == a.dev()
+            && named.ino() == a.ino(),
+        "input changed"
+    );
+    Ok(bytes)
+}
+fn bound_bytes(b: &Bound, immutable: bool) -> Result<Vec<u8>> {
+    ensure!(is_sha(&b.sha256), "invalid input digest");
+    let bytes = read_checked(&b.path, LIMIT, 0, immutable)?;
+    ensure!(sha(&bytes) == b.sha256, "input digest mismatch");
+    Ok(bytes)
+}
+fn bound_json(b: &Bound, immutable: bool) -> Result<Value> {
+    Ok(serde_json::from_slice(&bound_bytes(b, immutable)?)?)
+}
+fn tool_ok(b: &Bound) -> Result<()> {
+    ensure!(
+        is_sha(&b.sha256) && b.path.is_absolute() && b.path.canonicalize()? == b.path,
+        "invalid tool binding"
+    );
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&b.path)?;
+    let a = f.metadata()?;
+    ensure!(
+        a.is_file()
+            && a.nlink() == 1
+            && a.uid() == 0
+            && a.mode() & 0o222 == 0
+            && a.mode() & 0o111 != 0
+            && a.len() <= 512 << 20,
+        "unsafe executable"
+    );
+    let mut hash = Sha256::new();
+    let mut buf = [0; 128 << 10];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    let z = f.metadata()?;
+    let named = fs::symlink_metadata(&b.path)?;
+    ensure!(
+        hex(&hash.finalize()) == b.sha256
+            && a.dev() == z.dev()
+            && a.ino() == z.ino()
+            && a.len() == z.len()
+            && a.mtime() == z.mtime()
+            && a.mtime_nsec() == z.mtime_nsec()
+            && a.ctime() == z.ctime()
+            && a.ctime_nsec() == z.ctime_nsec()
+            && !named.file_type().is_symlink()
+            && a.dev() == named.dev()
+            && a.ino() == named.ino(),
+        "tool digest or identity changed"
+    );
+    Ok(())
+}
+fn private_dir(path: &Path) -> Result<()> {
+    ensure!(
+        path.is_absolute() && path.canonicalize()? == path,
+        "noncanonical private directory"
+    );
+    let m = fs::symlink_metadata(path)?;
+    ensure!(
+        m.is_dir() && m.uid() == 0 && m.mode() & 0o6077 == 0,
+        "directory must be root-private"
+    );
+    Ok(())
+}
+fn absent(path: &Path) -> Result<()> {
+    ensure!(
+        fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "output already exists or is unreadable"
+    );
+    Ok(())
+}
+
+fn newer_fleet(candidate: &Value, previous: &Value) -> Result<bool> {
+    if candidate["first_epoch"] != 201 || candidate["last_epoch"] != 300 {
+        return Ok(false);
+    }
+    ensure!(
+        candidate["schema"] == "jetstreamer-horizon-campaign-fleet-v1",
+        "unknown in-scope fleet schema"
+    );
+    let sample = utc_seconds(
+        candidate["sampled_at_utc"]
+            .as_str()
+            .context("fleet time missing")?,
+    )?;
+    let prior = utc_seconds(
+        previous["sampled_at_utc"]
+            .as_str()
+            .context("predecessor fleet time missing")?,
+    )?;
+    Ok(sample > prior
+        || (sample == prior
+            && candidate["recorded_unix_seconds"]
+                .as_u64()
+                .context("fleet recording time missing")?
+                > previous["recorded_unix_seconds"]
+                    .as_u64()
+                    .context("predecessor recording time missing")?))
+}
+
+fn latest_fleet_unchanged(previous: &Value) -> Result<()> {
+    // A user-requested cycle or an event-driven admission invalidates this
+    // pending one-shot. Never silently fork the authoritative fleet chain.
+    let root = Path::new("/var/lib/jetstreamer/horizon-campaign-fleet");
+    private_dir(root)?;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        ensure!(!kind.is_symlink(), "fleet census contains a symlink");
+        if !kind.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("fleet-ledger.json");
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+            Ok(_) => (),
+        }
+        let value: Value = serde_json::from_slice(&read_checked(&path, LIMIT, 0, false)?)?;
+        ensure!(
+            !newer_fleet(&value, previous)?,
+            "newer campaign fleet exists; regenerate pending cycle"
+        );
+    }
+    Ok(())
+}
+fn write_new(path: &Path, value: &Value) -> Result<Bound> {
+    private_dir(path.parent().context("output parent missing")?)?;
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
+    File::open(path.parent().unwrap())?.sync_all()?;
+    Ok(Bound {
+        path: path.into(),
+        sha256: sha(&bytes),
+    })
+}
+
+fn validate_templates(
+    p: &Plan,
+    model: &Value,
+    fleet: &Value,
+    previous: &Value,
+    estimates: &Value,
+    old_observer: &Value,
+) -> Result<()> {
+    ensure!(
+        p.schema == PLAN_SCHEMA && p.bucket == BUCKET && is_sha(&p.endpoint_sha256),
+        "invalid cycle scope"
+    );
+    let target = utc_seconds(&p.sample_target_utc)?;
+    let old_time = old_observer["recorded_at_utc"]
+        .as_str()
+        .context("old observer time missing")?;
+    ensure!(
+        target.checked_sub(utc_seconds(old_time)?) == Some(1800),
+        "routine target must advance exactly1800seconds"
+    );
+    ensure!(
+        old_observer["schema"] == "jetstreamer-horizon-live-resource-sample-v2"
+            && model["schema"] == "jetstreamer-horizon-r2-status-eta-model-v5"
+            && model["phase"] == "replay"
+            && model["sample_target_utc"] == old_time
+            && model["evidence"][1]["path"] == p.previous_observer.path.to_str().unwrap_or("")
+            && model["evidence"][1]["sha256"] == p.previous_observer.sha256,
+        "model does not bind exact predecessor"
+    );
+    ensure!(
+        previous["schema"] == "jetstreamer-horizon-campaign-fleet-v1"
+            && previous["sampled_at_utc"] == old_time
+            && previous["plan"].as_str() == p.fleet_template.path.to_str()
+            && previous["plan_sha256"] == p.fleet_template.sha256
+            && previous["observer_sha256"] == p.previous_observer.sha256,
+        "fleet predecessor mismatch"
+    );
+    ensure!(
+        fleet["schema"] == "jetstreamer-horizon-campaign-fleet-plan-v1"
+            && fleet["first_epoch"] == 201
+            && fleet["last_epoch"] == 300
+            && fleet["observer"]["path"].as_str() == p.previous_observer.path.to_str()
+            && fleet["observer"]["sha256"] == p.previous_observer.sha256
+            && fleet["admission_transition_guard"].is_null(),
+        "fleet template scope or transition mismatch"
+    );
+    ensure!(
+        estimates["schema"] == "jetstreamer-horizon-r2-status-estimates-v5"
+            && estimates["model_sha256"] == p.model_template.sha256
+            && estimates["observer_sha256"] == p.previous_observer.sha256
+            && estimates["sampled_at_utc"] == old_time,
+        "estimate predecessor mismatch"
+    );
+    let mut epochs = BTreeSet::new();
+    for range in model["ranges"].as_array().context("model ranges missing")? {
+        ensure!(
+            range.get("elapsed_execution_millis").is_none(),
+            "manual elapsed values are forbidden"
+        );
+        for e in range["epochs"].as_array().context("model epochs missing")? {
+            let e = e.as_u64().context("invalid model epoch")?;
+            ensure!(
+                (201..=300).contains(&e) && epochs.insert(e),
+                "overlapping or out-of-scope epoch"
+            );
+        }
+    }
+    ensure!(
+        p.expected_epochs.iter().copied().collect::<BTreeSet<_>>() == epochs
+            && p.expected_epochs.len() == epochs.len()
+            && !epochs.is_empty(),
+        "explicit cycle epoch census differs"
+    );
+    for (epoch, evidence) in &p.additional_gate_evidence {
+        let n = epoch.parse::<u64>()?;
+        ensure!(
+            (201..=300).contains(&n)
+                && n.to_string() == *epoch
+                && fleet["gates"][epoch]["evidence"].is_array()
+                && !evidence.is_empty(),
+            "invalid additional gate evidence"
+        );
+    }
+    ensure!(
+        p.estimate_output.parent().and_then(Path::to_str)
+            == model["estimate_receipt_directory"].as_str(),
+        "estimate output parent differs"
+    );
+    ensure!(
+        p.cycle_directory.file_name().and_then(|s| s.to_str())
+            == Some(&format!("{}-v1", stamp(&p.sample_target_utc)))
+            && p.cycle_directory.parent()
+                == Some(Path::new("/var/lib/jetstreamer/horizon-routine-cycles-v1")),
+        "cycle path is outside bounded namespace"
+    );
+    ensure!(
+        p.fleet_output
+            == Path::new("/var/lib/jetstreamer/horizon-campaign-fleet")
+                .join(format!("{}-rust-v1", stamp(&p.sample_target_utc)))
+                .join("fleet-ledger.json"),
+        "fleet output mismatch"
+    );
+    ensure!(
+        p.estimate_output.file_name().and_then(|s| s.to_str())
+            == Some(&format!(
+                "horizon-r2-status-estimates-{}-cohort-gated-v5.json",
+                stamp(&p.sample_target_utc)
+            )),
+        "estimate output mismatch"
+    );
+    Ok(())
+}
+
+fn validate_observation(p: &Plan, model: &Value, observer: &Value, now: u64) -> Result<()> {
+    let target = utc_seconds(&p.sample_target_utc)?;
+    ensure!(
+        target <= now && now - target <= 1800,
+        "cycle observation is stale or future"
+    );
+    ensure!(
+        observer["schema"] == "jetstreamer-horizon-live-resource-sample-v2"
+            && observer["recorded_at_utc"] == p.sample_target_utc
+            && observer["cadence"]["previous_sample"].as_str() == p.previous_observer.path.to_str()
+            && observer["cadence"]["previous_sample_sha256"] == p.previous_observer.sha256
+            && observer["cadence"]["routine_minimum_interval_enforced"] == true
+            && observer["cadence"]["minimum_interval_seconds"] == 1800
+            && observer["cadence"]["previous_sample_recorded_at_utc"] == model["sample_target_utc"]
+            && observer["cadence"]["observed_interval_seconds"]
+                .as_u64()
+                .is_some_and(|n| n >= 1800)
+            && observer["cadence"]["observation_reason"] == "routine",
+        "observer scope, cadence or predecessor mismatch"
+    );
+    let observed = observer["replays"]
+        .as_array()
+        .context("observer census missing")?;
+    let modeled = model["ranges"].as_array().context("model census missing")?;
+    ensure!(
+        observed.len() == modeled.len(),
+        "ordinary claim census changed"
+    );
+    for m in modeled {
+        let matches: Vec<_> = observed
+            .iter()
+            .filter(|r| r["range"] == m["range"])
+            .collect();
+        ensure!(
+            matches.len() == 1,
+            "ordinary range is missing or duplicated"
+        );
+        let r = matches[0];
+        ensure!(
+            r["invocation_binding_stable"] == true,
+            "observer identities are unstable"
+        );
+        for (kind, field) in [
+            ("controller", "expected_controller_invocation_id"),
+            ("producer", "expected_producer_invocation_id"),
+        ] {
+            for point in ["before", "after"] {
+                let v = &r[format!("{kind}_{point}")];
+                ensure!(
+                    v["invocation_id"] == m[field]
+                        && v["restarts"] == 0
+                        && v["active_state"] == "active",
+                    "ordinary owner changed or stopped"
+                );
+            }
+        }
+        ensure!(
+            r["useful_work"]["last"]["terminal_slot"] == m["terminal_slot"],
+            "epoch terminal changed; require reviewed model handoff"
+        );
+    }
+    Ok(())
+}
+
+fn validate_observer_config(p: &Plan, model: &Value, config: &Value) -> Result<()> {
+    ensure!(
+        config["schema"] == "jetstreamer-horizon-live-resource-sample-config-v2"
+            && config["output"].as_str() == p.observer.to_str()
+            && config["not_before_utc"] == p.sample_target_utc
+            && config["minimum_interval_seconds"] == 1800
+            && config["previous_sample"].as_str() == p.previous_observer.path.to_str()
+            && (config["observation_reason"].is_null()
+                || config["observation_reason"] == "routine"),
+        "scheduled observer config differs from the pinned routine scope"
+    );
+    let ranges = config["replays"]
+        .as_array()
+        .context("configured replay census missing")?;
+    let modeled = model["ranges"].as_array().context("model census missing")?;
+    ensure!(
+        ranges.len() == modeled.len(),
+        "scheduled observer census changed"
+    );
+    for m in modeled {
+        let found: Vec<_> = ranges.iter().filter(|r| r["range"] == m["range"]).collect();
+        ensure!(
+            found.len() == 1,
+            "scheduled observer range is missing or duplicate"
+        );
+        for field in [
+            "expected_controller_invocation_id",
+            "expected_producer_invocation_id",
+        ] {
+            ensure!(
+                found[0][field] == m[field],
+                "scheduled observer owner differs"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn derive(p: &Plan, model: &Value, fleet: &Value, observer: &Bound) -> Result<(Value, Value)> {
+    let mut model = model.clone();
+    let mut fleet = fleet.clone();
+    model["sample_target_utc"] = json!(p.sample_target_utc);
+    model["evidence"][0] = serde_json::to_value(&p.previous_estimates)?;
+    model["evidence"][1] = serde_json::to_value(observer)?;
+    fleet["observer"] = serde_json::to_value(observer)?;
+    fleet["previous_fleet"] = serde_json::to_value(&p.previous_fleet)?;
+    fleet["output"] = json!(p.fleet_output);
+    for (epoch, evidence) in &p.additional_gate_evidence {
+        let entries = fleet["gates"][epoch]["evidence"]
+            .as_array_mut()
+            .context("gate evidence missing")?;
+        for e in evidence {
+            let e = serde_json::to_value(e)?;
+            if !entries.contains(&e) {
+                entries.push(e);
+            }
+        }
+    }
+    Ok((model, fleet))
+}
+
+fn child(tool: &Bound, args: &[String], credentials: bool) -> Result<()> {
+    tool_ok(tool)?;
+    let mut cmd = Command::new(&tool.path);
+    cmd.args(args).stdin(Stdio::null());
+    if !credentials {
+        for key in [
+            "HORIZON_S3_ENDPOINT",
+            "HORIZON_ACCESS_KEY_ID",
+            "HORIZON_SECRET_ACCESS_KEY",
+        ] {
+            cmd.env_remove(key);
+        }
+    }
+    // The enclosing non-restarting oneshot owns the bounded runtime and kills
+    // only this metadata tool tree; no replay belongs to its cgroup.
+    let output = cmd.output()?;
+    ensure!(
+        output.status.success(),
+        "bound child {} failed with {}; inspect private cycle evidence",
+        tool.path.display(),
+        output.status
+    );
+    ensure!(
+        output.stdout.len() <= 1 << 20 && output.stderr.len() <= 1 << 20,
+        "oversized child output"
+    );
+    Ok(())
+}
+
+fn verify_estimates(
+    p: &Plan,
+    model: &Value,
+    observer: &Bound,
+    estimates: &Value,
+) -> Result<Vec<Value>> {
+    ensure!(
+        estimates["schema"] == "jetstreamer-horizon-r2-status-estimates-v5"
+            && estimates["observer_sha256"] == observer.sha256
+            && estimates["sampled_at_utc"] == p.sample_target_utc,
+        "new estimates are unbound"
+    );
+    let entries = estimates["estimates"]
+        .as_array()
+        .context("estimates missing")?;
+    let mut seen = BTreeSet::new();
+    for e in entries {
+        let n = e["epoch"].as_u64().context("estimate epoch missing")?;
+        ensure!(
+            p.expected_epochs.contains(&n) && seen.insert(n),
+            "unexpected or duplicate estimate epoch"
+        );
+        let m = model["ranges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["epochs"].as_array().unwrap().contains(&json!(n)))
+            .context("estimate range missing")?;
+        for field in [
+            "archive_directory",
+            "expected_controller_invocation_id",
+            "expected_producer_invocation_id",
+        ] {
+            ensure!(e[field] == m[field], "estimate owner or directory changed");
+        }
+        ensure!(
+            e["elapsed_execution_millis"].as_u64().is_some()
+                && e["estimated_remaining_millis"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0),
+            "invalid estimate integers"
+        );
+    }
+    ensure!(
+        seen.len() == p.expected_epochs.len(),
+        "estimate census incomplete"
+    );
+    Ok(entries.clone())
+}
+
+fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Result<()> {
+    let model = bound_json(&p.model_template, true)?;
+    let fleet = bound_json(&p.fleet_template, true)?;
+    let previous = bound_json(&p.previous_fleet, false)?;
+    let estimates = bound_json(&p.previous_estimates, false)?;
+    let old_observer = bound_json(&p.previous_observer, false)?;
+    validate_templates(p, &model, &fleet, &previous, &estimates, &old_observer)?;
+    latest_fleet_unchanged(&previous)?;
+    validate_observer_config(p, &model, &bound_json(&p.observer_config, true)?)?;
+    for t in [&p.tools.sealer, &p.tools.estimator, &p.tools.r2] {
+        tool_ok(t)?;
+    }
+    for values in p.additional_gate_evidence.values() {
+        for b in values {
+            bound_json(b, false)?;
+        }
+    }
+    private_dir(p.cycle_directory.parent().context("cycle parent missing")?)?;
+    private_dir(
+        p.estimate_output
+            .parent()
+            .context("estimate parent missing")?,
+    )?;
+    private_dir(Path::new(
+        model["status_receipt_directory"]
+            .as_str()
+            .context("status receipt parent missing")?,
+    ))?;
+    absent(&p.cycle_directory)?;
+    absent(&p.estimate_output)?;
+    absent(&p.fleet_output)?;
+    let endpoint = env::var("HORIZON_S3_ENDPOINT").context("storage endpoint missing")?;
+    ensure!(
+        sha(endpoint.as_bytes()) == p.endpoint_sha256
+            && endpoint
+                .trim_end_matches('/')
+                .ends_with(&format!("/{BUCKET}")),
+        "storage endpoint scope differs"
+    );
+    for key in ["HORIZON_ACCESS_KEY_ID", "HORIZON_SECRET_ACCESS_KEY"] {
+        ensure!(
+            env::var(key).is_ok_and(|v| !v.is_empty()),
+            "storage credential missing"
+        );
+    }
+    if check_only {
+        println!("routine cycle preflight passed; no sampling, remote access or mutation");
+        return Ok(());
+    }
+    let bytes = read_checked(&p.observer, LIMIT, 0, false)?;
+    let observer = Bound {
+        path: p.observer.clone(),
+        sha256: sha(&bytes),
+    };
+    let observed: Value = serde_json::from_slice(&bytes)?;
+    validate_observation(
+        p,
+        &model,
+        &observed,
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    )?;
+    fs::create_dir(&p.cycle_directory)?;
+    fs::set_permissions(&p.cycle_directory, fs::Permissions::from_mode(0o700))?;
+    File::open(p.cycle_directory.parent().unwrap())?.sync_all()?;
+    write_new(
+        &p.cycle_directory.join("intent.json"),
+        &json!({"schema":"jetstreamer-horizon-routine-cycle-intent-v1",
+        "plan":plan_bound,"self_sha256":self_sha,"observer":observer,"sampled_at_utc":p.sample_target_utc,
+        "replay_launch_authorized":false,"archive_mutations":false}),
+    )?;
+    let result = (|| -> Result<Value> {
+        let (model, fleet) = derive(p, &model, &fleet, &observer)?;
+        let model_source = write_new(&p.cycle_directory.join("model-source.json"), &model)?;
+        let fleet_source = write_new(&p.cycle_directory.join("fleet-source.json"), &fleet)?;
+        let sealed = p.cycle_directory.join("sealed");
+        let seal_plan = write_new(
+            &p.cycle_directory.join("seal-plan.json"),
+            &json!({"schema":"jetstreamer-sealed-deployment-plan-v1",
+            "destination":sealed,"members":[{"source":model_source.path,"name":"eta-model.json","sha256":model_source.sha256,"mode":292},
+            {"source":fleet_source.path,"name":"fleet-plan.json","sha256":fleet_source.sha256,"mode":292}]}),
+        )?;
+        child(
+            &p.tools.sealer,
+            &[
+                seal_plan.path.display().to_string(),
+                "--plan-sha256".into(),
+                seal_plan.sha256,
+                "--self-sha256".into(),
+                p.tools.sealer.sha256.clone(),
+            ],
+            false,
+        )?;
+        let model_bound = Bound {
+            path: sealed.join("eta-model.json"),
+            sha256: model_source.sha256,
+        };
+        let fleet_bound = Bound {
+            path: sealed.join("fleet-plan.json"),
+            sha256: fleet_source.sha256,
+        };
+        bound_json(&model_bound, true)?;
+        bound_json(&fleet_bound, true)?;
+        child(
+            &p.tools.estimator,
+            &[
+                "--model".into(),
+                model_bound.path.display().to_string(),
+                "--model-sha256".into(),
+                model_bound.sha256.clone(),
+                "--observer".into(),
+                observer.path.display().to_string(),
+                "--observer-sha256".into(),
+                observer.sha256.clone(),
+                "--self-sha256".into(),
+                p.tools.estimator.sha256.clone(),
+                "--output".into(),
+                p.estimate_output.display().to_string(),
+            ],
+            false,
+        )?;
+        let bytes = read_checked(&p.estimate_output, LIMIT, 0, false)?;
+        let new_estimates: Value = serde_json::from_slice(&bytes)?;
+        ensure!(
+            new_estimates["model_sha256"] == model_bound.sha256,
+            "new estimate model mismatch"
+        );
+        let entries = verify_estimates(p, &model, &observer, &new_estimates)?;
+        let estimate_bound = Bound {
+            path: p.estimate_output.clone(),
+            sha256: sha(&bytes),
+        };
+        let status_dir = Path::new(
+            model["status_receipt_directory"]
+                .as_str()
+                .context("status parent missing")?,
+        );
+        let mut receipts = Vec::new();
+        let digits: String = p
+            .sample_target_utc
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        for e in entries {
+            let epoch = e["epoch"].as_u64().unwrap();
+            let string = |key: &str| -> Result<String> {
+                Ok(e[key]
+                    .as_str()
+                    .context("estimate string missing")?
+                    .to_string())
+            };
+            child(
+                &p.tools.r2,
+                &[
+                    "status-publish".into(),
+                    string("archive_directory")?,
+                    "--epochs".into(),
+                    format!("{epoch}-{epoch}"),
+                    "--receipt-directory".into(),
+                    status_dir.display().to_string(),
+                    "--observer-receipt".into(),
+                    observer.path.display().to_string(),
+                    "--observer-sha256".into(),
+                    observer.sha256.clone(),
+                    "--expected-controller-invocation-id".into(),
+                    string("expected_controller_invocation_id")?,
+                    "--expected-producer-invocation-id".into(),
+                    string("expected_producer_invocation_id")?,
+                    "--elapsed-execution-millis".into(),
+                    e["elapsed_execution_millis"].to_string(),
+                    "--estimated-remaining-millis".into(),
+                    e["estimated_remaining_millis"].to_string(),
+                    "--phase".into(),
+                    "replay".into(),
+                ],
+                true,
+            )?;
+            let path = status_dir.join(format!("epoch-{epoch}.status-{digits}.json"));
+            let bytes = read_checked(&path, LIMIT, 0, false)?;
+            let receipt: Value = serde_json::from_slice(&bytes)?;
+            ensure!(
+                receipt["epoch"] == epoch
+                    && receipt["bucket"] == p.bucket
+                    && receipt["schema"]
+                        == "jetstreamer-horizon-r2-status-authenticated-publication-receipt-v1"
+                    && receipt["key"] == format!("epoch-{epoch}.epoch-status.json")
+                    && receipt["status"]["epoch"] == epoch
+                    && receipt["status"]["phase"] == "replay"
+                    && receipt["controller_invocation_id"]
+                        == e["expected_controller_invocation_id"]
+                    && receipt["producer_invocation_id"] == e["expected_producer_invocation_id"]
+                    && receipt["pipeline_binding"].is_null()
+                    && receipt["authenticated_readback"] == true
+                    && receipt["observer_receipt"].as_str() == observer.path.to_str()
+                    && receipt["observer_receipt_sha256"] == observer.sha256
+                    && receipt["status"]["sampled_at_utc"] == p.sample_target_utc
+                    && receipt["status"]["elapsed_execution_millis"]
+                        == e["elapsed_execution_millis"]
+                    && receipt["status"]["estimated_remaining_millis"]
+                        == e["estimated_remaining_millis"],
+                "status receipt differs from cycle"
+            );
+            receipts.push(Bound {
+                path,
+                sha256: sha(&bytes),
+            });
+        }
+        let parent = p.fleet_output.parent().context("fleet parent missing")?;
+        if !parent.exists() {
+            private_dir(parent.parent().context("fleet ancestor missing")?)?;
+            fs::create_dir(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            File::open(parent.parent().unwrap())?.sync_all()?;
+        }
+        private_dir(parent)?;
+        latest_fleet_unchanged(&previous)?;
+        child(
+            &p.tools.r2,
+            &[
+                "fleet-reconcile".into(),
+                fleet_bound.path.display().to_string(),
+                "--plan-sha256".into(),
+                fleet_bound.sha256.clone(),
+            ],
+            true,
+        )?;
+        let bytes = read_checked(&p.fleet_output, LIMIT, 0, false)?;
+        let ledger: Value = serde_json::from_slice(&bytes)?;
+        ensure!(
+            ledger["plan_sha256"] == fleet_bound.sha256
+                && ledger["observer_sha256"] == observer.sha256
+                && ledger["sampled_at_utc"] == p.sample_target_utc,
+            "new fleet receipt mismatch"
+        );
+        ensure!(
+            ledger["inventory"]["anomalies"] == 0,
+            "fleet reports remote anomalies; operator investigation required"
+        );
+        Ok(
+            json!({"schema":"jetstreamer-horizon-routine-cycle-completion-v1","plan":plan_bound,"self_sha256":self_sha,
+            "sampled_at_utc":p.sample_target_utc,"observer":observer,"model":model_bound,"estimates":estimate_bound,
+            "fleet_plan":fleet_bound,"fleet":{"path":p.fleet_output,"sha256":sha(&bytes)},"status_publications":receipts,
+            "inventory":ledger["inventory"],"replay_launch_authorized":false,"archive_mutations":false,
+            "sidecar_mutations":false,"deletions":false,"new_resource_samples":0}),
+        )
+    })();
+    match result {
+        Ok(value) => {
+            let b = write_new(&p.cycle_directory.join("completion.json"), &value)?;
+            println!("{}", b.path.display());
+            Ok(())
+        }
+        Err(error) => {
+            write_new(
+                &p.cycle_directory.join("failure.json"),
+                &json!({"schema":"jetstreamer-horizon-routine-cycle-failure-v1",
+            "plan":plan_bound,"observer":observer,"error":format!("{error:#}"),"partial_status_publications_possible":true,
+            "automatic_retry_authorized":false,"replay_launch_authorized":false,"archive_mutations":false}),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn main() {
+    let result = (|| -> Result<()> {
+        let args: Vec<_> = env::args().collect();
+        ensure!(
+            (args.len() == 6 || (args.len() == 7 && args[6] == "--check-only"))
+                && args[2] == "--plan-sha256"
+                && args[4] == "--self-sha256",
+            "usage: jetstreamer-horizon-routine-cycle PLAN --plan-sha256 HEX --self-sha256 HEX [--check-only]"
+        );
+        ensure!(
+            unsafe { libc::geteuid() } == 0,
+            "routine cycle requires root"
+        );
+        tool_ok(&Bound {
+            path: fs::read_link("/proc/self/exe")?,
+            sha256: args[5].clone(),
+        })?;
+        let bound = Bound {
+            path: args[1].clone().into(),
+            sha256: args[3].clone(),
+        };
+        let plan: Plan = serde_json::from_slice(&bound_bytes(&bound, true)?)?;
+        execute(&plan, &bound, &args[5], args.len() == 7)
+    })();
+    if let Err(error) = result {
+        eprintln!("routine cycle failed closed: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (Plan, Value, Value, Value, Value, Value, Value, Value) {
+        let b = |name: &str| json!({"path":format!("/sealed/{name}"),"sha256":"a".repeat(64)});
+        let p:Plan=serde_json::from_value(json!({"schema":PLAN_SCHEMA,"sample_target_utc":"2026-10-20T10:34:42Z",
+            "endpoint_sha256":"a".repeat(64),"bucket":BUCKET,"observer":"/private/next-observer.json",
+            "observer_config":b("observer-config"),"previous_observer":b("old-observer"),
+            "model_template":b("model"),"fleet_template":b("fleet-plan"),"previous_estimates":b("estimates"),
+            "previous_fleet":b("fleet"),"tools":{"sealer":b("sealer"),"estimator":b("estimator"),"r2":b("r2")},
+            "expected_epochs":[206],"cycle_directory":"/var/lib/jetstreamer/horizon-routine-cycles-v1/20261020T103442Z-v1",
+            "estimate_output":"/private/estimates/horizon-r2-status-estimates-20261020T103442Z-cohort-gated-v5.json",
+            "fleet_output":"/var/lib/jetstreamer/horizon-campaign-fleet/20261020T103442Z-rust-v1/fleet-ledger.json"})).unwrap();
+        let range = json!({"range":"206-206","epochs":[206],"archive_directory":"/private/archives",
+            "expected_controller_invocation_id":"b".repeat(32),"expected_producer_invocation_id":"c".repeat(32),
+            "terminal_slot":89423999,"epoch_additional_replay_slots":{"206":0},
+            "epoch_downstream_allowance_seconds":{"206":10230},"formula":{"206":"retained formula"}});
+        let model = json!({"schema":"jetstreamer-horizon-r2-status-eta-model-v5","phase":"replay",
+            "sample_target_utc":"2026-10-20T10:04:42Z","evidence":[b("older-estimates"),b("old-observer")],
+            "estimate_receipt_directory":"/private/estimates","status_receipt_directory":"/private/status","ranges":[range]});
+        let fleet = json!({"schema":"jetstreamer-horizon-campaign-fleet-plan-v1","first_epoch":201,"last_epoch":300,
+            "observer":b("old-observer"),"previous_fleet":b("older-fleet"),"output":"/old/output",
+            "gates":{"224":{"state":"blocked-qualification","next_action":"repair remains open","evidence":[]}},
+            "diagnostics":[{"epoch":203,"unit":"exact-private-unit"}],"pipeline_claims":[{"epoch":213,"unit":"completed-uploader"}]});
+        let previous = json!({"schema":"jetstreamer-horizon-campaign-fleet-v1","sampled_at_utc":"2026-10-20T10:04:42Z",
+            "plan":"/sealed/fleet-plan","plan_sha256":"a".repeat(64),"observer_sha256":"a".repeat(64)});
+        let estimates = json!({"schema":"jetstreamer-horizon-r2-status-estimates-v5","model_sha256":"a".repeat(64),
+            "observer_sha256":"a".repeat(64),"sampled_at_utc":"2026-10-20T10:04:42Z"});
+        let old = json!({"schema":"jetstreamer-horizon-live-resource-sample-v2","recorded_at_utc":"2026-10-20T10:04:42Z"});
+        let config = json!({"schema":"jetstreamer-horizon-live-resource-sample-config-v2","output":p.observer,
+            "not_before_utc":p.sample_target_utc,"minimum_interval_seconds":1800,"previous_sample":p.previous_observer.path,
+            "replays":[model["ranges"][0]]});
+        let point =
+            |id: &str| json!({"invocation_id":id.repeat(32),"restarts":0,"active_state":"active"});
+        let observer = json!({"schema":"jetstreamer-horizon-live-resource-sample-v2","recorded_at_utc":p.sample_target_utc,
+            "cadence":{"previous_sample":p.previous_observer.path,"previous_sample_sha256":p.previous_observer.sha256,
+                "previous_sample_recorded_at_utc":"2026-10-20T10:04:42Z","routine_minimum_interval_enforced":true,
+                "minimum_interval_seconds":1800,"observed_interval_seconds":1800,"observation_reason":"routine"},
+            "replays":[{"range":"206-206","invocation_binding_stable":true,"controller_before":point("b"),
+                "controller_after":point("b"),"producer_before":point("c"),"producer_after":point("c"),
+                "useful_work":{"last":{"terminal_slot":89423999}}}]});
+        (p, model, fleet, previous, estimates, old, config, observer)
+    }
+
+    #[test]
+    fn strict_utc_rejects_nonexistent_and_noncanonical_dates() {
+        assert_eq!(utc_seconds("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert!(utc_seconds("2026-02-29T00:00:00Z").is_err());
+        assert!(utc_seconds("2026-10-20T25:00:00Z").is_err());
+        assert!(utc_seconds("2026-10-20 10:34:42Z").is_err());
+        assert!(utc_seconds("2026-10-20T10:34:42.0Z").is_err());
+    }
+
+    #[test]
+    fn templates_bind_exact_predecessors_scope_and_thirty_minute_advance() {
+        let (mut p, model, fleet, prior, est, old, config, _) = fixture();
+        validate_templates(&p, &model, &fleet, &prior, &est, &old).unwrap();
+        validate_observer_config(&p, &model, &config).unwrap();
+        p.sample_target_utc = "2026-10-20T10:34:41Z".into();
+        assert!(validate_templates(&p, &model, &fleet, &prior, &est, &old).is_err());
+        p.sample_target_utc = "2026-10-20T10:34:42Z".into();
+        p.expected_epochs.push(301);
+        assert!(validate_templates(&p, &model, &fleet, &prior, &est, &old).is_err());
+        p.expected_epochs = vec![206, 206];
+        assert!(validate_templates(&p, &model, &fleet, &prior, &est, &old).is_err());
+    }
+
+    #[test]
+    fn changed_history_elapsed_or_admission_transition_is_not_a_routine_cycle() {
+        let (p, model, fleet, prior, est, old, _, _) = fixture();
+        for field in ["elapsed", "model-observer", "range-epoch"] {
+            let mut bad = model.clone();
+            match field {
+                "elapsed" => bad["ranges"][0]["elapsed_execution_millis"] = json!(1),
+                "model-observer" => bad["evidence"][1]["sha256"] = json!("f".repeat(64)),
+                _ => bad["ranges"][0]["epochs"] = json!([301]),
+            }
+            assert!(
+                validate_templates(&p, &bad, &fleet, &prior, &est, &old).is_err(),
+                "{field}"
+            );
+        }
+        let mut bad = fleet.clone();
+        bad["admission_transition_guard"] = json!({"path":"/guard"});
+        assert!(validate_templates(&p, &model, &bad, &prior, &est, &old).is_err());
+        bad = fleet;
+        bad["last_epoch"] = json!(301);
+        assert!(validate_templates(&p, &model, &bad, &prior, &est, &old).is_err());
+        let mut bad = est;
+        bad["model_sha256"] = json!("f".repeat(64));
+        assert!(validate_templates(&p, &model, &fixture().2, &prior, &bad, &old).is_err());
+    }
+
+    #[test]
+    fn routine_observation_rejects_early_stale_replaced_or_handed_off_owners() {
+        let (p, model, _, _, _, _, _, observer) = fixture();
+        let t = utc_seconds(&p.sample_target_utc).unwrap();
+        validate_observation(&p, &model, &observer, t + 60).unwrap();
+        assert!(validate_observation(&p, &model, &observer, t - 1).is_err());
+        assert!(validate_observation(&p, &model, &observer, t + 1801).is_err());
+        for field in [
+            "restart",
+            "owner",
+            "terminal",
+            "stopped",
+            "unstable",
+            "extra-range",
+            "reason",
+            "cadence",
+        ] {
+            let mut bad = observer.clone();
+            match field {
+                "restart" => bad["replays"][0]["producer_after"]["restarts"] = json!(1),
+                "owner" => {
+                    bad["replays"][0]["controller_after"]["invocation_id"] = json!("f".repeat(32))
+                }
+                "terminal" => {
+                    bad["replays"][0]["useful_work"]["last"]["terminal_slot"] = json!(89424000)
+                }
+                "stopped" => {
+                    bad["replays"][0]["producer_after"]["active_state"] = json!("inactive")
+                }
+                "unstable" => bad["replays"][0]["invocation_binding_stable"] = json!(false),
+                "extra-range" => {
+                    let entry = bad["replays"][0].clone();
+                    bad["replays"].as_array_mut().unwrap().push(entry);
+                }
+                "reason" => bad["cadence"]["observation_reason"] = json!("user-requested-status"),
+                _ => bad["cadence"]["observed_interval_seconds"] = json!(1799),
+            }
+            assert!(
+                validate_observation(&p, &model, &bad, t + 60).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_observer_cannot_change_scope_or_owner() {
+        let (p, model, _, _, _, _, config, _) = fixture();
+        for field in ["output", "owner", "reason", "cadence"] {
+            let mut bad = config.clone();
+            match field {
+                "output" => bad["output"] = json!("/different"),
+                "owner" => {
+                    bad["replays"][0]["expected_producer_invocation_id"] = json!("f".repeat(32))
+                }
+                "reason" => bad["observation_reason"] = json!("user-requested-status"),
+                _ => bad["minimum_interval_seconds"] = json!(1),
+            }
+            assert!(
+                validate_observer_config(&p, &model, &bad).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn derivation_preserves_all_gates_diagnostics_completed_pipelines_and_formulae() {
+        let (mut p, model, fleet, _, _, _, _, _) = fixture();
+        p.additional_gate_evidence.insert(
+            "224".into(),
+            vec![Bound {
+                path: "/sealed/new-repair".into(),
+                sha256: "b".repeat(64),
+            }],
+        );
+        let observer = Bound {
+            path: p.observer.clone(),
+            sha256: "c".repeat(64),
+        };
+        let (next, next_fleet) = derive(&p, &model, &fleet, &observer).unwrap();
+        assert_eq!(next["ranges"], model["ranges"]);
+        assert_eq!(next_fleet["diagnostics"], fleet["diagnostics"]);
+        assert_eq!(next_fleet["pipeline_claims"], fleet["pipeline_claims"]);
+        assert_eq!(next_fleet["gates"]["224"]["state"], "blocked-qualification");
+        assert_eq!(
+            next_fleet["gates"]["224"]["evidence"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            next["evidence"][0],
+            serde_json::to_value(&p.previous_estimates).unwrap()
+        );
+        assert_eq!(
+            next_fleet["previous_fleet"],
+            serde_json::to_value(&p.previous_fleet).unwrap()
+        );
+    }
+
+    #[test]
+    fn estimate_census_and_identity_cannot_be_substituted() {
+        let (p, model, _, _, _, _, _, _) = fixture();
+        let obs = Bound {
+            path: p.observer.clone(),
+            sha256: "d".repeat(64),
+        };
+        let entry = json!({"epoch":206,"archive_directory":"/private/archives","expected_controller_invocation_id":"b".repeat(32),
+            "expected_producer_invocation_id":"c".repeat(32),"elapsed_execution_millis":100,"estimated_remaining_millis":200});
+        let estimates = json!({"schema":"jetstreamer-horizon-r2-status-estimates-v5","observer_sha256":obs.sha256,
+            "sampled_at_utc":p.sample_target_utc,"estimates":[entry]});
+        verify_estimates(&p, &model, &obs, &estimates).unwrap();
+        for field in ["epoch", "owner", "remaining", "elapsed", "missing"] {
+            let mut bad = estimates.clone();
+            match field {
+                "epoch" => bad["estimates"][0]["epoch"] = json!(301),
+                "owner" => {
+                    bad["estimates"][0]["expected_producer_invocation_id"] = json!("f".repeat(32))
+                }
+                "remaining" => bad["estimates"][0]["estimated_remaining_millis"] = json!(0),
+                "elapsed" => bad["estimates"][0]["elapsed_execution_millis"] = json!("100"),
+                _ => bad["estimates"] = json!([]),
+            }
+            assert!(verify_estimates(&p, &model, &obs, &bad).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn input_reader_rejects_links_writable_immutable_files_and_wrong_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("input.json");
+        fs::write(&file, b"{}").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(read_checked(&file, 20, uid, true).unwrap(), b"{}");
+        assert!(read_checked(&file, 1, uid, true).is_err());
+        assert!(read_checked(&file, 20, uid.wrapping_add(1), true).is_err());
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(read_checked(&link, 20, uid, true).is_err());
+        let hard = root.path().join("hard");
+        fs::hard_link(&file, &hard).unwrap();
+        assert!(read_checked(&file, 20, uid, true).is_err());
+        assert!(absent(&file).is_err());
+    }
+
+    #[test]
+    fn occupied_cycle_cannot_be_claimed_twice() {
+        let root = tempfile::tempdir().unwrap();
+        let cycle = root.path().join("cycle");
+        absent(&cycle).unwrap();
+        fs::create_dir(&cycle).unwrap();
+        assert!(absent(&cycle).is_err());
+        assert!(fs::create_dir(&cycle).is_err());
+    }
+
+    #[test]
+    fn newer_routine_or_same_sample_admission_fleet_invalidates_pending_cycle() {
+        let old = json!({"schema":"jetstreamer-horizon-campaign-fleet-v1","first_epoch":201,"last_epoch":300,
+            "sampled_at_utc":"2026-10-20T10:04:42Z","recorded_unix_seconds":1792490800u64});
+        assert!(!newer_fleet(&old, &old).unwrap());
+        let mut next = old.clone();
+        next["sampled_at_utc"] = json!("2026-10-20T10:20:00Z");
+        assert!(newer_fleet(&next, &old).unwrap());
+        next = old.clone();
+        next["recorded_unix_seconds"] = json!(1792490801u64);
+        assert!(newer_fleet(&next, &old).unwrap());
+        next["first_epoch"] = json!(1);
+        next["last_epoch"] = json!(200);
+        assert!(!newer_fleet(&next, &old).unwrap());
+        next = old.clone();
+        next["schema"] = json!("unknown");
+        assert!(newer_fleet(&next, &old).is_err());
+    }
+
+    #[test]
+    fn source_executes_only_fixed_metadata_subcommands_not_replay_or_delete() {
+        let source = include_str!("routine_cycle.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!implementation.contains("Command::new(\"systemctl\")"));
+        assert!(!implementation.contains("\"sync\".into()"));
+        assert!(!implementation.contains("\"status-delete\""));
+        assert!(!implementation.contains("remove_file("));
+        assert!(!implementation.contains("remove_dir("));
+        assert!(implementation.contains("\"status-publish\".into()"));
+        assert!(implementation.contains("\"fleet-reconcile\".into()"));
+    }
+}
