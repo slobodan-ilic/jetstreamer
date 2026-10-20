@@ -66,6 +66,15 @@ canonical sidecar, public import, R2 operation or scratch retirement. A canonica
 prefix, separately qualified 419-slot suffix and complete anchored/plugin scans
 remain necessary for the proposed two-stage publication path.
 
+The parent's focused planner separately admits a prefix ending at the retained
+canonical root `88,127,580`: output starts at `87,696,000`, covers 431,581 slots,
+and leaves 419 slots through `88,127,999`. A planner regression checks this exact
+boundary and keeps ordinary epoch203 runtime selection rejected. This is only a
+planning capability, not evidence that a complete prefix exists, that the full
+prefix fits, or that its native restart tuple has been verified. The epoch213
+continuation runner remains restricted to its exact epoch213 artifacts; it cannot
+execute or publish an epoch203 continuation.
+
 Fleet reconciliation accepts only the distinct
 `jetstreamer-private-epoch203-bounded-resource-launch-v1` receipt for this run.
 It pins the worker and runner digests, bootstrap/target/root, unchanged v1.6.16

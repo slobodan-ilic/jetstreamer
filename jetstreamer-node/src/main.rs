@@ -23679,6 +23679,45 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn focused_epoch_203_qualification_can_stop_at_canonical_prefix_root() {
+        let snapshot = qualification_snapshot(87_695_515, Hash::new_unique());
+        let terminal = compatibility::SOLANA_V1_6_16_EPOCH_204_INITIAL_SNAPSHOT_SLOT;
+        let plan = qualification_plan(
+            203,
+            203,
+            Some(terminal),
+            Some(true),
+            Some(&snapshot),
+            Some(Path::new("epoch-hashes-203-prefix.txt")),
+            Some(Path::new("epoch-203-prefix-through-88127580.jet")),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(terminal, 88_127_580);
+        assert_eq!(plan.bootstrap_slot, 87_695_515);
+        assert_eq!(plan.replay_start, 87_695_516);
+        assert_eq!(plan.output_slot_start, 87_696_000);
+        assert_eq!(plan.end_inclusive, terminal);
+        assert_eq!(plan.slot_count(), 431_581);
+        let (_, epoch_end) = epoch_to_slot_range(203);
+        assert_eq!(epoch_end - terminal, 419);
+
+        let range = runtime_slot_range(203, Some(plan));
+        assert_eq!(range.end, terminal + 1);
+        assert!(
+            compatibility::plan_runtime_spans(range.clone(), true).is_err(),
+            "a focused prefix must not promote epoch203 into ordinary replay"
+        );
+        let spans = plan_runtime_spans_for_invocation(range, true, true).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            runtime_span_selection(&spans[0]).unwrap().backend,
+            compatibility::RuntimeBackend::SolanaV1_6_16
+        );
+    }
+
+    #[test]
     fn focused_epoch_203_qualification_can_use_the_next_epoch_root() {
         let snapshot = qualification_snapshot(87_695_515, Hash::new_unique());
         let terminal = 88_559_361;
