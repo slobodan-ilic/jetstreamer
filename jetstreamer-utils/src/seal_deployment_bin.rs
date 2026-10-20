@@ -406,6 +406,11 @@ fn write_generated_file(path: &Path, bytes: &[u8], expected_uid: u32) -> Result<
         .map_err(|error| format!("create {}: {error}", path.display()))?;
     file.write_all(bytes)
         .map_err(|error| format!("write {}: {error}", path.display()))?;
+    // OpenOptions' creation mode is filtered by the caller's umask. The stage
+    // is still root-private, so set the required immutable final mode through
+    // this already-open descriptor before fsync and identity validation.
+    file.set_permissions(fs::Permissions::from_mode(0o444))
+        .map_err(|error| format!("chmod {}: {error}", path.display()))?;
     file.sync_all()
         .map_err(|error| format!("fsync {}: {error}", path.display()))?;
     let metadata = file
@@ -611,6 +616,51 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_receipts_ignore_restrictive_umask() {
+        const CHILD: &str = "JETSTREAMER_SEAL_RESTRICTIVE_UMASK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // umask is process-wide: isolate it from all other libtest threads.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::generated_receipts_ignore_restrictive_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated umask regression failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        unsafe {
+            libc::umask(0o077);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let source = directory.path().join("source.bin");
+        let digest = write_source(&source, b"umask-independent immutable deployment", 0o400);
+        let plan = test_plan(directory.path(), &source, digest);
+        seal(
+            &plan,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            unsafe { libc::geteuid() },
+            false,
+        )
+        .unwrap();
+        for name in ["payload.bin", "deployment-seal-receipt.json", "SHA256SUMS"] {
+            let metadata = fs::symlink_metadata(plan.destination.join(name)).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o444, "{name}");
+            assert_eq!(metadata.nlink(), 1);
+        }
+    }
 
     fn write_source(path: &Path, bytes: &[u8], mode: u32) -> String {
         fs::write(path, bytes).unwrap();

@@ -543,7 +543,53 @@ fn derive(p: &Plan, model: &Value, fleet: &Value, observer: &Bound) -> Result<(V
     Ok((model, fleet))
 }
 
-fn child(tool: &Bound, args: &[String], credentials: bool) -> Result<()> {
+fn record_child_output(
+    tool: &Bound,
+    output: &std::process::Output,
+    receipt_path: &Path,
+) -> Result<()> {
+    record_child_output_with(tool, output, receipt_path, write_new)
+}
+
+fn record_child_output_with(
+    tool: &Bound,
+    output: &std::process::Output,
+    receipt_path: &Path,
+    persist: impl FnOnce(&Path, &Value) -> Result<Bound>,
+) -> Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+    const OUTPUT_LIMIT: usize = 1 << 20;
+    let stream = |bytes: &[u8]| {
+        json!({"length":bytes.len(),"sha256":sha(bytes),
+            "truncated":bytes.len()>OUTPUT_LIMIT,
+            "text":String::from_utf8_lossy(&bytes[..bytes.len().min(OUTPUT_LIMIT)])})
+    };
+    // Preserve bounded private diagnostics before rejecting a failed child.
+    // Never record the inherited environment (which may contain R2 credentials).
+    persist(
+        receipt_path,
+        &json!({"schema":"jetstreamer-horizon-routine-child-result-v1",
+            "tool":tool,"exit_code":output.status.code(),"signal":output.status.signal(),
+            "success":output.status.success(),"stdout":stream(&output.stdout),
+            "stderr":stream(&output.stderr),"automatic_retry_authorized":false,
+            "replay_launch_authorized":false,"archive_mutations_authorized":false}),
+    )?;
+    ensure!(
+        output.status.success(),
+        "bound child {} failed with {}; private result: {}",
+        tool.path.display(),
+        output.status,
+        receipt_path.display()
+    );
+    ensure!(
+        output.stdout.len() <= OUTPUT_LIMIT && output.stderr.len() <= OUTPUT_LIMIT,
+        "oversized child output; private result: {}",
+        receipt_path.display()
+    );
+    Ok(())
+}
+
+fn child(tool: &Bound, args: &[String], credentials: bool, receipt_path: &Path) -> Result<()> {
     tool_ok(tool)?;
     let mut cmd = Command::new(&tool.path);
     cmd.args(args).stdin(Stdio::null());
@@ -558,18 +604,10 @@ fn child(tool: &Bound, args: &[String], credentials: bool) -> Result<()> {
     }
     // The enclosing non-restarting oneshot owns the bounded runtime and kills
     // only this metadata tool tree; no replay belongs to its cgroup.
-    let output = cmd.output()?;
-    ensure!(
-        output.status.success(),
-        "bound child {} failed with {}; inspect private cycle evidence",
-        tool.path.display(),
-        output.status
-    );
-    ensure!(
-        output.stdout.len() <= 1 << 20 && output.stderr.len() <= 1 << 20,
-        "oversized child output"
-    );
-    Ok(())
+    let output = cmd
+        .output()
+        .with_context(|| format!("failed to execute bound child {}", tool.path.display()))?;
+    record_child_output(tool, &output, receipt_path)
 }
 
 fn validate_service(
@@ -781,6 +819,7 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
                 p.tools.sealer.sha256.clone(),
             ],
             false,
+            &p.cycle_directory.join("child-sealer.json"),
         )?;
         let model_bound = Bound {
             path: sealed.join("eta-model.json"),
@@ -809,6 +848,7 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
                 p.estimate_output.display().to_string(),
             ],
             false,
+            &p.cycle_directory.join("child-estimator.json"),
         )?;
         let bytes = read_checked(&p.estimate_output, LIMIT, 0, false)?;
         let new_estimates: Value = serde_json::from_slice(&bytes)?;
@@ -865,6 +905,7 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
                     "replay".into(),
                 ],
                 true,
+                &p.cycle_directory.join(format!("child-status-{epoch}.json")),
             )?;
             let path = status_dir.join(format!("epoch-{epoch}.status-{digits}.json"));
             let bytes = read_checked(&path, LIMIT, 0, false)?;
@@ -914,6 +955,7 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
                 fleet_bound.sha256.clone(),
             ],
             true,
+            &p.cycle_directory.join("child-fleet.json"),
         )?;
         let bytes = read_checked(&p.fleet_output, LIMIT, 0, false)?;
         let ledger: Value = serde_json::from_slice(&bytes)?;
@@ -986,6 +1028,192 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a sealed root test binary, pinned sealer and private sandbox probe root"]
+    fn privileged_real_sealer_child_records_success_and_failures() {
+        ensure_root_probe().unwrap();
+    }
+
+    fn ensure_root_probe() -> Result<()> {
+        ensure!(unsafe { libc::geteuid() } == 0, "probe requires root");
+        let root = Path::new("/var/lib/jetstreamer/horizon-routine-child-probes");
+        private_dir(root)?;
+        let directory = tempfile::Builder::new()
+            .prefix("attempt-")
+            .tempdir_in(root)?
+            .keep();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        // Keep all positive and negative child evidence; never remove the probe.
+        eprintln!("private child probe evidence: {}", directory.display());
+        let tool = Bound {
+            path: env::var("HORIZON_PROBE_SEALER")?.into(),
+            sha256: env::var("HORIZON_PROBE_SEALER_SHA256")?,
+        };
+        let member = write_new(
+            &directory.join("marker.json"),
+            &json!({"probe":true,
+            "replay_launch_authorized":false,"publication_authorized":false,"r2_mutations":false}),
+        )?;
+        let destination = directory.join("sealed");
+        let plan = write_new(
+            &directory.join("plan.json"),
+            &json!({
+            "schema":"jetstreamer-sealed-deployment-plan-v1","destination":destination,
+            "members":[{"source":member.path,"name":"marker.json","sha256":member.sha256,"mode":292}]}),
+        )?;
+        let mut args = vec![
+            plan.path.display().to_string(),
+            "--plan-sha256".into(),
+            "0".repeat(64),
+            "--self-sha256".into(),
+            tool.sha256.clone(),
+        ];
+        let negative = directory.join("child-wrong-plan.json");
+        ensure!(
+            child(&tool, &args, false, &negative).is_err(),
+            "wrong digest accepted"
+        );
+        ensure!(!destination.exists(), "negative probe published deployment");
+        let failed: Value = serde_json::from_slice(&fs::read(&negative)?)?;
+        ensure!(
+            failed["success"] == false
+                && failed["stderr"]["length"].as_u64().is_some_and(|n| n > 0),
+            "missing private child failure detail"
+        );
+        args[2] = plan.sha256;
+        child(&tool, &args, false, &directory.join("child-success.json"))?;
+        ensure!(
+            sha(&fs::read(destination.join("marker.json"))?) == member.sha256,
+            "sealed marker mismatch"
+        );
+        let positive: Value =
+            serde_json::from_slice(&fs::read(directory.join("child-success.json"))?)?;
+        ensure!(positive["success"] == true, "successful child not recorded");
+        ensure!(
+            child(
+                &tool,
+                &args,
+                false,
+                &directory.join("child-no-clobber.json")
+            )
+            .is_err(),
+            "sealer unexpectedly replaced existing deployment"
+        );
+        ensure!(
+            sha(&fs::read(destination.join("marker.json"))?) == member.sha256,
+            "no-clobber probe changed member"
+        );
+        Ok(())
+    }
+
+    fn write_test_child_result(path: &Path, value: &Value) -> Result<Bound> {
+        // Exercise the actual root-private writer in the privileged suite, and
+        // the same no-clobber/durability contract in ordinary unprivileged CI.
+        if unsafe { libc::geteuid() } == 0 {
+            return write_new(path, value);
+        }
+        let bytes = serde_json::to_vec(value)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        File::open(path.parent().unwrap())?.sync_all()?;
+        Ok(Bound {
+            path: path.into(),
+            sha256: sha(&bytes),
+        })
+    }
+
+    #[test]
+    fn failed_child_keeps_stderr_before_error_and_never_clobbers_receipt() {
+        use std::os::unix::process::ExitStatusExt;
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("child.json");
+        let tool = Bound {
+            path: "/sealed/sealer".into(),
+            sha256: "a".repeat(64),
+        };
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: b"partial diagnostic".to_vec(),
+            stderr: b"exact child failure".to_vec(),
+        };
+        let result =
+            record_child_output_with(&tool, &output, &path, write_test_child_result).unwrap_err();
+        assert!(result.to_string().contains("private result:"));
+        let original = fs::read(&path).unwrap();
+        let receipt: Value = serde_json::from_slice(&original).unwrap();
+        assert_eq!(receipt["exit_code"], 1);
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["stderr"]["text"], "exact child failure");
+        assert_eq!(receipt["stderr"]["sha256"], sha(&output.stderr));
+        assert_eq!(receipt["automatic_retry_authorized"], false);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert!(record_child_output_with(&tool, &output, &path, write_test_child_result).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn oversized_or_signaled_child_is_private_bounded_and_fatal() {
+        use std::os::unix::process::ExitStatusExt;
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let tool = Bound {
+            path: "/sealed/tool".into(),
+            sha256: "a".repeat(64),
+        };
+        for (name, raw_status, bytes) in [
+            ("oversized", 0, vec![b'x'; (1 << 20) + 1]),
+            ("signaled", 9, vec![0xff]),
+        ] {
+            let path = directory.path().join(format!("{name}.json"));
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(raw_status),
+                stdout: vec![],
+                stderr: bytes,
+            };
+            assert!(
+                record_child_output_with(&tool, &output, &path, write_test_child_result).is_err()
+            );
+            let receipt: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(receipt["stderr"]["sha256"], sha(&output.stderr));
+            assert_eq!(receipt["stderr"]["length"], output.stderr.len());
+            if name == "oversized" {
+                assert_eq!(receipt["stderr"]["truncated"], true);
+                assert_eq!(receipt["stderr"]["text"].as_str().unwrap().len(), 1 << 20);
+            } else {
+                assert_eq!(receipt["signal"], 9);
+            }
+        }
+    }
+
+    #[test]
+    fn successful_child_also_has_durable_result() {
+        use std::os::unix::process::ExitStatusExt;
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("success.json");
+        let tool = Bound {
+            path: "/sealed/tool".into(),
+            sha256: "a".repeat(64),
+        };
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"ok".to_vec(),
+            stderr: vec![],
+        };
+        record_child_output_with(&tool, &output, &path, write_test_child_result).unwrap();
+        let receipt: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(receipt["success"], true);
+        assert_eq!(receipt["stdout"]["text"], "ok");
+        assert_eq!(receipt["stderr"]["truncated"], false);
+    }
 
     fn fixture() -> (Plan, Value, Value, Value, Value, Value, Value, Value) {
         let b = |name: &str| json!({"path":format!("/sealed/{name}"),"sha256":"a".repeat(64)});
