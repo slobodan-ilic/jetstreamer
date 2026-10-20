@@ -839,7 +839,14 @@ mod tests {
         assert_eq!(sha, format!("{:x}", Sha256::digest(b"original")));
         let file = open_file(&path, false).unwrap();
         let before = identity(&file.metadata().unwrap());
-        fs::write(&path, b"modified").unwrap();
+        // Keep the old descriptor open so the replacement cannot reuse its
+        // inode. Same-length in-place writes can share a filesystem timestamp
+        // tick, even when nanoseconds are recorded; they are not an inode test.
+        let replacement = dir.path().join("replacement");
+        fs::write(&replacement, b"original").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert_ne!(identity(&fs::metadata(&path).unwrap()).ino, before.ino);
         assert!(unchanged(&path, &file, &before).is_err());
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
@@ -847,5 +854,30 @@ mod tests {
         fs::remove_file(link).unwrap();
         fs::hard_link(&path, dir.path().join("hard")).unwrap();
         assert!(open_file(&path, false).is_err());
+    }
+
+    #[test]
+    fn changed_length_fails_without_timestamp_resolution_assumptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        fs::write(&path, b"original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let file = open_file(&path, false).unwrap();
+        let before = identity(&file.metadata().unwrap());
+        fs::write(&path, b"modified with a different length").unwrap();
+        assert_ne!(file.metadata().unwrap().len(), before.len);
+        assert!(unchanged(&path, &file, &before).is_err());
+    }
+
+    #[test]
+    fn independent_hash_detects_same_length_content_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        fs::write(&path, b"original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (before, _) = measure(&path, false).unwrap();
+        fs::write(&path, b"modified").unwrap();
+        let (after, _) = measure(&path, false).unwrap();
+        assert_ne!(before, after);
     }
 }
