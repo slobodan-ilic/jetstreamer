@@ -39,3 +39,15 @@ Repeat check, test and clippy with `-p jetstreamer-node --features FEATURE` for
 each isolated mode. Run both `jetstreamer-horizon` archive-example regressions
 with default and all features as the workflow does. Passing a narrow package's
 tests alone does not establish workspace or CI readiness.
+
+Pull-request CI checks GitHub's synthetic merge with the current base branch,
+not the source branch alone. Reproduce integration failures in a separate
+worktree of the fork's `refs/pull/PR_NUMBER/merge`, preserving unrelated local
+changes. Apply the proposed repair there and run the affected suites before
+claiming local reproduction. In particular, the HTTP test server's request-line
+fixture must use `Cow<'static, str>` and convert literal initializers with
+`.into()` consistently with the base branch's dynamically generated requests.
+
+Test jobs retain Cargo's exit status through Bash `pipefail` while teeing output.
+On failure they publish a bounded, escaped log tail as a check annotation so an
+SSH-only maintainer can read the error without Actions log-download credentials.

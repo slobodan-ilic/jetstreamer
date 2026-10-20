@@ -1,6 +1,6 @@
 use super::*;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::TcpListener,
@@ -9,7 +9,7 @@ use tokio::{
 };
 
 struct Reply {
-    request_line: &'static str,
+    request_line: Cow<'static, str>,
     range: Option<String>,
     request_json: Option<Value>,
     status: &'static str,
@@ -18,9 +18,9 @@ struct Reply {
 }
 
 impl Reply {
-    fn head(request_line: &'static str, status: &'static str) -> Self {
+    fn head(request_line: impl Into<Cow<'static, str>>, status: &'static str) -> Self {
         Self {
-            request_line,
+            request_line: request_line.into(),
             range: None,
             request_json: None,
             status,
@@ -31,7 +31,7 @@ impl Reply {
 
     fn range(start: usize, end: usize, bytes: &[u8]) -> Self {
         Self {
-            request_line: "GET /archive/670/epoch-670.car HTTP/1.1",
+            request_line: "GET /archive/670/epoch-670.car HTTP/1.1".into(),
             range: Some(format!("bytes={start}-{end}")),
             request_json: None,
             status: "206 Partial Content",
@@ -42,7 +42,7 @@ impl Reply {
 
     fn rpc(response: Value) -> Self {
         Self {
-            request_line: "POST /archive/ HTTP/1.1",
+            request_line: "POST /archive/ HTTP/1.1".into(),
             range: None,
             request_json: Some(json!({
                 "jsonrpc": "2.0",
@@ -179,7 +179,7 @@ async fn successor_car_rate_limit_is_not_decoded_as_a_header_and_clean_eof() {
     let server = TestServer::start(vec![
         Reply::range(0, 0, &bytes),
         Reply {
-            request_line: "GET /archive/670/epoch-670.car HTTP/1.1",
+            request_line: "GET /archive/670/epoch-670.car HTTP/1.1".into(),
             range: Some("bytes=0-4095".into()),
             request_json: None,
             status: "429 Too Many Requests",
