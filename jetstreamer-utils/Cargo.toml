@@ -15,6 +15,8 @@ sst-capability-tests = ["dep:rocksdb"]
 epoch225-v1-6-25-diagnostic = []
 # Private same-input epoch203 resource comparison; no runtime promotion.
 epoch203-single-thread-resource = []
+# Exact private comparison of the v1.6.16 upstream shrink-budget cap.
+epoch203-shrink-budget-resource = []
 # Private, resource-limited canonical-root prefix qualification, not publication.
 epoch203-root-prefix-resource = []
 # Private fixed-span epoch224 measurement against its pinned v1.6.25 package.

@@ -33,6 +33,13 @@ struct DiagnosticClaim {
     launch_receipt: BoundFile,
 }
 
+fn shrink_budget_203_namespace(claim: &DiagnosticClaim) -> bool {
+    claim.epoch == 203
+        && claim
+            .unit
+            .starts_with("horizon-qualify-203-bounded-resource-shrink-budget-")
+}
+
 fn diagnostic_scope(claim: &DiagnosticClaim) -> std::ops::RangeInclusive<u64> {
     if claim.epoch == 225
         && (claim
@@ -376,6 +383,11 @@ fn validate_same_sample_admission(
             // never a target-stop or zero-worker benchmark exemption.
             "cc3536dfcc268c913feccf1603a25e3cdbdf2807289c9061e04884027d1b1560"
         }
+        203 if shrink_budget_203_namespace(claim) => {
+            // Separately sealed guard with the exact epoch203 target-stop
+            // profile; this does not replace a guard on an existing replay.
+            "d039ddf0b161bc554614a862bd12987bd6a3474549a22d066ebefa5584e5dd98"
+        }
         203 if claim
             .unit
             .starts_with("horizon-qualify-203-bounded-resource-")
@@ -458,7 +470,19 @@ fn validate_same_sample_admission(
 }
 
 fn diagnostic_guard_profile_matches(claim: &DiagnosticClaim, plan: &Value) -> bool {
-    if claim.epoch == 225
+    if shrink_budget_203_namespace(claim) {
+        !claim
+            .unit
+            .starts_with("horizon-qualify-203-bounded-resource-shrink-budget-r1-")
+            && plan.get("bounded_measurement").is_none_or(Value::is_null)
+            && plan["bounded_canary"]["expected_uid"] == 1000
+            && plan["bounded_canary"]["maximum_drainage_seconds"] == 180
+            && plan["bounded_canary"]["target_stop_intent"].as_str()
+                == claim
+                    .scratch_path
+                    .join("receipts/target-stop.json")
+                    .to_str()
+    } else if claim.epoch == 225
         && claim
             .unit
             .starts_with("horizon-qualify-225-natural-root-resource-")
@@ -511,6 +535,8 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
     let bounded_v1625 = receipt["schema"] == "jetstreamer-private-epoch225-v1625-bounded-launch-v1";
     let bounded_203 =
         receipt["schema"] == "jetstreamer-private-epoch203-bounded-resource-launch-v1";
+    let shrink_budget_203 =
+        receipt["schema"] == "jetstreamer-private-epoch203-shrink-budget-resource-launch-v1";
     let bounded_224 =
         receipt["schema"] == "jetstreamer-private-epoch224-bounded-resource-launch-v1";
     let root_prefix_203 =
@@ -527,6 +553,7 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             || bounded_resource
             || bounded_v1625
             || bounded_203
+            || shrink_budget_203
             || bounded_224
             || root_prefix_203
             || natural_root_225
@@ -745,6 +772,8 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             && receipt["runtime_promotion_authorized"] == false
             && receipt["canonical_sidecar_authorized"] == false
             && receipt["publication_authorized"] == false
+    } else if shrink_budget_203 {
+        shrink_budget_203_launch_matches(claim, receipt)
     } else if bounded_203 {
         claim.epoch == 203
             && claim
@@ -838,6 +867,11 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
 }
 
 fn epoch203_resource_runner_matches(claim: &DiagnosticClaim, receipt: &Value) -> bool {
+    // A candidate cannot borrow the baseline schema or runner receipt even
+    // when its namespace shares the historical bounded-resource prefix.
+    if shrink_budget_203_namespace(claim) {
+        return false;
+    }
     match receipt["runner_sha256"].as_str() {
         Some("bc9a75b420210a93b6ab65d28bd82d1fe2748c95541394bfae2e0f0f5153bf12") => {
             !claim
@@ -853,6 +887,51 @@ fn epoch203_resource_runner_matches(claim: &DiagnosticClaim, receipt: &Value) ->
         }
         _ => false,
     }
+}
+
+fn shrink_budget_203_launch_matches(claim: &DiagnosticClaim, receipt: &Value) -> bool {
+    shrink_budget_203_namespace(claim)
+        && !claim
+            .unit
+            .starts_with("horizon-qualify-203-bounded-resource-shrink-budget-r1-")
+        && claim.unit.ends_with(".service")
+        && claim.scratch_path.parent() == Some(Path::new("/home/ubuntu/.jetstreamer-private"))
+        && claim
+            .scratch_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| {
+                s.starts_with("bounded-resource-203-shrink-budget-")
+                    && !s.starts_with("bounded-resource-203-shrink-budget-r1-")
+            })
+        && receipt["epoch"] == 203
+        && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+        && receipt["snapshot_slot"] == 87_695_515u64
+        && receipt["snapshot_sha256"]
+            == "e45584858d0c825f095a43ff5e5909e62a68d197d39c042a76727454525228c4"
+        && receipt["worker_sha256"]
+            == "4aeca56378a4bb2c55d0e590c1e334c4afa6a375a2c0d94894b412bea261f1cc"
+        && receipt["node_sha256"]
+            == "025757b9b337abf05435c427f143f590d9bfa542b5e4493aae783c158b4f2d3d"
+        && receipt["runner_sha256"]
+            == "d7b3f0c72f091426ce5679ebb237d7015cd054c2fa6953f811779a25736a2760"
+        && receipt["runtime"] == "solana-v1.6.16"
+        && receipt["runtime_semantics_changed"] == false
+        && receipt["storage_maintenance_changed"] == true
+        && receipt["upstream_shrink_budget_cap"] == true
+        && receipt["solana_rayon_threads"] == 16
+        && receipt["target_slot"] == 87_720_000u64
+        && receipt["terminal_root_slot"] == 88_127_580u64
+        && receipt["maximum_scratch_bytes"] == 256u64 << 30
+        && receipt["maximum_runtime_seconds"] == 21_600u64
+        && receipt["experimental_envelope_bytes"] == 416u64 << 30
+        && receipt["bounded_replay_authorized"] == true
+        && receipt["ordinary_replay_authorized"] == false
+        && receipt["canonical_prefix_qualified"] == false
+        && receipt["full_cold_epoch_peak_qualified"] == false
+        && receipt["runtime_promotion_authorized"] == false
+        && receipt["canonical_sidecar_authorized"] == false
+        && receipt["publication_authorized"] == false
 }
 
 fn transitions(
@@ -2746,6 +2825,180 @@ mod tests {
         assert!(!epoch203_resource_runner_matches(&claim, &receipt));
         receipt["solana_rayon_threads"] = json!(16);
         assert!(epoch203_resource_runner_matches(&claim, &receipt));
+    }
+
+    fn shrink_budget_203_fixture() -> (DiagnosticClaim, Value) {
+        let claim = DiagnosticClaim {
+            epoch: 203,
+            unit: "horizon-qualify-203-bounded-resource-shrink-budget-test.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path:
+                "/home/ubuntu/.jetstreamer-private/bounded-resource-203-shrink-budget-test".into(),
+            launch_receipt: BoundFile {
+                path: "/private/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let receipt = json!({
+            "schema":"jetstreamer-private-epoch203-shrink-budget-resource-launch-v1",
+            "launched":true,"epoch":203,"private_run_root":claim.scratch_path,
+            "snapshot_slot":87695515,
+            "snapshot_sha256":"e45584858d0c825f095a43ff5e5909e62a68d197d39c042a76727454525228c4",
+            "worker_sha256":"4aeca56378a4bb2c55d0e590c1e334c4afa6a375a2c0d94894b412bea261f1cc",
+            "node_sha256":"025757b9b337abf05435c427f143f590d9bfa542b5e4493aae783c158b4f2d3d",
+            "runner_sha256":"d7b3f0c72f091426ce5679ebb237d7015cd054c2fa6953f811779a25736a2760",
+            "runtime":"solana-v1.6.16","runtime_semantics_changed":false,
+            "storage_maintenance_changed":true,"upstream_shrink_budget_cap":true,
+            "solana_rayon_threads":16,"target_slot":87720000,"terminal_root_slot":88127580,
+            "maximum_scratch_bytes":256u64<<30,"maximum_runtime_seconds":21600,
+            "experimental_envelope_bytes":416u64<<30,
+            "bounded_replay_authorized":true,"ordinary_replay_authorized":false,
+            "canonical_prefix_qualified":false,"full_cold_epoch_peak_qualified":false,
+            "runtime_promotion_authorized":false,"canonical_sidecar_authorized":false,
+            "publication_authorized":false,"remote_mutations":false,"r2_mutations":false,
+            "evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,
+                "restarts":0,"load_state":"loaded","active_state":"active",
+                "sub_state":"running","main_pid":123,"result":"success"}]}
+        });
+        (claim, receipt)
+    }
+
+    #[test]
+    fn bounded_203_shrink_budget_requires_exact_candidate_and_nonpromotion_fields() {
+        let (claim, receipt) = shrink_budget_203_fixture();
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        for key in receipt.as_object().unwrap().keys() {
+            let mut bad = receipt.clone();
+            bad.as_object_mut().unwrap().remove(key);
+            assert!(
+                validate_diagnostic_launch(&bad, &claim).is_err(),
+                "missing {key}"
+            );
+        }
+        for (key, value) in [
+            (
+                "schema",
+                json!("jetstreamer-private-epoch203-bounded-resource-launch-v1"),
+            ),
+            (
+                "worker_sha256",
+                json!("3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a"),
+            ),
+            ("node_sha256", json!("0".repeat(64))),
+            (
+                "runner_sha256",
+                json!("bc9a75b420210a93b6ab65d28bd82d1fe2748c95541394bfae2e0f0f5153bf12"),
+            ),
+            ("snapshot_slot", json!(87695516)),
+            ("snapshot_sha256", json!("0".repeat(64))),
+            ("solana_rayon_threads", json!(1)),
+            ("target_slot", json!(88127580)),
+            ("terminal_root_slot", json!(88127999)),
+            ("maximum_scratch_bytes", json!(768u64 << 30)),
+            ("maximum_runtime_seconds", json!(21601)),
+            ("experimental_envelope_bytes", json!(415u64 << 30)),
+            ("runtime_semantics_changed", json!(true)),
+            ("storage_maintenance_changed", json!(false)),
+            ("upstream_shrink_budget_cap", json!(false)),
+            ("canonical_prefix_qualified", json!(true)),
+            ("full_cold_epoch_peak_qualified", json!(true)),
+            ("runtime_promotion_authorized", json!(true)),
+            ("canonical_sidecar_authorized", json!(true)),
+            ("ordinary_replay_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+            ("remote_mutations", json!(true)),
+            ("r2_mutations", json!(true)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[key] = value;
+            assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn bounded_203_shrink_budget_cannot_borrow_baseline_or_r1_namespaces() {
+        let (mut claim, mut receipt) = shrink_budget_203_fixture();
+        for unit in [
+            "horizon-qualify-203-bounded-resource-store8-test.service",
+            "horizon-qualify-203-bounded-resource-shrink-budget-r1-test.service",
+            "horizon-qualify-203-root-prefix-resource-test.service",
+            "horizon-qualify-203-bounded-resource-shrink-budget-test.timer",
+        ] {
+            claim.unit = unit.into();
+            receipt["evidence"]["units"][0]["unit"] = json!(unit);
+            assert!(
+                validate_diagnostic_launch(&receipt, &claim).is_err(),
+                "{unit}"
+            );
+        }
+        let (mut claim, mut receipt) = shrink_budget_203_fixture();
+        for root in [
+            "/private/203",
+            "/home/ubuntu/.jetstreamer-private/bounded-resource-203-test",
+            "/home/ubuntu/.jetstreamer-private/bounded-resource-203-shrink-budget-r1-test",
+        ] {
+            claim.scratch_path = root.into();
+            receipt["private_run_root"] = json!(root);
+            assert!(
+                validate_diagnostic_launch(&receipt, &claim).is_err(),
+                "{root}"
+            );
+        }
+        let (claim, mut receipt) = shrink_budget_203_fixture();
+        receipt["runner_sha256"] =
+            json!("bc9a75b420210a93b6ab65d28bd82d1fe2748c95541394bfae2e0f0f5153bf12");
+        assert!(!epoch203_resource_runner_matches(&claim, &receipt));
+    }
+
+    #[test]
+    fn bounded_203_shrink_budget_requires_own_guard_and_exact_target_handoff() {
+        let (previous, mut plan, mut guard, mut gp) = admission_fixture();
+        let (claim, _) = shrink_budget_203_fixture();
+        plan.diagnostics[1].epoch = claim.epoch;
+        plan.diagnostics[1].unit = claim.unit.clone();
+        plan.diagnostics[1].scratch_path = claim.scratch_path.clone();
+        gp["unit"] = json!(claim.unit);
+        gp["worker_root"] = json!(claim.scratch_path);
+        gp["bounded_canary"]["maximum_drainage_seconds"] = json!(180);
+        gp["bounded_canary"]["target_stop_intent"] =
+            json!(claim.scratch_path.join("receipts/target-stop.json"));
+        guard["producer"]["cgroup"] = json!(format!("/system.slice/{}", claim.unit));
+        let check = |g: &Value, p: &Value| {
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                g,
+                p,
+                1792455130,
+            )
+        };
+        assert!(check(&guard, &gp).is_err());
+        guard["guard_sha256"] =
+            json!("d039ddf0b161bc554614a862bd12987bd6a3474549a22d066ebefa5584e5dd98");
+        check(&guard, &gp).unwrap();
+        for (pointer, value) in [
+            ("/bounded_canary/expected_uid", json!(0)),
+            ("/bounded_canary/maximum_drainage_seconds", json!(181)),
+            (
+                "/bounded_canary/target_stop_intent",
+                json!("/other/target-stop.json"),
+            ),
+        ] {
+            let mut bad = gp.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(check(&guard, &bad).is_err(), "{pointer}");
+        }
+        let mut bad = gp.clone();
+        bad.as_object_mut().unwrap().remove("bounded_canary");
+        assert!(check(&guard, &bad).is_err());
+        let mut bad = gp.clone();
+        bad["bounded_measurement"] = json!({});
+        assert!(check(&guard, &bad).is_err());
+        let (mut single_thread, _) = shrink_budget_203_fixture();
+        single_thread.unit =
+            "horizon-qualify-203-bounded-resource-shrink-budget-r1-test.service".into();
+        assert!(!diagnostic_guard_profile_matches(&single_thread, &gp));
     }
 
     #[test]
