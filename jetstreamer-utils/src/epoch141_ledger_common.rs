@@ -133,18 +133,43 @@ pub(super) fn hash_alias(value: &Value, raw: &str, normalized: &str, expected: &
 }
 
 pub(super) fn validate_metadata(value: &Value) -> Result<()> {
+    validate_object_metadata(value, &LEDGER_OBJECT)
+}
+
+/// Compile-time exact object identity; never supplied by an operational plan.
+pub(super) struct ObjectSpec {
+    pub bucket: &'static str,
+    pub name: &'static str,
+    pub generation: &'static str,
+    pub size: u64,
+    pub crc: &'static str,
+    pub md5: &'static str,
+    pub uri: &'static str,
+}
+
+pub(super) const LEDGER_OBJECT: ObjectSpec = ObjectSpec {
+    bucket: BUCKET,
+    name: NAME,
+    generation: GENERATION,
+    size: SIZE,
+    crc: CRC,
+    md5: MD5,
+    uri: URI,
+};
+
+pub(super) fn validate_object_metadata(value: &Value, object: &ObjectSpec) -> Result<()> {
     ensure!(
-        value.is_object() && value["bucket"] == BUCKET && value["name"] == NAME,
+        value.is_object() && value["bucket"] == object.bucket && value["name"] == object.name,
         "wrong ledger object"
     );
     ensure!(
-        exact_number(&value["generation"], GENERATION.parse()?)
-            && exact_number(&value["size"], SIZE),
+        exact_number(&value["generation"], object.generation.parse()?)
+            && exact_number(&value["size"], object.size),
         "ledger generation/length mismatch"
     );
-    hash_alias(value, "crc32c", "crc32c_hash", CRC)?;
-    hash_alias(value, "md5Hash", "md5_hash", MD5)?;
-    let id = format!("{BUCKET}/{NAME}/{GENERATION}");
+    hash_alias(value, "crc32c", "crc32c_hash", object.crc)?;
+    hash_alias(value, "md5Hash", "md5_hash", object.md5)?;
+    let id = format!("{}/{}/{}", object.bucket, object.name, object.generation);
     ensure!(
         value.get("id").is_some() || value.get("storage_url").is_some(),
         "generation identity missing"
@@ -153,7 +178,10 @@ pub(super) fn validate_metadata(value: &Value) -> Result<()> {
         ensure!(actual.as_str() == Some(&id), "raw object identity mismatch");
     }
     if let Some(actual) = value.get("storage_url") {
-        ensure!(actual.as_str() == Some(URI), "versioned URL mismatch");
+        ensure!(
+            actual.as_str() == Some(object.uri),
+            "versioned URL mismatch"
+        );
     }
     Ok(())
 }
@@ -202,13 +230,17 @@ pub(super) fn wait_bounded(child: &mut Child, timeout: Duration) -> Result<ExitS
 }
 
 pub(super) fn observe_gcloud() -> Result<Vec<u8>> {
+    observe_gcloud_object(&LEDGER_OBJECT)
+}
+
+pub(super) fn observe_gcloud_object(object: &ObjectSpec) -> Result<Vec<u8>> {
     let mut command = Command::new("/usr/lib/google-cloud-sdk/bin/gcloud");
     command
         .args([
             "storage",
             "objects",
             "describe",
-            URI,
+            object.uri,
             "--account=sam.johnson@anza.xyz",
             "--billing-project=principal-lane-200702",
             "--format=json",
