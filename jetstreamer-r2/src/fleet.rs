@@ -1012,10 +1012,21 @@ pub(super) async fn run() -> Result<()> {
                 epoch,
             );
             // Missing local publication history is explicitly unbound, never current.
-            let matches = live.is_some_and(|(controller, producer)| {
-                publication.as_ref().is_ok_and(|(receipt, _, _)| {
-                    status_matches(&status, &object.etag, receipt, controller, producer)
-                })
+            let matches = publication.as_ref().is_ok_and(|(receipt, _, _)| {
+                if let Some(binding) = &receipt.pipeline_binding {
+                    receipt.status == status
+                        && receipt.object_etag == object.etag
+                        && receipt.authenticated_readback
+                        && pipelines.iter().any(|entry| {
+                            entry["epoch"] == epoch
+                                && entry["live"] == true
+                                && binding.live_matches(&entry["unit"])
+                        })
+                } else {
+                    live.is_some_and(|(controller, producer)| {
+                        status_matches(&status, &object.etag, receipt, controller, producer)
+                    })
+                }
             });
             json!({"key":key,"etag":object.etag,"payload":status,"sha256":hex_lower(&Sha256::digest(&object.bytes)),"classification":if matches {"bound-live-status"} else {"stale-or-orphaned"},"sample_matches_observer":status.sampled_at_utc == sample,"current_eta_valid":matches && status.sampled_at_utc == sample && state != "remote-ready"})
         } else {
@@ -1637,6 +1648,7 @@ mod tests {
             producer_invocation_id: "producer".into(),
             authenticated_readback: true,
             verified_unix_seconds: 0,
+            pipeline_binding: None,
         };
         let controller =
             json!({"InvocationID":"controller","ActiveState":"active","NRestarts":"0"});

@@ -207,7 +207,7 @@ fn command(p: &Plan) -> Command {
         // on Custom(2), without changing runtime or transaction semantics.
         .env("JETSTREAMER_HISTORICAL_TRACE", "1")
         .env("RUST_LOG", "info")
-        .env("SOLANA_RAYON_THREADS", "16")
+        .env("SOLANA_RAYON_THREADS", RAYON_THREADS.to_string())
         .env_remove("JETSTREAMER_HISTORICAL_WORKER_V1_6_16")
         .env_remove("JETSTREAMER_HISTORICAL_WORKER_V1_6_20")
         .env_remove("JETSTREAMER_HISTORICAL_WORKER_V1_6_25")
@@ -678,6 +678,8 @@ fn measure(
     }
     let success = error.is_none() && controlled_success(target, external, code);
     let payload = json!({"schema":RESULT_SCHEMA,"epoch":EPOCH,"unit":p.unit,"invocation_id":invocation,"plan":{"path":bindings["plan_path"],"sha256":bindings["plan_sha256"]},"runner_sha256":bindings["self_sha256"],"node_sha256":p.node.sha256,"worker_sha256":WORKER,"snapshot_sha256":SNAPSHOT,"target_slot":p.target_slot,"observed_slot":observed,"target_reached":target,"first_progress":first_progress,"last_progress":last_progress,"child_pid":pid,"child_return_code":code,"external_signal":external,"elapsed_millis":started.elapsed().as_millis(),"capture":capture,"cgroup_before":before,"cgroup_after":metrics(cgroup)?,"free_before":free_before,"free_after":free_bytes(&p.run_root)?,"success":success,"error":error,"authority":{"ordinary_replay_authorized":false,"full_cold_epoch_peak_qualified":false,"publication_authorized":false,"runtime_promotion_authorized":false,"canonical_sidecar_authorized":false,"remote_mutations":false,"r2_mutations":false}});
+    let mut payload = payload;
+    payload["solana_rayon_threads"] = json!(RAYON_THREADS);
     persist(
         &p.run_root.join(if success {
             "receipts/resource.json"
@@ -779,7 +781,10 @@ mod tests {
             .map(|(k, v)| (k.to_str().unwrap(), v.and_then(|s| s.to_str())))
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(env[WORKER_ENV], Some("/sealed/worker"));
-        assert_eq!(env["SOLANA_RAYON_THREADS"], Some("16"));
+        assert_eq!(
+            env["SOLANA_RAYON_THREADS"],
+            Some(RAYON_THREADS.to_string().as_str())
+        );
         for key in [
             "JETSTREAMER_HISTORICAL_WORKER_V1_6_16",
             "JETSTREAMER_HISTORICAL_WORKER_V1_6_20",
@@ -1021,6 +1026,7 @@ mod tests {
         assert_eq!(receipt["success"], true);
         assert_eq!(receipt["epoch"], EPOCH);
         assert_eq!(receipt["schema"], RESULT_SCHEMA);
+        assert_eq!(receipt["solana_rayon_threads"], json!(RAYON_THREADS));
         assert_eq!(receipt["worker_sha256"], WORKER);
         assert_eq!(receipt["snapshot_sha256"], SNAPSHOT);
         assert_eq!(receipt["child_return_code"], 1);

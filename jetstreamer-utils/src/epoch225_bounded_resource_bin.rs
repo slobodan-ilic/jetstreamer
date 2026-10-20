@@ -1,5 +1,6 @@
 //! Private epoch225 measurement; no runtime, root, or publication promotion.
 mod profile {
+    pub const RAYON_THREADS: u32 = 16;
     pub const EPOCH: u64 = 225;
     pub const TARGET: u64 = 97_202_500;
     pub const TERMINAL: u64 = 97_631_459;

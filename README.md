@@ -649,6 +649,13 @@ for this full-span/root check. The full-span build rejects ordinary replay, root
 cohorts, inherited leases, recovery and public/mixed output paths; it writes no
 canonical sidecar and does not promote epoch 226 or alter the default runtime.
 See [`epoch225-complete-span-qualification.json`](historical-runtime/v1_6_25/epoch225-complete-span-qualification.json).
+The Rust package attester has a separate exact epoch-225 profile for the sealed
+`63a2717` complete-span parent/worker pair and the checked-in
+[`epoch225-complete-span-epoch-hashes.txt`](historical-runtime/v1_6_25/epoch225-complete-span-epoch-hashes.txt).
+This initial content attestation precedes the exact-package capability probe:
+its manifest must report that probe as not yet passed. Attestation still grants
+no replay, plugin, publication or R2 authority; fresh resource admission and
+independent complete-span qualification remain mandatory.
 Exact v1.7.13 remains an unassigned fallback comparison candidate. The primary
 v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers the complete
 epoch-266-301 execution envelope, with publication ending at epoch 300 and epoch 301 retained as
