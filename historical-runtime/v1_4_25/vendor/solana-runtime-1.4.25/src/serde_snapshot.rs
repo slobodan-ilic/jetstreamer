@@ -205,6 +205,49 @@ where
     deserialize_from(reader)
 }
 
+/// Observations of serialized fields only, not a reconstructed or verified Bank.
+#[cfg(feature = "epoch140-snapshot-clock-diagnostic")]
+pub struct SerializedBankClockObservation {
+    pub slot: Slot,
+    pub hash: Hash,
+    pub parent_hash: Hash,
+    pub parent_slot: Slot,
+    pub last_hash: Hash,
+    pub transaction_count: u64,
+    pub tick_height: u64,
+    pub capitalization: u64,
+    pub max_tick_height: u64,
+    pub hashes_per_tick: Option<u64>,
+    pub ticks_per_slot: u64,
+}
+
+/// Decode the actual pinned snapshot type without reconstructing AccountsDb or Bank.
+/// The caller must independently bind version, complete input digest, framing,
+/// resource limits and file identity. No replay or publication authority follows.
+#[cfg(feature = "epoch140-snapshot-clock-diagnostic")]
+pub fn observe_serialized_bank_clock<R: Read>(
+    reader: R,
+) -> Result<SerializedBankClockObservation, String> {
+    let bank: future::DeserializableVersionedBank = deserialize_from_snapshot(reader)
+        .map_err(|e| format!("pinned serialized Bank fields: {}", e))?;
+    let queue = &bank.blockhash_queue;
+    let last_hash = std::panic::catch_unwind(|| queue.last_hash())
+        .map_err(|_| "serialized blockhash queue has no last hash")?;
+    Ok(SerializedBankClockObservation {
+        slot: bank.slot,
+        hash: bank.hash,
+        parent_hash: bank.parent_hash,
+        parent_slot: bank.parent_slot,
+        last_hash,
+        transaction_count: bank.transaction_count,
+        tick_height: bank.tick_height,
+        capitalization: bank.capitalization,
+        max_tick_height: bank.max_tick_height,
+        hashes_per_tick: bank.hashes_per_tick,
+        ticks_per_slot: bank.ticks_per_slot,
+    })
+}
+
 pub fn bank_from_stream<R, P>(
     serde_style: SerdeStyle,
     stream: &mut BufReader<R>,

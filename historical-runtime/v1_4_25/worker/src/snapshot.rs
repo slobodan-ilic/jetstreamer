@@ -17,6 +17,11 @@ use tar::{Archive, EntryType};
 use tempfile::{Builder, TempDir};
 
 const SNAPSHOT_VERSION_1_2: &str = "1.2.0";
+
+// Separate offline binary only. This exposes no new worker protocol or replay route.
+#[cfg(feature = "epoch140-snapshot-clock-diagnostic")]
+#[path = "snapshot_clock.rs"]
+pub mod private_clock;
 // The audited boundary snapshots contain 144,901 members at slot 51,407,922
 // and 380,435 members at slot 63,935,659, almost entirely AppendVecs. The next
 // power of two admits the terminal snapshot with about 38% headroom while
