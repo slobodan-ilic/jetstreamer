@@ -94,6 +94,12 @@ compressed binding nor a complete tar census proves original-backup completeness
 native live state, correct PoH boundaries or publication eligibility. No actual
 epoch141 source has been collected by these fixture tests.
 
+The native crash-shaped fixture also compares direct-tar and digest-bound
+multistream-bzip2 collections byte-for-byte, then performs the complete-CF native
+read-only resolution against the compressed collection. It checks live-file
+references, range/point deletions and WAL-only values without modifying either
+the retained compressed input or the collected member census.
+
 `horizon_legacy_shred::assemble_v1_4_25_padded_batches` provides bounded,
 diagnostic-only data-shred assembly for revision
 `893cc7647248a3536fb6e6d0b5e51c71446b862d`. It requires a complete contiguous
