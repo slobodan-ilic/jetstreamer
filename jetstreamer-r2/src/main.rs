@@ -4,7 +4,7 @@
 //! The archive API surface is intentionally append-only. The sole remote
 //! deletion operation is the fail-closed removal of a mutable
 //! `epoch-N.epoch-status.json` after durable authenticated completion evidence,
-//! or separately proven inactive ownership under the guarded cleanup plan.
+//! or through the separately qualified, exact-owner inactive cleanup profile.
 //! A local archive is removed only after its exact
 //! SHA-256 sidecar, length, multipart ETag, and immutable metadata have been
 //! observed in R2 and a private receipt has been fsynced. The sidecar is
@@ -63,6 +63,7 @@ mod fleet;
 mod inactive_status;
 mod resource_audit;
 mod resource_verify;
+mod status_inactive;
 
 #[derive(Debug)]
 struct Config {
@@ -3080,6 +3081,9 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().nth(1).as_deref() == Some("status-delete-inactive") {
+        return status_inactive::run().await;
+    }
     if env::args().nth(1).as_deref() == Some("private-resource-audit-verify") {
         return resource_verify::run();
     }
@@ -3978,12 +3982,20 @@ mod tests {
     }
 
     #[test]
-    fn source_confines_remote_deletion_to_one_status_object_operation() {
+    fn source_confines_remote_deletion_to_the_two_status_lifecycles() {
         let source = include_str!("main.rs");
         let singular = concat!(".delete_", "object()");
         let plural = concat!(".delete_", "objects()");
         assert_eq!(source.matches(singular).count(), 1);
         assert!(!source.contains(plural));
+        let inactive = include_str!("status_inactive.rs");
+        assert_eq!(inactive.matches(singular).count(), 0);
+        assert!(!inactive.contains(plural));
+        assert!(inactive.contains("owner_matches(publication, publication.epoch)?"));
+        assert!(inactive.contains("conditional_delete_epoch_status("));
+        let general_inactive = include_str!("inactive_status.rs");
+        let general_inactive = general_inactive.split("#[cfg(test)]").next().unwrap();
+        assert!(!general_inactive.contains(singular) && !general_inactive.contains(plural));
         let start = source.find("async fn status_delete(").unwrap();
         let end = source[start..].find("\nasync fn head_archive(").unwrap() + start;
         let status_delete = &source[start..end];
