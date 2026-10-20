@@ -68,6 +68,10 @@ name = "jetstreamer-epoch141-ledger-reverify"
 path = "src/epoch141_ledger_reverify_bin.rs"
 
 [[bin]]
+name = "jetstreamer-epoch141-ledger-census"
+path = "src/epoch141_ledger_census_bin.rs"
+
+[[bin]]
 name = "jetstreamer-horizon-boundary-bridge"
 path = "src/horizon_boundary_bridge_bin.rs"
 

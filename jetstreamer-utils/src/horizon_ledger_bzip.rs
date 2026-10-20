@@ -117,6 +117,7 @@ pub fn collect_bound_bzip2(
         archive_root,
         Some(destination),
         limits,
+        || Ok(()),
     )
 }
 
@@ -141,9 +142,49 @@ pub fn census_bound_bzip2(
         archive_root,
         None,
         limits,
+        || Ok(()),
     )
 }
 
+/// Census with a caller guard checked before each compressed-input read.
+///
+/// The guard also runs before work and after complete decoding. Any failure
+/// aborts without a successful census. Callers must provide independent wall-time
+/// and memory limits; this callback cannot interrupt an in-progress blocking read.
+pub fn census_bound_bzip2_guarded(
+    input: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    maximum_compressed_bytes: u64,
+    archive_root: &Path,
+    limits: CollectionLimits,
+    guard: impl FnMut() -> Result<()>,
+) -> Result<BoundBzipCollection> {
+    inspect_bound_bzip2(
+        input,
+        expected_bytes,
+        expected_sha256,
+        maximum_compressed_bytes,
+        archive_root,
+        None,
+        limits,
+        guard,
+    )
+}
+
+struct GuardReader<R, G> {
+    inner: R,
+    guard: G,
+}
+
+impl<R: Read, G: FnMut() -> Result<()>> Read for GuardReader<R, G> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        (self.guard)().map_err(std::io::Error::other)?;
+        self.inner.read(bytes)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn inspect_bound_bzip2(
     input: &Path,
     expected_bytes: u64,
@@ -152,7 +193,9 @@ fn inspect_bound_bzip2(
     archive_root: &Path,
     destination: Option<&Path>,
     limits: CollectionLimits,
+    mut guard: impl FnMut() -> Result<()>,
 ) -> Result<BoundBzipCollection> {
+    guard()?;
     ensure!(
         expected_bytes > 0 && expected_bytes <= maximum_compressed_bytes,
         "invalid compressed length bound"
@@ -195,7 +238,11 @@ fn inspect_bound_bzip2(
     );
     let mut prehash = Sha256::new();
     let count = std::io::copy(
-        &mut (&mut source).take(probe_limit),
+        &mut GuardReader {
+            inner: &mut source,
+            guard: &mut guard,
+        }
+        .take(probe_limit),
         &mut DigestSink(&mut prehash),
     )?;
     ensure!(
@@ -208,7 +255,11 @@ fn inspect_bound_bzip2(
     );
     source.seek(SeekFrom::Start(0))?;
     let mut reader = HashReader {
-        inner: (&mut source).take(probe_limit),
+        inner: GuardReader {
+            inner: &mut source,
+            guard: &mut guard,
+        }
+        .take(probe_limit),
         digest: Sha256::new(),
         count: 0,
     };
@@ -227,6 +278,7 @@ fn inspect_bound_bzip2(
             && format!("{:x}", reader.digest.finalize()) == expected_sha256,
         "compressed decode-read digest mismatch"
     );
+    guard()?;
     ensure!(
         Identity::from(&source.metadata()?) == identity
             && Identity::from(&fs::symlink_metadata(input)?) == identity,
@@ -344,6 +396,33 @@ mod tests {
         retained["collection"]["files_retained"] = false.into();
         assert_eq!(serde_json::to_value(measured).unwrap(), retained);
         assert_eq!(fs::read(&input).unwrap(), bytes);
+    }
+
+    #[test]
+    fn census_guard_aborts_before_work_during_hash_and_during_decode() {
+        let bytes = compress(&tar_bytes());
+        let root = tempfile::tempdir().unwrap();
+        let input = install(root.path(), &bytes);
+        for stop_at in [1, 2, 4] {
+            let mut calls = 0;
+            let error = census_bound_bzip2_guarded(
+                &input,
+                bytes.len() as u64,
+                &format!("{:x}", Sha256::digest(&bytes)),
+                bytes.len() as u64,
+                Path::new("rocksdb"),
+                limits(),
+                || {
+                    calls += 1;
+                    ensure!(calls < stop_at, "test guard stopped");
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("test guard stopped"));
+            assert_eq!(calls, stop_at);
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        }
     }
 
     #[test]

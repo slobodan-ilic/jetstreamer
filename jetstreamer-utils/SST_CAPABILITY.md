@@ -107,6 +107,22 @@ source completeness/live state. A real census still requires a persistent bounde
 caller, immutable generation binding, fresh CPU/RAM/I/O admission and durable
 receipts. The library tests do not constitute a census of the real epoch141 input.
 
+`jetstreamer-epoch141-ledger-census` is the private offline runner for that census
+only. It requires independently supplied executable, immutable plan and fresh
+admission-receipt hashes. It binds the exact successful compressed-source
+verification, retained inode/ctime identity, fixed generation/length/digest, and
+an admission manifest/receipt whose file census names this exact executable.
+Admission must be no older than 300 seconds at start. It does not call GCloud or
+download anything. Its protected free-space threshold cannot be lower than the
+source verifier's original threshold; the guard checks at least once per second
+of input consumption, plus before and after the scan. A persistent service must
+also enforce its own wall-time, CPU, memory and I/O limits because a read callback
+cannot interrupt a blocked syscall. All decompressed members are discarded after
+hashing. Only complete decoder/tar EOF and unchanged input identity permit the
+root-private fsynced no-clobber result. `--check-only` tests local bindings without
+scanning or writing. This source alone does not prove an operational deployment,
+real census, source completeness, native liveness, PoH recovery or publication.
+
 The native crash-shaped fixture also compares direct-tar and digest-bound
 multistream-bzip2 collections byte-for-byte, then performs the complete-CF native
 read-only resolution against the compressed collection. It checks live-file
