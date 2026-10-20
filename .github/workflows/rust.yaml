@@ -28,6 +28,10 @@ jobs:
             examples: true
           # Node qualification modes are intentionally mutually exclusive.
           # Exercise every mode independently instead of disabling their guards.
+          - name: node-epoch140-native-restore
+            scope: "-p jetstreamer-node"
+            flags: "--features epoch140-native-restore-diagnostic"
+            examples: false
           - name: all-compatible-features
             scope: "--workspace --exclude jetstreamer-node"
             flags: "--all-features"
