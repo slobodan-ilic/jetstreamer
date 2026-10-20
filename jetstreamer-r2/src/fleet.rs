@@ -806,6 +806,13 @@ fn status_matches(
         && producer["NRestarts"] == "0"
 }
 
+fn production_status_binding_matches(owner_matches: bool, state: &str) -> bool {
+    // A live private qualification can own an old status receipt without
+    // claiming an archive that is eligible for production publication.
+    // This distinction is display evidence only, never deletion authority.
+    owner_matches && matches!(state, "live-replay" | "post-replay-pipeline")
+}
+
 fn validate_output_destination(path: &Path) -> Result<&Path> {
     ensure!(path.is_absolute(), "fleet output must be absolute");
     let parent = path.parent().context("fleet output has no parent")?;
@@ -1225,7 +1232,8 @@ pub(super) async fn run() -> Result<()> {
                     })
                 }
             });
-            json!({"key":key,"etag":object.etag,"payload":status,"sha256":hex_lower(&Sha256::digest(&object.bytes)),"classification":if matches {"bound-live-status"} else {"stale-or-orphaned"},"sample_matches_observer":status.sampled_at_utc == sample,"current_eta_valid":matches && status.sampled_at_utc == sample && state != "remote-ready"})
+            let production_matches = production_status_binding_matches(matches, state);
+            json!({"key":key,"etag":object.etag,"payload":status,"sha256":hex_lower(&Sha256::digest(&object.bytes)),"classification":if production_matches {"bound-live-status"} else {"stale-or-orphaned"},"owner_binding_matches":matches,"production_claim_eligible":matches!(state,"live-replay"|"post-replay-pipeline"),"sample_matches_observer":status.sampled_at_utc == sample,"current_eta_valid":production_matches && status.sampled_at_utc == sample})
         } else {
             Value::Null
         };
@@ -1253,6 +1261,28 @@ pub(super) async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_qualification_owner_cannot_make_a_production_countdown_valid() {
+        assert!(production_status_binding_matches(true, "live-replay"));
+        assert!(production_status_binding_matches(
+            true,
+            "post-replay-pipeline"
+        ));
+        assert!(!production_status_binding_matches(false, "live-replay"));
+        for state in [
+            "blocked-qualification",
+            "failed-needs-repair",
+            "staged-admissible",
+            "not-yet-staged",
+            "remote-ready",
+        ] {
+            assert!(
+                !production_status_binding_matches(true, state),
+                "accepted status for {state}"
+            );
+        }
+    }
+
     fn epoch154_guard_properties() -> Value {
         json!({
             "Id":EPOCH154_SAFETY_GUARD,"LoadState":"loaded","Type":"oneshot",

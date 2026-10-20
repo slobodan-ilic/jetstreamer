@@ -43,3 +43,10 @@ independent ready-pair or terminal-ownership gates.
 Use this path within the existing 30-minute observation cycle, not as another
 poll loop. A completion or authenticated handoff is a lifecycle event; an old
 ETA is never evidence that a delivery stage remains live.
+
+Fleet status classification distinguishes live receipt ownership from an actual
+production claim. A private qualification may still own an old status receipt,
+but that does not make its production countdown valid. `owner_binding_matches`
+records ownership separately from `production_claim_eligible` and ETA freshness.
+This classification grants no deletion authority: a live diagnostic owner must
+not be passed off as terminal to use inactive-owner cleanup.
