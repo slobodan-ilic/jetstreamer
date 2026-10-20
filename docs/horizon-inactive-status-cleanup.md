@@ -37,6 +37,10 @@ ID, the narrow profile additionally requires the root manager journal's latest
 lifecycle to name the exact original invocation and contain its completed stop
 after its last start. That journal proof is retained in the census receipt;
 empty identity alone never establishes ownership or terminal success.
+The full census accepts canonical systemd `\xHH` escaped service names and
+checks pre/start/post commands. A valid stop-only service with no start command
+is inert only with an explicit zero-PID terminal or active/exited state; a
+missing command for a live process remains a failed observation.
 
 `--check-only` authenticates remote status bytes/ETag, checks current archive
 inventory and multipart transfers, and performs the local census without writing
