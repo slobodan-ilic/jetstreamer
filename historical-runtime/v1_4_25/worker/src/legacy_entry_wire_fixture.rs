@@ -75,3 +75,54 @@ fn pinned_sdk_legacy_entry_wire_and_signature_merkle_fixture() {
     );
     println!("legacy_entry_fixture_signature_merkle={:?}", root.as_ref());
 }
+
+#[test]
+fn pinned_sdk_gap_poh_chain_fixture() {
+    use solana_sdk::hash::{hash, hashv};
+    // Mirror pinned Entry::next_hash with the SDK's own SHA implementation,
+    // independently of the modern diagnostic verifier. The signature mixin is
+    // synthetic; real signature Merkle serialization is tested separately above.
+    let mut current = Hash::new(&[9; 32]);
+    current = hashv(&[current.as_ref(), &[4; 32]]);
+    let mut ticks = 0;
+    for count in &[2, 3, 3, 3, 3, 3] {
+        for _ in 0..*count {
+            current = hash(current.as_ref());
+        }
+        ticks += 1;
+        if ticks % 2 == 0 {
+            println!(
+                "gap_poh_fixture_boundary_{}={:?}",
+                ticks / 2,
+                current.as_ref()
+            );
+        }
+    }
+    let metadata = bincode::serialize(&(
+        60912004_u64,
+        4_u64,
+        4_u64,
+        123_u64,
+        3_u64,
+        60911999_u64,
+        vec![60912007_u64, 60912005_u64],
+        true,
+        vec![1_u32, 3_u32],
+    ))
+    .unwrap();
+    println!(
+        "gap_slotmeta_fixture_sha256={:x}",
+        Sha256::digest(&metadata)
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&metadata)),
+        "6b2bcca69ee61a560e719e0e58456ac5907e8e24c90434b90e9f8e12b25f6ec7"
+    );
+    assert_eq!(
+        current.as_ref(),
+        &[
+            58, 40, 67, 136, 158, 227, 136, 110, 69, 22, 232, 71, 238, 213, 223, 56, 55, 20, 78,
+            47, 7, 118, 245, 63, 122, 188, 207, 169, 9, 140, 123, 212,
+        ][..]
+    );
+}

@@ -1308,7 +1308,33 @@ mod tests {
         let exe = root.join("historical-worker");
         fs::copy("/bin/sleep", &exe).unwrap();
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o555)).unwrap();
-        let child = Owned(Command::new(&exe).arg("20").spawn().unwrap());
+        let mut child = Owned(Command::new(&exe).arg("20").spawn().unwrap());
+        // spawn() synchronizes exec error reporting, not this fixture's /proc
+        // executable/map observations. Establish those prerequisites separately;
+        // do not retry the guard under test or relax its zero-worker behavior.
+        let proc_path = Path::new("/proc").join(child.0.id().to_string());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "fixture exited before readiness"
+            );
+            let actual_exe = fs::read_link(proc_path.join("exe"));
+            let maps = fs::read_to_string(proc_path.join("maps"));
+            if actual_exe.as_ref().is_ok_and(|path| path == &exe)
+                && maps.as_ref().is_ok_and(|text| {
+                    text.lines()
+                        .any(|line| line.split_whitespace().last() == exe.to_str())
+                })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "copied-worker fixture never became observable: exe={actual_exe:?}, maps={maps:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let cg = t.path().join("actual");
         fs::create_dir(&cg).unwrap();
         fs::write(cg.join("cgroup.procs"), b"").unwrap();

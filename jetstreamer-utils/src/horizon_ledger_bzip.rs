@@ -109,6 +109,33 @@ pub fn collect_bound_bzip2(
     destination: &Path,
     limits: CollectionLimits,
 ) -> Result<BoundBzipCollection> {
+    collect_bound_bzip2_guarded(
+        input,
+        expected_bytes,
+        expected_sha256,
+        maximum_compressed_bytes,
+        archive_root,
+        destination,
+        limits,
+        || Ok(()),
+    )
+}
+
+/// Retain every member with the same input-read guard as the complete census.
+/// Partial output is preserved on any failure, never a successful collection.
+/// A persistent caller still owes fresh full-peak admission and independent
+/// wall-time/memory limits; the callback cannot interrupt a blocked syscall.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_bound_bzip2_guarded(
+    input: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    maximum_compressed_bytes: u64,
+    archive_root: &Path,
+    destination: &Path,
+    limits: CollectionLimits,
+    guard: impl FnMut() -> Result<()>,
+) -> Result<BoundBzipCollection> {
     inspect_bound_bzip2(
         input,
         expected_bytes,
@@ -117,7 +144,7 @@ pub fn collect_bound_bzip2(
         archive_root,
         Some(destination),
         limits,
-        || Ok(()),
+        guard,
     )
 }
 
@@ -396,6 +423,61 @@ mod tests {
         retained["collection"]["files_retained"] = false.into();
         assert_eq!(serde_json::to_value(measured).unwrap(), retained);
         assert_eq!(fs::read(&input).unwrap(), bytes);
+    }
+
+    #[test]
+    fn guarded_retention_preserves_input_and_fails_without_a_success_result() {
+        let bytes = compress(&tar_bytes());
+        let root = tempfile::tempdir().unwrap();
+        let input = install(root.path(), &bytes);
+        let output = tempfile::tempdir().unwrap();
+        fs::set_permissions(output.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut complete_calls = 0;
+        let result = collect_bound_bzip2_guarded(
+            &input,
+            bytes.len() as u64,
+            &format!("{:x}", Sha256::digest(&bytes)),
+            bytes.len() as u64,
+            Path::new("rocksdb"),
+            output.path(),
+            limits(),
+            || {
+                complete_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(result.collection.files_retained);
+        assert!(complete_calls >= 4);
+        for stop_at in 1..=complete_calls {
+            let destination = tempfile::tempdir().unwrap();
+            fs::set_permissions(destination.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let mut calls = 0;
+            let error = collect_bound_bzip2_guarded(
+                &input,
+                bytes.len() as u64,
+                &format!("{:x}", Sha256::digest(&bytes)),
+                bytes.len() as u64,
+                Path::new("rocksdb"),
+                destination.path(),
+                limits(),
+                || {
+                    calls += 1;
+                    ensure!(calls < stop_at, "retention guard stop");
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("retention guard stop"));
+            assert_eq!(calls, stop_at);
+            assert_eq!(fs::read(&input).unwrap(), bytes);
+            if stop_at == complete_calls {
+                // Even a complete private file tree is not a successful result
+                // when the final guard fails. Never silently discard it.
+                assert_eq!(fs::read_dir(destination.path()).unwrap().count(), 4);
+                assert!(collect(&input, &bytes, destination.path()).is_err());
+            }
+        }
     }
 
     #[test]

@@ -17,6 +17,120 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const DATA_COMPLETE: u8 = 0x40;
 const LAST_IN_SLOT: u8 = 0x80;
 
+/// Bounded complete-slot metadata decoded with the pinned v1.4.25 layout.
+/// Its provenance and logical native-state resolution remain caller obligations.
+#[derive(Debug, Eq, PartialEq)]
+pub struct DiagnosticSlotMeta {
+    /// Exact independently expected slot.
+    pub slot: u64,
+    /// Exact independently expected finalized parent.
+    pub parent_slot: u64,
+    /// Last data-shred index; all indexes zero through this value are owed.
+    pub last_index: u32,
+    /// Sorted data-complete endpoints, including the final data shred.
+    pub completed_data_indexes: Vec<u32>,
+    /// Recorded connectivity bit, not independently authenticated ancestry.
+    pub is_connected: bool,
+}
+
+/// Decode the entire fixed-int SlotMeta record, rejecting partial or trailing data.
+///
+/// Layout source: ledger/src/blockstore_meta.rs at revision893cc764, SHA256
+/// `25e29134699e586f626a56b79e507c4e0b1e92b21d47684841cdd727abc80ba7`.
+/// Require a known terminal index, fully consumed/received contiguous data range,
+/// bounded unique child slots, and strictly ordered completed-data endpoints.
+/// This is a stricter diagnostic complete-slot profile, not a runtime behavior
+/// change, native liveness proof, signature verification or publication gate.
+pub fn decode_v1_4_25_complete_slot_meta(
+    bytes: &[u8],
+    expected_slot: u64,
+    expected_parent: u64,
+) -> Result<DiagnosticSlotMeta, String> {
+    struct Reader<'a> {
+        bytes: &'a [u8],
+        position: usize,
+    }
+    impl Reader<'_> {
+        fn take(&mut self, n: usize) -> Result<&[u8], String> {
+            let end = self
+                .position
+                .checked_add(n)
+                .ok_or("SlotMeta offset overflow")?;
+            let value = self
+                .bytes
+                .get(self.position..end)
+                .ok_or("truncated SlotMeta")?;
+            self.position = end;
+            Ok(value)
+        }
+        fn integer(&mut self) -> Result<u64, String> {
+            Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        }
+        fn count(&mut self) -> Result<usize, String> {
+            let n = self.integer()?;
+            if n > MAX_SHREDS as u64 {
+                return Err("SlotMeta vector bound exceeded".into());
+            }
+            Ok(n as usize)
+        }
+    }
+    if bytes.len() > 1024 * 1024
+        || expected_slot
+            .checked_sub(expected_parent)
+            .is_none_or(|n| n == 0 || n > u16::MAX as u64)
+    {
+        return Err("invalid SlotMeta scope or size".into());
+    }
+    let mut reader = Reader { bytes, position: 0 };
+    let slot = reader.integer()?;
+    let consumed = reader.integer()?;
+    let received = reader.integer()?;
+    reader.integer()?; // first_shred_timestamp, not an authenticity clock.
+    let last = reader.integer()?;
+    let parent_slot = reader.integer()?;
+    if slot != expected_slot
+        || parent_slot != expected_parent
+        || last >= MAX_SHREDS as u64
+        || consumed != last + 1
+        || received != consumed
+    {
+        return Err("incomplete or mismatching SlotMeta range".into());
+    }
+    let children = reader.count()?;
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..children {
+        let child = reader.integer()?;
+        if child <= slot || !seen.insert(child) {
+            return Err("invalid/duplicate SlotMeta child".into());
+        }
+    }
+    let is_connected = match reader.take(1)?[0] {
+        0 => false,
+        1 => true,
+        _ => return Err("invalid SlotMeta boolean".into()),
+    };
+    let count = reader.count()?;
+    let mut completed_data_indexes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let index = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if u64::from(index) > last || completed_data_indexes.last().is_some_and(|p| *p >= index) {
+            return Err("invalid SlotMeta completed-data endpoints".into());
+        }
+        completed_data_indexes.push(index);
+    }
+    if reader.position != bytes.len() || completed_data_indexes.last().copied() != Some(last as u32)
+    {
+        return Err("incomplete or trailing SlotMeta record".into());
+    }
+    Ok(DiagnosticSlotMeta {
+        slot,
+        parent_slot,
+        last_index: last as u32,
+        completed_data_indexes,
+        is_connected,
+    })
+}
+
 /// One complete serialized entry-vector batch, including historical padding.
 #[derive(Debug, Eq, PartialEq)]
 pub struct PaddedEntryBatch {
@@ -123,10 +237,100 @@ pub fn assemble_v1_4_25_padded_batches(
     Ok(batches)
 }
 
+/// Bind assembled batches to a complete connected SlotMeta and all data endpoints.
+/// The caller still owes authenticated native source state and canonical PoH gates.
+pub fn assemble_v1_4_25_slot_from_meta(
+    meta: &DiagnosticSlotMeta,
+    shreds: &[&[u8]],
+) -> Result<Vec<PaddedEntryBatch>, String> {
+    if !meta.is_connected {
+        return Err("SlotMeta ancestry is not recorded connected".into());
+    }
+    let batches =
+        assemble_v1_4_25_padded_batches(meta.slot, meta.parent_slot, meta.last_index, shreds)?;
+    if batches.iter().map(|b| b.last_index).collect::<Vec<_>>() != meta.completed_data_indexes {
+        return Err("assembled endpoints differ from complete SlotMeta".into());
+    }
+    Ok(batches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bincode::Options;
+    use sha2::Digest;
+
+    fn metadata(
+        consumed: u64,
+        received: u64,
+        last: u64,
+        children: Vec<u64>,
+        completed: Vec<u32>,
+    ) -> Vec<u8> {
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .serialize(&(
+                60912004_u64,
+                consumed,
+                received,
+                123_u64,
+                last,
+                60911999_u64,
+                children,
+                true,
+                completed,
+            ))
+            .unwrap()
+    }
+
+    #[test]
+    fn bounded_complete_slot_metadata_matches_fixed_integer_layout() {
+        let bytes = metadata(4, 4, 3, vec![60912007, 60912005], vec![1, 3]);
+        // Independent pinned SDK/bincode1.3.1 golden from its Rust1.46 workspace.
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&bytes)),
+            "6b2bcca69ee61a560e719e0e58456ac5907e8e24c90434b90e9f8e12b25f6ec7"
+        );
+        let meta = decode_v1_4_25_complete_slot_meta(&bytes, 60912004, 60911999).unwrap();
+        assert_eq!(meta.last_index, 3);
+        assert_eq!(meta.completed_data_indexes, [1, 3]);
+        assert!(meta.is_connected);
+        for end in 0..bytes.len() {
+            assert!(decode_v1_4_25_complete_slot_meta(&bytes[..end], 60912004, 60911999).is_err());
+        }
+        let mut extra = bytes;
+        extra.push(0);
+        assert!(decode_v1_4_25_complete_slot_meta(&extra, 60912004, 60911999).is_err());
+    }
+
+    #[test]
+    fn metadata_rejects_partial_ranges_bad_endpoints_and_unbounded_vectors() {
+        for bad in [
+            metadata(3, 4, 3, vec![], vec![3]),
+            metadata(4, 5, 3, vec![], vec![3]),
+            metadata(0, 0, u64::MAX, vec![], vec![]),
+            metadata(4, 4, 3, vec![], vec![1, 1, 3]),
+            metadata(4, 4, 3, vec![], vec![1]),
+            metadata(4, 4, 3, vec![60912005, 60912005], vec![3]),
+            metadata(4, 4, 3, vec![60912004], vec![3]),
+        ] {
+            assert!(decode_v1_4_25_complete_slot_meta(&bad, 60912004, 60911999).is_err());
+        }
+        let mut bad = metadata(4, 4, 3, vec![], vec![3]);
+        bad[48..56].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode_v1_4_25_complete_slot_meta(&bad, 60912004, 60911999).is_err());
+        let mut bad = metadata(4, 4, 3, vec![], vec![3]);
+        bad[56] = 2;
+        assert!(decode_v1_4_25_complete_slot_meta(&bad, 60912004, 60911999).is_err());
+        assert!(
+            decode_v1_4_25_complete_slot_meta(
+                &metadata(4, 4, 3, vec![], vec![3]),
+                60912004,
+                60911998
+            )
+            .is_err()
+        );
+    }
 
     fn shred(index: u32, flags: u8, size: u16) -> Vec<u8> {
         // Fixed-int bincode field order of Signature + ShredCommonHeader +
@@ -183,6 +387,28 @@ mod tests {
         assert_eq!(batches[0].last_index, 0);
         assert_eq!(batches[1].first_index, 1);
         assert_eq!(batches[1].bytes.len(), DATA_BYTES);
+    }
+
+    #[test]
+    fn assembled_slot_must_match_metadata_connectivity_and_every_endpoint() {
+        let bytes = [shred(0, 0, 1139), shred(1, LAST_IN_SLOT, 1139)];
+        let refs: Vec<_> = bytes.iter().map(Vec::as_slice).collect();
+        let mut meta = DiagnosticSlotMeta {
+            slot: 60912004,
+            parent_slot: 60912001,
+            last_index: 1,
+            completed_data_indexes: vec![1],
+            is_connected: true,
+        };
+        assert_eq!(
+            assemble_v1_4_25_slot_from_meta(&meta, &refs).unwrap().len(),
+            1
+        );
+        meta.completed_data_indexes = vec![0, 1];
+        assert!(assemble_v1_4_25_slot_from_meta(&meta, &refs).is_err());
+        meta.completed_data_indexes = vec![1];
+        meta.is_connected = false;
+        assert!(assemble_v1_4_25_slot_from_meta(&meta, &refs).is_err());
     }
 
     #[test]

@@ -13,11 +13,18 @@ pub mod horizon_legacy_shred;
 /// Bounded diagnostic decoding of pinned Solana v1.4.25 entry batches.
 pub mod horizon_legacy_entry;
 
+/// Bounded diagnostic verification of pinned legacy entry/tick/PoH chains.
+pub mod horizon_legacy_poh;
+
 /// Bounded diagnostic collection of a complete flat RocksDB tar file set.
 pub mod horizon_ledger_tar;
 
 /// Digest-bound diagnostic collection of a retained bzip2 RocksDB tar.
 pub mod horizon_ledger_bzip;
+
+/// Optional, diagnostic complete-census native RocksDB resolution, not source completeness.
+#[cfg(feature = "sst-capability-tests")]
+pub mod horizon_ledger_native;
 
 /// Re-exported ClickHouse utility types and functions.
 pub use clickhouse::{

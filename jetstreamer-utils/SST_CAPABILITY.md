@@ -123,11 +123,59 @@ root-private fsynced no-clobber result. `--check-only` tests local bindings with
 scanning or writing. This source alone does not prove an operational deployment,
 real census, source completeness, native liveness, PoH recovery or publication.
 
+`jetstreamer-epoch141-ledger-collect` is a separate fixed full-retention profile
+sharing the census executable's source, admission, guard and receipt gates.
+It additionally requires a separately hash-bound successful **complete** census
+of the same frozen compressed inode and source verification. Its immutable plan
+binds a separate empty root-private same-filesystem destination and an incremental
+peak budget covering every member's rounded allocation plus 64 MiB of slack.
+Fresh admission must cover that entire budget **above** the unchanged protected
+free-space threshold. This scheduling estimate does not equate logical lengths
+with exact physical allocation; the actual-free-space guard remains mandatory.
+
+The collector prehashes and fully decodes the input again, retaining every file
+through the reviewed no-clobber tar core. A result is written only if all names,
+lengths, digests, CURRENT/MANIFEST/WAL bindings and compressed identity match the
+prior complete census exactly (except the explicit `files_retained` bit).
+The census-only executable rejects retention plans; neither executable exposes
+a command-line mode override. Guard failure preserves partial diagnostic output,
+never reuses or deletes it and writes no successful collection receipt.
+
+This source is not an operational deployment or real collection result. Seal and
+qualify the exact executable, run fresh complete admission, and prove its initial
+guard under a persistent bounded non-restarting sandbox before real retention.
+Original-backup completeness, complete actual CF set, native read-only resolution,
+trusted clock and all post-gap PoH/canonical/publication gates remain separate.
+No live sealed census deployment is changed by this source refactor.
+
 The native crash-shaped fixture also compares direct-tar and digest-bound
 multistream-bzip2 collections byte-for-byte, then performs the complete-CF native
 read-only resolution against the compressed collection. It checks live-file
 references, range/point deletions and WAL-only values without modifying either
 the retained compressed input or the collected member census.
+
+With the optional `sst-capability-tests` feature,
+`horizon_ledger_native::resolve_native_candidates` provides a reusable diagnostic
+core for bounded exact-key lookups against a retained complete collection.
+It refuses a census-only result, unknown/omitted column families, missing or extra
+members, writable/linked/mutated inputs, and mismatching CURRENT/MANIFEST/WAL
+bindings. Every member is streamed through SHA-256 before native open and after
+native close; inode/ctime identities must also remain unchanged across the entire
+resolution. Native manifest live-SST references must match the retained census's
+names and lengths. Read checksum verification is explicit. Native logs go only
+to a separate empty private directory. Each requested value is bounded before
+copying the pinned native slice into the aggregate bounded result.
+
+This core preserves the distinction between diagnostic candidates and trusted
+source state: it always denies original-backup completeness, historical live-state
+and publication authority, even when the native read succeeds. Its caller must
+independently authenticate the census, qualify the expected complete family set,
+admit and guard full retention/native memory/I/O/runtime, decode SlotMeta/shreds,
+and validate complete entry/tick/PoH chains plus canonical anchors. There is no
+operational native recovery caller yet. The native fixture exercises this core
+against an entire collected crash-shaped database, including outside-prefix range
+deletion, point deletion, updated WAL and WAL-only values, and rejects an omitted
+family allowlist. These remain disposable-fixture tests, not epoch141 evidence.
 
 `jetstreamer-epoch141-ledger-metadata` is a separate, read-only exact-generation
 gate for `60911751/rocksdb.tar.bz2#1634789748052739` in the regional ledger
@@ -232,3 +280,32 @@ wire bytes with that SDK's actual Transaction/Message serialization and MerkleTr
 Run it from `historical-runtime/v1_4_25` with its pinned compiler and bounded build
 jobs. Neither that synthetic fixture nor the modern decoder tests qualify a real
 ledger, the upstream full Entry implementation, or a runtime route.
+
+`horizon_legacy_shred::decode_v1_4_25_complete_slot_meta` bounds and decodes the
+entire pinned fixed-int SlotMeta record, including both vector lengths, the
+boolean, children and every completed-data endpoint. It rejects trailing or
+partial records, unknown terminal indexes, noncontiguous consumed/received
+ranges, oversized vectors and duplicate/invalid endpoints. Its complete-slot
+profile is deliberately stricter than upstream `SlotMeta::is_full`: it also
+rejects received data beyond the terminal range. The assembly wrapper requires
+recorded connectivity and exact agreement between metadata and all assembled
+batch endpoints. This proves parsing/binding only, not metadata provenance.
+
+`horizon_legacy_poh::verify_v1_4_25_poh_chain` verifies each ordered decoded entry
+from an independently supplied parent hash, carrying tick work across batch
+boundaries. It executes the pinned ordinary-SHA/signature-root mixin semantics,
+checks every tick's exact work, extracts every hidden/final slot-ending hash at
+trusted tick ordinals and requires the independently supplied visible final hash.
+It rejects incomplete/extra work, zero-work entries, disabled hashing, wrong
+clock/scope/shape, reordered/corrupt chains and repeated boundary hashes. Hash
+work is bounded before execution; a caller guard also runs within long entries.
+Independent bounded execution and authenticated clock/parent/final inputs remain
+caller obligations. It never infers missing boundaries, uses Bank hashes as PoH
+hashes, or grants source, runtime or publication authority.
+
+Tests cover the complete synthetic metadata→shred→entry→PoH path and a tampered
+entry. The pinned Rust1.46 v1.4.25 SDK `hash`/`hashv` fixture independently supplies
+three golden boundary hashes and a bincode1.3.1 SlotMeta wire digest, asserted by
+the modern decoders. These are synthetic SDK primitive/layout checks, **not** a
+real-ledger run, upstream full Entry-crate qualification, recovered epoch141
+boundaries or canonical checkpoint/plugin/publication evidence.
