@@ -51,6 +51,30 @@ pinned historical layout, complete ordered entry/tick chain, independently
 finalized parent and final PoH hashes, and ordinary checkpoint/plugin/publication
 gates have all passed. Do not equate PoH hashes with Bank or SlotHashes hashes.
 
+`horizon_ledger_tar::collect_rocksdb_tar` is the bounded diagnostic collection
+core for a complete **flat** RocksDB tar. It retains every regular member, not
+only selected SSTs: CURRENT, its nonempty MANIFEST, all archived WALs, all table
+files, OPTIONS and ancillary files appear in a sorted length/SHA-256 census.
+The caller explicitly supplies the archive root and independent file-count,
+individual-file, total-output and zero-trailer limits. Unknown members are
+preserved; links, devices, sparse/GNU/PAX extensions, nested/foreign paths,
+duplicates, missing end markers and nonzero/excess trailers fail closed. New
+files are no-clobber, read-only and individually fsynced, followed by directory
+fsync. A failed partial tree is preserved and cannot be reused as a completed
+collection.
+
+This core accepts an already decompressed reader. It has **no production caller**
+and does not authenticate a compressed cloud generation, bind an original
+backup's completeness, provide a resumable download or perform fresh resource
+admission. Those remain mandatory before actual ledger collection. Its result
+explicitly denies source-completeness, live-state and publication authority.
+The native read-only fixture test above also collects an entire crash-shaped
+database tar, compares every source member byte-for-byte, verifies all native
+CF/live-file references against the census, resolves outside-prefix range and
+point deletions plus WAL-only updates, and rehashes every collected input after
+native resolution. This is disposable-fixture qualification only, never evidence
+for epoch141 or any real ledger generation.
+
 `horizon_legacy_shred::assemble_v1_4_25_padded_batches` provides bounded,
 diagnostic-only data-shred assembly for revision
 `893cc7647248a3536fb6e6d0b5e51c71446b862d`. It requires a complete contiguous
