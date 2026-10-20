@@ -130,7 +130,8 @@ fn unchanged(path: &Path, file: &File, before: &Identity) -> Result<()> {
 }
 
 fn measure(path: &Path, root_only: bool) -> Result<(String, Identity)> {
-    let mut file = open_file(path, root_only)?;
+    let mut file = open_file(path, root_only)
+        .with_context(|| format!("open bound file {}", path.display()))?;
     let before = identity(&file.metadata()?);
     let digest = hash_open(&mut file)?;
     unchanged(path, &file, &before)?;
@@ -276,6 +277,15 @@ fn validate_terminal(text: &str) -> Result<()> {
         "producer not clean terminal: ExecMainCode"
     );
     ensure!(
+        fields.get("LoadState") == Some(&"loaded")
+            || (fields.get("LoadState") == Some(&"not-found")
+                && fields.get("ExecMainCode") == Some(&"0")
+                && fields.get("InvocationID") == Some(&"")
+                && fields.get("ActiveState") == Some(&"inactive")
+                && fields.get("SubState") == Some(&"dead")),
+        "invalid producer load state"
+    );
+    ensure!(
         matches!(
             fields.get("ActiveState"),
             Some(&"inactive") | Some(&"active")
@@ -332,7 +342,7 @@ fn validate_terminal_journal(bytes: &[u8]) -> Result<Value> {
 }
 
 fn terminal() -> Result<Value> {
-    let output = Command::new("/usr/bin/systemctl").args(["show", UNIT, "--property=InvocationID,MainPID,NRestarts,Restart,Result,ExecMainStatus,ExecMainCode,ActiveState,SubState"]).output()?;
+    let output = Command::new("/usr/bin/systemctl").args(["show", UNIT, "--property=LoadState,InvocationID,MainPID,NRestarts,Restart,Result,ExecMainStatus,ExecMainCode,ActiveState,SubState"]).output()?;
     ensure!(output.status.success(), "service observation failed");
     let text = String::from_utf8(output.stdout)?;
     validate_terminal(&text)?;
@@ -641,13 +651,20 @@ mod tests {
     #[test]
     fn terminal_identity_and_exit_are_mandatory() {
         let good = format!(
-            "InvocationID={INVOCATION}\nMainPID=0\nNRestarts=0\nRestart=no\nResult=success\nExecMainStatus=0\nExecMainCode=1\nActiveState=inactive\nSubState=dead\n"
+            "LoadState=loaded\nInvocationID={INVOCATION}\nMainPID=0\nNRestarts=0\nRestart=no\nResult=success\nExecMainStatus=0\nExecMainCode=1\nActiveState=inactive\nSubState=dead\n"
         );
         validate_terminal(&good).unwrap();
         let cleared = good
             .replace(INVOCATION, "")
             .replace("ExecMainCode=1", "ExecMainCode=0");
         validate_terminal(&cleared).unwrap();
+        validate_terminal(&cleared.replace("LoadState=loaded", "LoadState=not-found")).unwrap();
+        assert!(
+            validate_terminal(&good.replace("LoadState=loaded", "LoadState=not-found")).is_err()
+        );
+        assert!(
+            validate_terminal(&cleared.replace("LoadState=loaded", "LoadState=error")).is_err()
+        );
         let original_invocation = format!("InvocationID={INVOCATION}");
         for (old, new) in [
             ("InvocationID=", original_invocation.as_str()),
