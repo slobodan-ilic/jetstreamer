@@ -41,6 +41,7 @@ struct Arguments {
     archive: PathBuf,
     output: PathBuf,
     hash_source: bool,
+    inspect_slot: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,6 +212,8 @@ struct EpochEvidence {
     source_identity: SourceIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
     whole_source_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inspected_slot: Option<InspectedSlot>,
     runtime_profile: String,
     parent_recorded_worker_executable_sha256: String,
     output_start_slot: u64,
@@ -295,6 +298,19 @@ struct TerminalWriteCounts {
 }
 
 #[derive(Debug, Serialize)]
+struct InspectedSlot {
+    slot: u64,
+    kind: &'static str,
+    observed_blockhash: Option<String>,
+    observed_first_write_version: Option<u64>,
+    observed_next_write_version: Option<u64>,
+    observed_write_counts: TerminalWriteCounts,
+    checkpoint_drained_write_interpretation_qualified: bool,
+    complete_prefix_verified: bool,
+    native_consensus_comparison_passed: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct Evidence {
     schema: &'static str,
     evidence_scope: &'static str,
@@ -306,17 +322,32 @@ struct Evidence {
 }
 
 fn usage(program: &str) -> String {
-    format!("usage: {program} <archive.jet> --output <private-evidence.json> [--hash-source]")
+    format!(
+        "usage: {program} <archive.jet> --output <private-evidence.json> [--hash-source [--inspect-slot SLOT]]"
+    )
 }
 
 fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Arguments, String> {
     let mut archive = None;
     let mut output = None;
     let mut hash_source = false;
+    let mut inspect_slot = None;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--hash-source" if !hash_source => hash_source = true,
+            "--inspect-slot" if inspect_slot.is_none() => {
+                let text = arguments
+                    .next()
+                    .ok_or_else(|| "--inspect-slot requires a slot".to_string())?;
+                let slot = text
+                    .parse::<u64>()
+                    .map_err(|_| "invalid inspection slot".to_string())?;
+                if slot.to_string() != text {
+                    return Err("inspection slot must be canonical u64".to_string());
+                }
+                inspect_slot = Some(slot);
+            }
             "--output" if output.is_none() => {
                 output = Some(
                     arguments
@@ -332,10 +363,14 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
             _ => return Err("only one archive path is accepted".to_string()),
         }
     }
+    if inspect_slot.is_some() && !hash_source {
+        return Err("slot inspection requires --hash-source".to_string());
+    }
     Ok(Arguments {
         archive: archive.ok_or_else(|| "missing archive path".to_string())?,
         output: output.ok_or_else(|| "missing --output path".to_string())?,
         hash_source,
+        inspect_slot,
     })
 }
 
@@ -361,6 +396,57 @@ fn read_bucket(path: &Path, index: usize) -> Result<EdgeVisitor, String> {
         .read_bucket(index, &mut visitor)
         .map_err(|error| format!("failed to decode bucket {index}: {error}"))?;
     visitor.finish()
+}
+
+fn inspected_slot(visitor: EdgeVisitor, requested: u64) -> Result<InspectedSlot, String> {
+    let visitor = visitor.finish()?;
+    let terminal = visitor
+        .terminal
+        .ok_or_else(|| "inspection has no terminal slot".to_string())?;
+    if terminal.slot != requested {
+        return Err("inspection returned the wrong slot".to_string());
+    }
+    let next = visitor
+        .last_write
+        .map(|v| {
+            v.checked_add(1)
+                .ok_or_else(|| "inspection write cursor overflows".to_string())
+        })
+        .transpose()?;
+    Ok(InspectedSlot {
+        slot: requested,
+        kind: if terminal.kind == SlotKind::Block {
+            "block"
+        } else {
+            "skipped"
+        },
+        observed_blockhash: terminal.blockhash.map(|h| h.to_string()),
+        observed_first_write_version: visitor.first_write,
+        observed_next_write_version: next,
+        observed_write_counts: TerminalWriteCounts {
+            pre: terminal.pre_write_count,
+            transaction: terminal.transaction_write_count,
+            post: terminal.post_write_count,
+        },
+        checkpoint_drained_write_interpretation_qualified: false,
+        complete_prefix_verified: false,
+        native_consensus_comparison_passed: false,
+    })
+}
+
+fn read_inspected_slot(path: &Path, slot: u64) -> Result<InspectedSlot, String> {
+    let file = open_regular_nofollow(path).map_err(|e| format!("inspection open failed: {e}"))?;
+    let mut reader = ArchiveReader::open(BufReader::with_capacity(16 << 20, file))
+        .map_err(|e| format!("inspection reader failed: {e}"))?;
+    reader.verify_chain = true;
+    let mut visitor = EdgeVisitor::default();
+    let count = reader
+        .read_slots(slot, 1, &mut visitor)
+        .map_err(|e| format!("inspection decode failed: {e}"))?;
+    if count != 1 {
+        return Err("inspection did not decode exactly one slot".to_string());
+    }
+    inspected_slot(visitor, slot)
 }
 
 fn collect(arguments: &Arguments) -> Result<Evidence, String> {
@@ -463,6 +549,14 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
     if first_write >= terminal_next_write {
         return Err("archive write-version edge range is empty or inverted".to_string());
     }
+    let inspected_slot = if let Some(slot) = arguments.inspect_slot {
+        if slot < header.slot_start || slot > expected_terminal {
+            return Err("inspection slot lies outside the source archive".to_string());
+        }
+        Some(read_inspected_slot(&archive, slot)?)
+    } else {
+        None
+    };
     if !path_matches_archive_identity(&archive, identity)
         .map_err(|error| format!("failed to recheck {}: {error}", archive.display()))?
     {
@@ -477,6 +571,7 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
             archive_bytes,
             source_identity: SourceIdentity::from(&metadata),
             whole_source_sha256,
+            inspected_slot,
             runtime_profile,
             parent_recorded_worker_executable_sha256,
             output_start_slot: header.slot_start,
@@ -637,6 +732,7 @@ mod tests {
                 archive: "/private/epoch-151.jet".into(),
                 output: "/private/edge.json".into(),
                 hash_source: false,
+                inspect_slot: None,
             }
         );
         assert!(parse_arguments(["/private/epoch-151.jet".to_string()]).is_err());
@@ -667,6 +763,67 @@ mod tests {
         let mut repeated = args.map(str::to_owned).to_vec();
         repeated.push("--hash-source".into());
         assert!(parse_arguments(repeated).is_err());
+    }
+
+    #[test]
+    fn inspection_requires_full_source_binding_and_exact_single_u64() {
+        let base = ["/private/epoch-140.jet", "--output", "/private/cut.json"];
+        let args = |tail: &[&str]| {
+            base.into_iter()
+                .chain(tail.iter().copied())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            parse_arguments(args(&["--hash-source", "--inspect-slot", "60911751"]))
+                .unwrap()
+                .inspect_slot,
+            Some(60911751)
+        );
+        for tail in [
+            vec!["--inspect-slot", "60911751"],
+            vec!["--hash-source", "--inspect-slot"],
+            vec!["--hash-source", "--inspect-slot", "-1"],
+            vec!["--hash-source", "--inspect-slot", "060911751"],
+            vec!["--hash-source", "--inspect-slot", "18446744073709551616"],
+            vec![
+                "--hash-source",
+                "--inspect-slot",
+                "1",
+                "--inspect-slot",
+                "2",
+            ],
+        ] {
+            assert!(parse_arguments(args(&tail)).is_err(), "accepted {tail:?}");
+        }
+    }
+
+    #[test]
+    fn inspected_slot_keeps_raw_phase_counts_and_does_not_invent_checkpoint_semantics() {
+        let make = || EdgeVisitor {
+            first_write: Some(100),
+            last_write: Some(109),
+            terminal: Some(TerminalSlot {
+                slot: 42,
+                kind: SlotKind::Block,
+                blockhash: Some(Hash::default()),
+                pre_write_count: 2,
+                transaction_write_count: 5,
+                post_write_count: 3,
+            }),
+            ..EdgeVisitor::default()
+        };
+        let evidence = inspected_slot(make(), 42).unwrap();
+        assert_eq!(evidence.observed_next_write_version, Some(110));
+        assert_eq!(evidence.observed_write_counts.post, 3);
+        assert!(!evidence.checkpoint_drained_write_interpretation_qualified);
+        assert!(!evidence.complete_prefix_verified);
+        assert!(!evidence.native_consensus_comparison_passed);
+        assert!(inspected_slot(make(), 43).is_err());
+        assert!(inspected_slot(EdgeVisitor::default(), 42).is_err());
+        let mut overflow = make();
+        overflow.last_write = Some(u64::MAX);
+        assert!(inspected_slot(overflow, 42).is_err());
     }
 
     #[test]
