@@ -777,6 +777,43 @@ mod tests {
     }
 
     #[test]
+    fn root_import_publication_receipt_is_completion_cleanup_compatible() {
+        let directory = Path::new("/private/receipts");
+        let mut receipt = super::super::tests::status_publication_receipt(206);
+        receipt.schema = PIPELINE_STATUS_RECEIPT_SCHEMA.into();
+        receipt.controller_invocation_id.clear();
+        receipt.producer_invocation_id.clear();
+        receipt.status.phase = "publication".into();
+        let mut importer = binding();
+        importer.unit = "jetstreamer-root-import-horizon-206-cf9b7e9-v1-e206-206-3.service".into();
+        importer.claim_phase = "local-publication".into();
+        receipt.pipeline_binding = Some(importer);
+        let path = status_receipt_path(directory, &receipt.status);
+        assert_eq!(
+            validate_status_publication_receipt_bytes(
+                directory,
+                &path,
+                &serde_json::to_vec(&receipt).unwrap(),
+                "bucket",
+                206
+            )
+            .unwrap(),
+            receipt
+        );
+        receipt.status.phase = "upload".into();
+        assert!(
+            validate_status_publication_receipt_bytes(
+                directory,
+                &path,
+                &serde_json::to_vec(&receipt).unwrap(),
+                "bucket",
+                206
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn scope_rejects_ready_replay_stale_and_unsupported_estimates() {
         let root = tempfile::tempdir().unwrap();
         let jet = root.path().join("epoch-213.jet");
