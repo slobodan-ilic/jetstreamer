@@ -12,6 +12,9 @@ Seal a root-owned plan with schema
 - `fleet`: `{path, sha256}` of the fresh complete-range fleet receipt;
 - `terminal_fleet`: `{path, sha256}` of preserved terminal owner evidence;
 - `publication`: `{path, sha256}` of the owner's latest canonical status receipt;
+- `repair_backlog`: `{path, sha256}` of the matching open
+  `jetstreamer-horizon-open-epoch-repair-v1` record and concrete next action;
+- `public_archive_directory`: the canonical local public archive directory;
 - `status_receipt_directory`: its absolute private receipt directory;
 - `intent` and `completion`: distinct absolute paths in one existing canonical,
   root-owned, owner-only directory;
@@ -37,6 +40,9 @@ the existing coordinated observation, not an additional replay poll.
 The command derives owner identities from the digest-bound publication observer,
 then repeats the complete systemd census, unbound-producer discovery, queued-job
 checks and owner-trigger checks. The census must still equal the bound fleet.
+Canonical local artifacts, a remote pair/staged archive, or an exact-key
+multipart upload block cleanup; reconcile delivery instead. The open repair
+record remains hash-bound in the intent and is never changed by this command.
 It authenticates the exact current status bytes and ETag, fsyncs a no-clobber
 intent, repeats its live-claim checks, and deletes only
 `epoch-N.epoch-status.json` with `If-Match`. It never retries a precondition failure

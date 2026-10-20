@@ -18,6 +18,8 @@ struct Plan {
     fleet: Bound,
     terminal_fleet: Bound,
     publication: Bound,
+    repair_backlog: Bound,
+    public_archive_directory: PathBuf,
     status_receipt_directory: PathBuf,
     intent: PathBuf,
     completion: PathBuf,
@@ -218,6 +220,22 @@ fn owner_units(publication: &StatusPublicationReceipt) -> Result<Vec<(String, St
     ])
 }
 
+pub(super) fn queued_job_units(bytes: &[u8]) -> Result<Vec<&str>> {
+    let mut names = Vec::new();
+    for line in std::str::from_utf8(bytes)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let columns: Vec<_> = line.split_whitespace().collect();
+        ensure!(
+            columns.len() == 4 && columns[0].parse::<u64>().is_ok_and(|id| id > 0),
+            "unrecognized systemctl job table row"
+        );
+        names.push(columns[1]);
+    }
+    Ok(names)
+}
+
 fn no_pending_owner_trigger(name: &str, collected: bool) -> Result<()> {
     if !collected {
         let output = ProcessCommand::new("systemctl")
@@ -239,13 +257,19 @@ fn no_pending_owner_trigger(name: &str, collected: bool) -> Result<()> {
         }
     }
     let jobs = ProcessCommand::new("systemctl")
-        .args(["list-jobs", "--output=json", "--no-pager"])
+        .args([
+            "list-jobs",
+            "--no-legend",
+            "--no-pager",
+            "--plain",
+            "--full",
+        ])
         .output()?;
     ensure!(jobs.status.success(), "cannot inspect queued owner jobs");
-    let jobs: Vec<Value> = serde_json::from_slice(&jobs.stdout)?;
+    let jobs = queued_job_units(&jobs.stdout)?;
     ensure!(
-        !jobs.iter().any(|job| job["unit"] == name
-            || job["unit"].as_str().is_some_and(|unit| [
+        !jobs.iter().any(|unit| *unit == name
+            || [
                 "horizon-controller-",
                 "jetstreamer-root-sweep-",
                 "horizon-qualify-",
@@ -256,7 +280,7 @@ fn no_pending_owner_trigger(name: &str, collected: bool) -> Result<()> {
                 "horizon-recover-"
             ]
             .iter()
-            .any(|prefix| unit.starts_with(prefix)))),
+            .any(|prefix| unit.starts_with(prefix))),
         "owner has a queued systemd job"
     );
     Ok(())
@@ -365,6 +389,25 @@ fn validate_receipt_paths(plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+fn no_local_delivery(plan: &Plan) -> Result<()> {
+    ensure!(
+        plan.public_archive_directory.is_absolute()
+            && plan.public_archive_directory.canonicalize()? == plan.public_archive_directory,
+        "public archive directory must be canonical"
+    );
+    for name in [
+        format!("epoch-{}.jet", plan.epoch),
+        format!("epoch-{}.jet.sha256", plan.epoch),
+    ] {
+        match fs::symlink_metadata(plan.public_archive_directory.join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => bail!("local canonical artifact exists; reconcile delivery instead"),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn run() -> Result<()> {
     let args: Vec<_> = env::args().collect();
     ensure!(
@@ -384,6 +427,18 @@ pub(super) async fn run() -> Result<()> {
     validate_receipt_paths(&plan)?;
     let fleet = bound_json(&plan.fleet)?;
     let history = bound_json(&plan.terminal_fleet)?;
+    let repair = bound_json(&plan.repair_backlog)?;
+    ensure!(
+        repair["schema"] == "jetstreamer-horizon-open-epoch-repair-v1"
+            && repair["epoch"] == plan.epoch
+            && repair["open"] == true
+            && repair["close_only_after_verified_r2_ready_pair"] == true
+            && repair["next_action"]
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty()),
+        "inactive cleanup requires a preserved open repair entry and next action"
+    );
+    no_local_delivery(&plan)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     validate_fleet(&fleet, &plan, now)?;
     let history_time =
@@ -422,6 +477,7 @@ pub(super) async fn run() -> Result<()> {
     let owners = owner_units(&publication)?;
     let before = fresh_census(&fleet, &history, &owners)?;
     let s3 = s3_client(&r2);
+    status_inactive::no_remote_delivery(&s3, &r2, plan.epoch).await?;
     let key = format!("epoch-{}.epoch-status.json", plan.epoch);
     let current = get_mutable_object(&s3, &r2.bucket, &key).await?;
     if let Some(object) = current.as_ref() {
@@ -432,7 +488,8 @@ pub(super) async fn run() -> Result<()> {
         "publication":pub_path,"publication_sha256":pub_sha,"status":publication.status,"etag":publication.object_etag,
         "fleet":plan.fleet.path,"fleet_sha256":plan.fleet.sha256,"terminal_fleet":plan.terminal_fleet.path,
         "terminal_fleet_sha256":plan.terminal_fleet.sha256,"owners":owners,"archive_completion_claimed":false,
-        "prior_intent":plan.prior_intent.as_ref().map(|b|json!({"path":b.path,"sha256":b.sha256}))});
+        "prior_intent":plan.prior_intent.as_ref().map(|b|json!({"path":b.path,"sha256":b.sha256})),
+        "repair_backlog":{"path":plan.repair_backlog.path,"sha256":plan.repair_backlog.sha256}});
     if let Some(prior) = &plan.prior_intent {
         validate_recovery_intent(&bound_json(prior)?, &intent)?;
     }
@@ -480,6 +537,8 @@ pub(super) async fn run() -> Result<()> {
         fresh_census(&fleet, &history, &owners)? == before,
         "census changed before cleanup"
     );
+    no_local_delivery(&plan)?;
+    status_inactive::no_remote_delivery(&s3, &r2, plan.epoch).await?;
     if let Some(object) = current {
         same_object(&object.bytes, &object.etag, &publication)?;
         ensure!(
@@ -496,6 +555,8 @@ pub(super) async fn run() -> Result<()> {
         fresh_census(&fleet, &history, &owners)? == before,
         "claim appeared after cleanup; repair live status through gated publisher"
     );
+    no_local_delivery(&plan)?;
+    status_inactive::no_remote_delivery(&s3, &r2, plan.epoch).await?;
     let completion = json!({"schema":"jetstreamer-horizon-inactive-status-completion-v1","intent":intent,
         "authenticated_absence":true,"unchanged_claim_census":true,"archive_completion_claimed":false});
     if plan.completion.exists() {
@@ -517,6 +578,14 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queued_jobs_are_a_plain_systemctl_table_not_journal_json() {
+        assert!(queued_job_units(b"").unwrap().is_empty());
+        assert_eq!(queued_job_units(b"3285782 horizon-inactive-status-224.service start running\n3285783 horizon-controller-224.service start waiting\n").unwrap(),
+            vec!["horizon-inactive-status-224.service","horizon-controller-224.service"]);
+        assert!(queued_job_units(b"JOB UNIT TYPE STATE\n").is_err());
+        assert!(queued_job_units(b"3285782 missing-columns\n").is_err());
+    }
     #[test]
     fn terminal_owner_requires_positive_history_and_rejects_replacements() {
         let old = json!({"LoadState":"loaded","InvocationID":"abc","ActiveState":"failed","SubState":"failed","Result":"exit-code","ExecMainStatus":"1"});
@@ -554,6 +623,8 @@ mod tests {
             fleet: bound(),
             terminal_fleet: bound(),
             publication: bound(),
+            repair_backlog: bound(),
+            public_archive_directory: "/public".into(),
             status_receipt_directory: "/receipts".into(),
             intent: "/receipts/intent.json".into(),
             completion: "/receipts/completion.json".into(),

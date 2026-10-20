@@ -139,7 +139,7 @@ fn validate_absence_recovery(
     Ok(())
 }
 
-async fn no_remote_delivery(s3: &Client, r2: &R2Config, epoch: u64) -> Result<()> {
+pub(super) async fn no_remote_delivery(s3: &Client, r2: &R2Config, epoch: u64) -> Result<()> {
     ensure!(
         inventory_epoch(s3, r2, epoch).await?.state == InventoryState::Missing,
         "remote pair/staged archive exists; reconcile delivery rather than deleting status"
@@ -474,12 +474,18 @@ fn live_census(plan: &Plan, fleet: &Value) -> Result<Value> {
         claims.insert(name.to_string(), current);
     }
     let jobs = Command::new("systemctl")
-        .args(["list-jobs", "--output=json", "--no-pager"])
+        .args([
+            "list-jobs",
+            "--no-legend",
+            "--no-pager",
+            "--plain",
+            "--full",
+        ])
         .output()?;
     ensure!(jobs.status.success(), "queued-job census failed");
-    let queued: Vec<Value> = serde_json::from_slice(&jobs.stdout)?;
+    let queued = inactive_status::queued_job_units(&jobs.stdout)?;
     for j in &queued {
-        let name = j["unit"].as_str().context("queued unit omitted")?;
+        let name = *j;
         if !name.ends_with(".service") {
             ensure!(
                 !names_epoch(name, plan.epoch),
