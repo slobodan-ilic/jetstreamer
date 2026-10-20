@@ -56,11 +56,14 @@ const RECEIPT_SCHEMA: &str = "jetstreamer-horizon-r2-receipt-v1";
 const PUBLIC_RECEIPT_SCHEMA: &str = "jetstreamer-horizon-r2-public-read-receipt-v1";
 const STATUS_RECEIPT_SCHEMA: &str =
     "jetstreamer-horizon-r2-status-authenticated-publication-receipt-v1";
+const PIPELINE_STATUS_RECEIPT_SCHEMA: &str =
+    "jetstreamer-horizon-r2-status-authenticated-pipeline-publication-receipt-v1";
 const STATUS_DELETION_RECEIPT_SCHEMA: &str =
     "jetstreamer-horizon-r2-status-authenticated-deletion-receipt-v1";
 
 mod fleet;
 mod inactive_status;
+mod pipeline_status;
 mod resource_audit;
 mod resource_verify;
 mod status_inactive;
@@ -204,6 +207,8 @@ struct StatusPublicationReceipt {
     producer_invocation_id: String,
     authenticated_readback: bool,
     verified_unix_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pipeline_binding: Option<pipeline_status::Binding>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1468,7 +1473,7 @@ fn validate_epoch_status(status: &EpochStatus, expected_epoch: u64) -> Result<()
     ensure!(
         matches!(
             status.phase.as_str(),
-            "replay" | "verification" | "upload" | "readback"
+            "replay" | "verification" | "publication" | "upload" | "readback"
         ),
         "status object phase is invalid"
     );
@@ -1567,13 +1572,50 @@ async fn status_publish(
         phase: config.phase.clone().expect("validated"),
     };
     validate_epoch_status(&status, epoch)?;
-    let status_bytes = epoch_status_bytes(&status)?;
+    let (object_etag, previous_object_etag) = publish_epoch_status(s3, r2, &status).await?;
+    let receipt = StatusPublicationReceipt {
+        schema: STATUS_RECEIPT_SCHEMA.to_owned(),
+        bucket: r2.bucket.clone(),
+        epoch,
+        key: format!("epoch-{epoch}.epoch-status.json"),
+        status,
+        object_etag,
+        previous_object_etag,
+        observer_receipt: observer_receipt.to_path_buf(),
+        observer_receipt_sha256: config.observer_sha256.clone().expect("validated"),
+        controller_invocation_id: config
+            .expected_controller_invocation_id
+            .clone()
+            .expect("validated"),
+        producer_invocation_id: config
+            .expected_producer_invocation_id
+            .clone()
+            .expect("validated"),
+        authenticated_readback: true,
+        verified_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        pipeline_binding: None,
+    };
+    write_status_receipt(
+        config.receipt_directory.as_deref().expect("validated"),
+        &receipt,
+    )
+}
+
+// Shared conditional mutation boundary for replay and post-replay status only.
+async fn publish_epoch_status(
+    s3: &Client,
+    r2: &R2Config,
+    status: &EpochStatus,
+) -> Result<(String, Option<String>)> {
+    let epoch = status.epoch;
+    validate_epoch_status(status, epoch)?;
+    let status_bytes = epoch_status_bytes(status)?;
     let key = format!("epoch-{epoch}.epoch-status.json");
     let previous = get_mutable_object(s3, &r2.bucket, &key).await?;
     let action = if let Some(previous) = &previous {
         let previous_status: EpochStatus =
             serde_json::from_slice(&previous.bytes).context("existing status JSON is invalid")?;
-        status_publication_action(&previous_status, &status)?
+        status_publication_action(&previous_status, status)?
     } else {
         StatusPublicationAction::Replace
     };
@@ -1609,34 +1651,7 @@ async fn status_publish(
         authenticated.bytes == status_bytes,
         "authenticated status readback differs from uploaded bytes"
     );
-    let receipt = StatusPublicationReceipt {
-        schema: STATUS_RECEIPT_SCHEMA.to_owned(),
-        bucket: r2.bucket.clone(),
-        epoch,
-        key,
-        status,
-        object_etag: authenticated.etag,
-        previous_object_etag: previous.map(|value| value.etag),
-        observer_receipt: observer_receipt.to_path_buf(),
-        observer_receipt_sha256: config.observer_sha256.clone().expect("validated"),
-        controller_invocation_id: config
-            .expected_controller_invocation_id
-            .clone()
-            .expect("validated"),
-        producer_invocation_id: config
-            .expected_producer_invocation_id
-            .clone()
-            .expect("validated"),
-        authenticated_readback: true,
-        verified_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-    };
-    write_status_receipt(
-        config
-            .receipt_directory
-            .as_deref()
-            .expect("status-publish requires receipt directory"),
-        &receipt,
-    )
+    Ok((authenticated.etag, previous.map(|value| value.etag)))
 }
 
 fn status_deletion_receipt_path(directory: &Path, epoch: u64) -> PathBuf {
@@ -1719,7 +1734,11 @@ fn validate_status_publication_receipt_bytes(
     let receipt: StatusPublicationReceipt =
         serde_json::from_slice(bytes).context("invalid status publication receipt JSON")?;
     ensure!(
-        receipt.schema == STATUS_RECEIPT_SCHEMA,
+        (receipt.schema == STATUS_RECEIPT_SCHEMA && receipt.pipeline_binding.is_none())
+            || (receipt.schema == PIPELINE_STATUS_RECEIPT_SCHEMA
+                && receipt.pipeline_binding.is_some()
+                && receipt.controller_invocation_id.is_empty()
+                && receipt.producer_invocation_id.is_empty()),
         "unsupported status publication receipt schema"
     );
     ensure!(
@@ -1743,6 +1762,9 @@ fn validate_status_publication_receipt_bytes(
         "status receipt has an empty object ETag"
     );
     validate_epoch_status(&receipt.status, epoch)?;
+    if let Some(binding) = &receipt.pipeline_binding {
+        binding.validate(epoch, &receipt.status.phase)?;
+    }
     ensure!(
         path == status_receipt_path(directory, &receipt.status),
         "status publication receipt path is noncanonical"
@@ -3081,6 +3103,9 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().nth(1).as_deref() == Some("status-publish-pipeline") {
+        return pipeline_status::run().await;
+    }
     if env::args().nth(1).as_deref() == Some("status-delete-inactive") {
         return status_inactive::run().await;
     }
@@ -3417,6 +3442,7 @@ mod tests {
             producer_invocation_id: "ef".repeat(16),
             authenticated_readback: true,
             verified_unix_seconds: 1,
+            pipeline_binding: None,
         }
     }
 

@@ -186,6 +186,10 @@ fn validate_fleet(fleet: &Value, plan: &Plan, now: u64) -> Result<()> {
 }
 
 fn owner_units(publication: &StatusPublicationReceipt) -> Result<Vec<(String, String)>> {
+    if let Some(binding) = &publication.pipeline_binding {
+        binding.validate(publication.epoch, &publication.status.phase)?;
+        return Ok(vec![(binding.unit.clone(), binding.invocation_id.clone())]);
+    }
     let bytes = read_stable_bounded(
         &publication.observer_receipt,
         MAX_OBSERVER_RECEIPT_BYTES,

@@ -935,6 +935,7 @@ mod tests {
 
     fn publication() -> StatusPublicationReceipt {
         StatusPublicationReceipt {
+            pipeline_binding: None,
             schema: STATUS_RECEIPT_SCHEMA.into(),
             bucket: "test-bucket".into(),
             epoch: 183,
