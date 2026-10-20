@@ -43,16 +43,59 @@ struct PipelineClaim {
     evidence: Vec<BoundFile>,
 }
 
-fn validate_pipeline_claim(claim: &PipelineClaim, first: u64, last: u64) -> Result<()> {
-    let prefix = match claim.phase.as_str() {
-        "local-publication" => format!("horizon-publish-{}-", claim.epoch),
-        "upload-readback" => format!("horizon-upload-{}-", claim.epoch),
+// Unit names describe scope, not authority. Every live claim still needs the
+// exact invocation/command, immutable evidence and an independent delivery gate.
+fn pipeline_unit_range(phase: &str, unit: &str) -> Result<std::ops::RangeInclusive<u64>> {
+    let prefix = match phase {
+        "full-verification" => "horizon-full-verify-",
+        "plugin-verification" => "horizon-plugin-verify-",
+        "local-publication" => "horizon-publish-",
+        "upload-readback" => "horizon-upload-",
         _ => anyhow::bail!("invalid pipeline phase"),
     };
     ensure!(
+        unit.len() <= 255
+            && unit
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+        "invalid pipeline unit name"
+    );
+    let scope = unit
+        .strip_prefix(prefix)
+        .and_then(|s| s.strip_suffix(".service"))
+        .context("pipeline unit does not match phase")?;
+    let mut fields = scope.splitn(3, '-');
+    let first = fields.next().context("pipeline epoch missing")?;
+    let second = fields.next().context("pipeline unit suffix missing")?;
+    let start: u64 = first.parse()?;
+    ensure!(
+        first == start.to_string() && !second.is_empty(),
+        "noncanonical pipeline scope"
+    );
+    let end = if second.bytes().all(|b| b.is_ascii_digit()) {
+        let end: u64 = second.parse()?;
+        ensure!(
+            second == end.to_string() && fields.next().is_some_and(|s| !s.is_empty()),
+            "noncanonical pipeline range"
+        );
+        end
+    } else {
+        start
+    };
+    ensure!(
+        start <= end && end - start <= 1000,
+        "invalid pipeline range"
+    );
+    Ok(start..=end)
+}
+
+fn validate_pipeline_claim(claim: &PipelineClaim, first: u64, last: u64) -> Result<()> {
+    let scope = pipeline_unit_range(&claim.phase, &claim.unit)?;
+    ensure!(
         (first..=last).contains(&claim.epoch)
-            && claim.unit.starts_with(&prefix)
-            && claim.unit.ends_with(".service")
+            && scope.contains(&claim.epoch)
+            && *scope.start() >= first
+            && *scope.end() <= last
             && claim.invocation_id.len() == 32
             && claim
                 .invocation_id
@@ -61,6 +104,36 @@ fn validate_pipeline_claim(claim: &PipelineClaim, first: u64, last: u64) -> Resu
             && !claim.expected_exec_start.trim().is_empty()
             && !claim.evidence.is_empty(),
         "invalid observational pipeline claim"
+    );
+    Ok(())
+}
+
+fn register_pipeline_claim<'a>(
+    units: &mut BTreeMap<&'a str, &'a PipelineClaim>,
+    claim: &'a PipelineClaim,
+) -> Result<()> {
+    if let Some(prior) = units.get(claim.unit.as_str()) {
+        ensure!(
+            prior.epoch != claim.epoch
+                && prior.phase == claim.phase
+                && prior.invocation_id == claim.invocation_id
+                && prior.expected_exec_start == claim.expected_exec_start
+                && prior.evidence == claim.evidence,
+            "duplicate or inconsistent cohort pipeline claim"
+        );
+    } else {
+        units.insert(claim.unit.as_str(), claim);
+    }
+    Ok(())
+}
+
+fn register_live_pipeline_stage(
+    stages: &mut BTreeSet<(u64, String)>,
+    claim: &PipelineClaim,
+) -> Result<()> {
+    ensure!(
+        stages.insert((claim.epoch, claim.phase.clone())),
+        "overlapping live claims for the same pipeline stage"
     );
     Ok(())
 }
@@ -669,14 +742,19 @@ pub(super) fn census(
                 .and_then(|tail| tail.split('-').next())
                 .and_then(|epoch| epoch.parse::<u64>().ok())
                 .is_some_and(|epoch| (first_epoch..=last_epoch).contains(&epoch));
-        let assigned_pipeline = ["horizon-publish-", "horizon-upload-"]
-            .iter()
-            .any(|prefix| {
-                name.strip_prefix(prefix)
-                    .and_then(|tail| tail.split('-').next())
-                    .and_then(|epoch| epoch.parse::<u64>().ok())
-                    .is_some_and(|epoch| (first_epoch..=last_epoch).contains(&epoch))
-            });
+        let assigned_pipeline = [
+            "horizon-publish-",
+            "horizon-upload-",
+            "horizon-full-verify-",
+            "horizon-plugin-verify-",
+        ]
+        .iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix)
+                .and_then(|tail| tail.split('-').next())
+                .and_then(|epoch| epoch.parse::<u64>().ok())
+                .is_some_and(|epoch| (first_epoch..=last_epoch).contains(&epoch))
+        });
         if name.starts_with("jetstreamer-root-sweep-")
             || name.starts_with("horizon-controller-")
             || name.starts_with("horizon-qualify-")
@@ -1094,7 +1172,8 @@ pub(super) async fn run() -> Result<()> {
         }
         names.insert(claim.unit.clone());
     }
-    let mut pipeline_units = BTreeSet::new();
+    let mut pipeline_units = BTreeMap::new();
+    let mut pipeline_epoch_units = BTreeSet::new();
     if plan.admission_transition_guard.is_some() {
         // Preserve the exact claims from the hash-bound predecessor plan,
         // including completed delivery history. Requiring an empty vector
@@ -1114,9 +1193,11 @@ pub(super) async fn run() -> Result<()> {
     for claim in &plan.pipeline_claims {
         validate_pipeline_claim(claim, plan.first_epoch, plan.last_epoch)?;
         ensure!(
-            pipeline_units.insert(claim.unit.clone()) && !diagnostic_units.contains(&claim.unit),
+            pipeline_epoch_units.insert((claim.epoch, claim.unit.clone()))
+                && !diagnostic_units.contains(&claim.unit),
             "duplicate pipeline unit or diagnostic relabeling"
         );
+        register_pipeline_claim(&mut pipeline_units, claim)?;
         for evidence in &claim.evidence {
             bound_json(evidence)?;
         }
@@ -1139,7 +1220,7 @@ pub(super) async fn run() -> Result<()> {
     let mut active = Vec::new();
     let mut diagnostics = Vec::new();
     let mut pipelines = Vec::new();
-    let mut live_pipeline_epochs = BTreeSet::new();
+    let mut live_pipeline_stages = BTreeSet::new();
     for claim in &plan.pipeline_claims {
         let current = &before[&claim.unit];
         let is_active = pipeline_live(claim, current)?;
@@ -1149,10 +1230,7 @@ pub(super) async fn run() -> Result<()> {
             "sampled_at_utc":sample,"ordinary_replay_claim":false,
             "current_sidecar_eta_valid":false,"grants_launch_or_publication_authority":false});
         if is_active {
-            ensure!(
-                live_pipeline_epochs.insert(claim.epoch),
-                "overlapping live pipeline claims"
-            );
+            register_live_pipeline_stage(&mut live_pipeline_stages, claim)?;
             ensure!(
                 plan.gates[&claim.epoch].state == "post-replay-pipeline",
                 "live pipeline requires an independently evidenced post-replay gate"
@@ -1487,6 +1565,112 @@ mod tests {
         validate_pipeline_claim(&claim, 201, 300).unwrap();
         claim.evidence.clear();
         assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+    }
+
+    #[test]
+    fn verifier_and_cohort_claims_retain_exact_epoch_scope() {
+        let (mut claim, _) = pipeline_fixture();
+        claim.epoch = 218;
+        for (phase, unit) in [
+            (
+                "full-verification",
+                "horizon-full-verify-216-219-cached-v1.service",
+            ),
+            (
+                "plugin-verification",
+                "horizon-plugin-verify-216-219-cached-v1.service",
+            ),
+            (
+                "upload-readback",
+                "horizon-upload-216-219-cached-v1.service",
+            ),
+        ] {
+            claim.phase = phase.into();
+            claim.unit = unit.into();
+            validate_pipeline_claim(&claim, 201, 300).unwrap();
+            claim.epoch = 220;
+            assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+            claim.epoch = 218;
+        }
+        for unit in [
+            "horizon-upload-219-216-test.service",
+            "horizon-upload-0216-219-test.service",
+            "horizon-upload-216-0219-test.service",
+            "horizon-upload-216-219.service",
+            "horizon-upload-216--test.service",
+            "horizon-upload-216-219-test/service",
+        ] {
+            claim.unit = unit.into();
+            assert!(validate_pipeline_claim(&claim, 201, 300).is_err(), "{unit}");
+        }
+        claim.epoch = 300;
+        claim.unit = "horizon-upload-298-301-private-tail.service".into();
+        assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+        claim.phase = "full-verification".into();
+        claim.epoch = 206;
+        claim.unit = "horizon-full-verify-206-production-v1.service".into();
+        validate_pipeline_claim(&claim, 201, 300).unwrap();
+        claim.phase = "plugin-verification".into();
+        assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+    }
+
+    #[test]
+    fn shared_cohort_unit_requires_identical_invocation_command_and_evidence() {
+        let (mut first, _) = pipeline_fixture();
+        first.epoch = 216;
+        first.unit = "horizon-upload-216-219-test.service".into();
+        first.phase = "upload-readback".into();
+        let copy = || PipelineClaim {
+            epoch: 217,
+            phase: first.phase.clone(),
+            unit: first.unit.clone(),
+            invocation_id: first.invocation_id.clone(),
+            expected_exec_start: first.expected_exec_start.clone(),
+            evidence: vec![BoundFile {
+                path: first.evidence[0].path.clone(),
+                sha256: first.evidence[0].sha256.clone(),
+            }],
+        };
+        let next = copy();
+        let mut units = BTreeMap::new();
+        register_pipeline_claim(&mut units, &first).unwrap();
+        register_pipeline_claim(&mut units, &next).unwrap();
+        assert!(register_pipeline_claim(&mut units, &first).is_err());
+        for field in ["invocation", "command", "evidence", "phase"] {
+            let mut changed = copy();
+            match field {
+                "invocation" => changed.invocation_id = "f".repeat(32),
+                "command" => changed.expected_exec_start.push_str(" changed"),
+                "evidence" => changed.evidence.clear(),
+                "phase" => changed.phase = "local-publication".into(),
+                _ => unreachable!(),
+            }
+            let mut units = BTreeMap::new();
+            register_pipeline_claim(&mut units, &first).unwrap();
+            assert!(
+                register_pipeline_claim(&mut units, &changed).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_verifiers_and_upload_are_distinct_but_duplicate_stages_fail() {
+        let (mut claim, _) = pipeline_fixture();
+        let mut stages = BTreeSet::new();
+        for phase in [
+            "full-verification",
+            "plugin-verification",
+            "upload-readback",
+        ] {
+            claim.phase = phase.into();
+            register_live_pipeline_stage(&mut stages, &claim).unwrap();
+        }
+        assert_eq!(stages.len(), 3);
+        claim.unit = "horizon-upload-213-replacement.service".into();
+        assert!(register_live_pipeline_stage(&mut stages, &claim).is_err());
+        claim.epoch = 214;
+        register_live_pipeline_stage(&mut stages, &claim).unwrap();
     }
     use super::*;
     fn admission_fixture() -> (Value, Plan, Value, Value) {
