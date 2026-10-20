@@ -47,6 +47,8 @@ pub struct CollectedFile {
 /// Complete tar-member census, never a live-state or source-completeness proof.
 #[derive(Debug, Serialize)]
 pub struct DiagnosticCollection {
+    /// True only when every member was retained and fsynced, not merely counted.
+    pub files_retained: bool,
     /// The exact, independently supplied root prefix in the input tar.
     pub archive_root: String,
     /// Sorted census of every regular member, including ancillary files.
@@ -125,6 +127,28 @@ pub fn collect_rocksdb_tar<R: Read>(
     destination: &Path,
     limits: CollectionLimits,
 ) -> Result<DiagnosticCollection> {
+    inspect_rocksdb_tar(reader, archive_root, Some(destination), limits)
+}
+
+/// Hash and census every member without creating or retaining any output files.
+///
+/// This consumes the complete tar, including its bounded zero trailer. It uses
+/// the same parser, CURRENT binding and content bounds as collection, but cannot
+/// supply native database inputs or establish backup completeness/live state.
+pub fn census_rocksdb_tar<R: Read>(
+    reader: R,
+    archive_root: &Path,
+    limits: CollectionLimits,
+) -> Result<DiagnosticCollection> {
+    inspect_rocksdb_tar(reader, archive_root, None, limits)
+}
+
+fn inspect_rocksdb_tar<R: Read>(
+    reader: R,
+    archive_root: &Path,
+    destination: Option<&Path>,
+    limits: CollectionLimits,
+) -> Result<DiagnosticCollection> {
     ensure!(
         plain_relative(archive_root),
         "archive root must be plain relative components"
@@ -136,20 +160,26 @@ pub fn collect_rocksdb_tar<R: Read>(
             && (512..=16 * 1024 * 1024).contains(&limits.maximum_trailer_bytes),
         "invalid collection limits"
     );
-    ensure!(
-        destination.is_absolute() && destination.canonicalize()? == destination,
-        "destination must be canonical and absolute"
-    );
-    let before = fs::symlink_metadata(destination)?;
-    ensure!(
-        before.is_dir() && before.uid() == unsafe { libc::geteuid() } && before.mode() & 0o077 == 0,
-        "destination must be owned and private"
-    );
-    ensure!(
-        fs::read_dir(destination)?.next().is_none(),
-        "destination is not empty"
-    );
-    let directory = File::open(destination)?;
+    let retained = if let Some(destination) = destination {
+        ensure!(
+            destination.is_absolute() && destination.canonicalize()? == destination,
+            "destination must be canonical and absolute"
+        );
+        let before = fs::symlink_metadata(destination)?;
+        ensure!(
+            before.is_dir()
+                && before.uid() == unsafe { libc::geteuid() }
+                && before.mode() & 0o077 == 0,
+            "destination must be owned and private"
+        );
+        ensure!(
+            fs::read_dir(destination)?.next().is_none(),
+            "destination is not empty"
+        );
+        Some((before, File::open(destination)?))
+    } else {
+        None
+    };
     let mut archive = tar::Archive::new(PositionReader {
         inner: reader,
         bytes: 0,
@@ -218,13 +248,16 @@ pub fn collect_rocksdb_tar<R: Read>(
         if name == "CURRENT" {
             ensure!(bytes <= 4096, "CURRENT exceeds metadata bound");
         }
-        let path = destination.join(&name);
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)?;
+        let mut output = destination
+            .map(|destination| {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(destination.join(&name))
+            })
+            .transpose()?;
         let mut digest = Sha256::new();
         let mut copied = 0_u64;
         let mut buffer = [0_u8; 65536];
@@ -238,7 +271,9 @@ pub fn collect_rocksdb_tar<R: Read>(
                 .checked_add(count as u64)
                 .context("copy count overflow")?;
             ensure!(copied <= bytes, "member exceeds declared length");
-            output.write_all(&buffer[..count])?;
+            if let Some(output) = &mut output {
+                output.write_all(&buffer[..count])?;
+            }
             digest.update(&buffer[..count]);
             if name == "CURRENT" {
                 current_bytes.extend_from_slice(&buffer[..count]);
@@ -248,8 +283,10 @@ pub fn collect_rocksdb_tar<R: Read>(
         if name == "CURRENT" {
             current = Some(manifest_name(&current_bytes)?);
         }
-        output.set_permissions(fs::Permissions::from_mode(0o444))?;
-        output.sync_all()?;
+        if let Some(output) = output {
+            output.set_permissions(fs::Permissions::from_mode(0o444))?;
+            output.sync_all()?;
+        }
         files.push(CollectedFile {
             name,
             bytes,
@@ -291,20 +328,23 @@ pub fn collect_rocksdb_tar<R: Read>(
             .any(|f| numbered(&f.name, "", ".sst") && f.bytes > 0),
         "archive has no nonempty numbered SST"
     );
-    let after = fs::symlink_metadata(destination)?;
-    ensure!(
-        (before.dev(), before.ino(), before.uid(), before.mode())
-            == (after.dev(), after.ino(), after.uid(), after.mode()),
-        "destination changed"
-    );
+    if let (Some(destination), Some((before, directory))) = (destination, retained) {
+        let after = fs::symlink_metadata(destination)?;
+        ensure!(
+            (before.dev(), before.ino(), before.uid(), before.mode())
+                == (after.dev(), after.ino(), after.uid(), after.mode()),
+            "destination changed"
+        );
+        directory.sync_all()?;
+    }
     files.sort_by(|a, b| a.name.cmp(&b.name));
     let wal_files = files
         .iter()
         .filter(|f| numbered(&f.name, "", ".log"))
         .map(|f| f.name.clone())
         .collect();
-    directory.sync_all()?;
     Ok(DiagnosticCollection {
+        files_retained: destination.is_some(),
         archive_root: archive_root
             .to_str()
             .context("non-UTF-8 archive root")?
@@ -400,6 +440,7 @@ mod tests {
     fn preserves_entire_flat_census_without_claiming_live_state() {
         let dir = output();
         let census = collect(&fixture(&ordinary()), dir.path(), limits()).unwrap();
+        assert!(census.files_retained);
         assert_eq!(census.files.len(), 6);
         assert_eq!(census.current_manifest, "MANIFEST-1");
         assert_eq!(census.wal_files, ["000002.log"]);
@@ -408,7 +449,7 @@ mod tests {
         assert!(!census.publication_authorized);
         assert_eq!(
             census.total_bytes,
-            census.files.iter().map(|f| f.bytes).sum()
+            census.files.iter().map(|f| f.bytes).sum::<u64>()
         );
         for file in &census.files {
             let path = dir.path().join(&file.name);
@@ -421,6 +462,100 @@ mod tests {
             fs::read(dir.path().join("unknown-ancillary")).unwrap(),
             b"preserve-me"
         );
+    }
+
+    #[test]
+    fn census_reads_every_byte_without_retaining_files() {
+        let bytes = fixture(&ordinary());
+        let dir = output();
+        let mut retained =
+            serde_json::to_value(collect(&bytes, dir.path(), limits()).unwrap()).unwrap();
+        let census =
+            census_rocksdb_tar(Cursor::new(&bytes), Path::new("rocksdb"), limits()).unwrap();
+        assert!(!census.files_retained);
+        retained["files_retained"] = false.into();
+        assert_eq!(serde_json::to_value(census).unwrap(), retained);
+        let mut changed = bytes;
+        // Alter the last ancillary member without changing its length/header.
+        let offset = changed
+            .windows(11)
+            .position(|w| w == b"preserve-me")
+            .unwrap();
+        changed[offset] ^= 1;
+        let changed =
+            census_rocksdb_tar(Cursor::new(changed), Path::new("rocksdb"), limits()).unwrap();
+        let original = collect(&fixture(&ordinary()), output().path(), limits()).unwrap();
+        assert_ne!(
+            changed.files.last().unwrap().sha256,
+            original.files.last().unwrap().sha256
+        );
+    }
+
+    #[test]
+    fn census_keeps_all_structural_and_expansion_gates() {
+        let bytes = fixture(&ordinary());
+        for end in [1, 511, 512, 600, bytes.len() - 1024, bytes.len() - 512] {
+            assert!(
+                census_rocksdb_tar(Cursor::new(&bytes[..end]), Path::new("rocksdb"), limits())
+                    .is_err()
+            );
+        }
+        let mut duplicate = ordinary();
+        duplicate.push(("rocksdb/CURRENT", tar::EntryType::Regular, b"MANIFEST-1\n"));
+        let mut nested = ordinary();
+        nested.push(("rocksdb/sub/file", tar::EntryType::Regular, b"x"));
+        let mut nonzero = bytes.clone();
+        nonzero.push(1);
+        let mut excess = bytes.clone();
+        excess.extend([0; 4096]);
+        for bad in [
+            fixture(&duplicate),
+            fixture(&nested),
+            nonzero,
+            excess,
+            fixture(&[("rocksdb/link", tar::EntryType::Symlink, b"")]),
+        ] {
+            assert!(census_rocksdb_tar(Cursor::new(bad), Path::new("rocksdb"), limits()).is_err());
+        }
+        assert!(
+            census_rocksdb_tar(
+                Cursor::new(fixture(&ordinary()[1..])),
+                Path::new("rocksdb"),
+                limits()
+            )
+            .is_ok()
+        );
+        for bounds in [
+            CollectionLimits {
+                maximum_files: 1,
+                ..limits()
+            },
+            CollectionLimits {
+                maximum_file_bytes: 2,
+                ..limits()
+            },
+            CollectionLimits {
+                maximum_total_bytes: 20,
+                ..limits()
+            },
+        ] {
+            assert!(census_rocksdb_tar(Cursor::new(&bytes), Path::new("rocksdb"), bounds).is_err());
+        }
+        for omitted in [
+            "rocksdb/CURRENT",
+            "rocksdb/MANIFEST-1",
+            "rocksdb/000001.sst",
+        ] {
+            let entries: Vec<_> = ordinary().into_iter().filter(|e| e.0 != omitted).collect();
+            assert!(
+                census_rocksdb_tar(
+                    Cursor::new(fixture(&entries)),
+                    Path::new("rocksdb"),
+                    limits()
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

@@ -6,7 +6,9 @@
 //! guard. No real ledger or publication route is qualified by this module.
 
 use {
-    crate::horizon_ledger_tar::{CollectionLimits, DiagnosticCollection, collect_rocksdb_tar},
+    crate::horizon_ledger_tar::{
+        CollectionLimits, DiagnosticCollection, census_rocksdb_tar, collect_rocksdb_tar,
+    },
     anyhow::{Context, Result, ensure},
     serde::Serialize,
     sha2::{Digest, Sha256},
@@ -107,6 +109,50 @@ pub fn collect_bound_bzip2(
     destination: &Path,
     limits: CollectionLimits,
 ) -> Result<BoundBzipCollection> {
+    inspect_bound_bzip2(
+        input,
+        expected_bytes,
+        expected_sha256,
+        maximum_compressed_bytes,
+        archive_root,
+        Some(destination),
+        limits,
+    )
+}
+
+/// Bind and decode the complete input without retaining decompressed members.
+///
+/// Every compressed and decompressed integrity gate is identical to collection.
+/// The returned census explicitly has `files_retained: false`; native resolution,
+/// fresh admission, durable receipts and all recovery gates remain separate.
+pub fn census_bound_bzip2(
+    input: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    maximum_compressed_bytes: u64,
+    archive_root: &Path,
+    limits: CollectionLimits,
+) -> Result<BoundBzipCollection> {
+    inspect_bound_bzip2(
+        input,
+        expected_bytes,
+        expected_sha256,
+        maximum_compressed_bytes,
+        archive_root,
+        None,
+        limits,
+    )
+}
+
+fn inspect_bound_bzip2(
+    input: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    maximum_compressed_bytes: u64,
+    archive_root: &Path,
+    destination: Option<&Path>,
+    limits: CollectionLimits,
+) -> Result<BoundBzipCollection> {
     ensure!(
         expected_bytes > 0 && expected_bytes <= maximum_compressed_bytes,
         "invalid compressed length bound"
@@ -167,7 +213,10 @@ pub fn collect_bound_bzip2(
         count: 0,
     };
     let mut decoder = bzip2::read::MultiBzDecoder::new(&mut reader);
-    let collection = collect_rocksdb_tar(&mut decoder, archive_root, destination, limits)?;
+    let collection = match destination {
+        Some(destination) => collect_rocksdb_tar(&mut decoder, archive_root, destination, limits)?,
+        None => census_rocksdb_tar(&mut decoder, archive_root, limits)?,
+    };
     // The tar collector drains through decoded EOF; require the decoder to have
     // validated every bzip2 member, including its checksum and stream footer.
     let mut end = [0_u8; 1];
@@ -268,6 +317,35 @@ mod tests {
         )
     }
 
+    fn census(input: &Path, bytes: &[u8]) -> Result<BoundBzipCollection> {
+        census_bound_bzip2(
+            input,
+            bytes.len() as u64,
+            &format!("{:x}", Sha256::digest(bytes)),
+            bytes.len() as u64,
+            Path::new("rocksdb"),
+            limits(),
+        )
+    }
+
+    #[test]
+    fn complete_multistream_census_matches_retained_collection_without_output() {
+        let tar = tar_bytes();
+        let mut bytes = compress(&tar[..777]);
+        bytes.extend(compress(&tar[777..]));
+        let root = tempfile::tempdir().unwrap();
+        let input = install(root.path(), &bytes);
+        let measured = census(&input, &bytes).unwrap();
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        assert!(!measured.collection.files_retained);
+        let output = tempfile::tempdir().unwrap();
+        let mut retained =
+            serde_json::to_value(collect(&input, &bytes, output.path()).unwrap()).unwrap();
+        retained["collection"]["files_retained"] = false.into();
+        assert_eq!(serde_json::to_value(measured).unwrap(), retained);
+        assert_eq!(fs::read(&input).unwrap(), bytes);
+    }
+
     #[test]
     fn binds_complete_multistream_input_and_preserves_every_member() {
         let tar = tar_bytes();
@@ -332,12 +410,16 @@ mod tests {
         let output = tempfile::tempdir().unwrap();
         let input = install(root.path(), &bytes);
         fs::set_permissions(&input, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(census(&input, &bytes).is_err());
         assert!(collect(&input, &bytes, output.path()).is_err());
         fs::set_permissions(&input, fs::Permissions::from_mode(0o444)).unwrap();
         let link = root.path().join("link");
         symlink(&input, &link).unwrap();
+        assert!(census(&link, &bytes).is_err());
         assert!(collect(&link, &bytes, output.path()).is_err());
         fs::hard_link(&input, root.path().join("hardlink")).unwrap();
+        assert!(census(&input, &bytes).is_err());
+        assert!(census(root.path(), &bytes).is_err());
         assert!(collect(&input, &bytes, output.path()).is_err());
         assert!(collect(root.path(), &bytes, output.path()).is_err());
         assert_eq!(fs::read_dir(output.path()).unwrap().count(), 0);
@@ -355,6 +437,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let output = tempfile::tempdir().unwrap();
             let input = install(root.path(), &bad);
+            assert!(census(&input, &bad).is_err());
             assert!(collect(&input, &bad, output.path()).is_err());
         }
     }
@@ -366,6 +449,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
         let input = install(root.path(), &bytes);
+        assert!(census(&input, &bytes).is_err());
         assert!(collect(&input, &bytes, output.path()).is_err());
         assert_eq!(fs::read_dir(output.path()).unwrap().count(), 4);
 

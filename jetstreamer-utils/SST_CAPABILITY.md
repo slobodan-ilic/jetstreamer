@@ -94,6 +94,19 @@ compressed binding nor a complete tar census proves original-backup completeness
 native live state, correct PoH boundaries or publication eligibility. No actual
 epoch141 source has been collected by these fixture tests.
 
+`horizon_ledger_tar::census_rocksdb_tar` and
+`horizon_ledger_bzip::census_bound_bzip2` run the same complete member parser and
+compressed-input binding without writing decompressed files. Every member is
+fully read and hashed; CURRENT, MANIFEST, WAL, path, count, expansion, end-marker
+and trailer gates remain unchanged. The result explicitly records
+`files_retained: false`, while successful extraction records `true`. This permits
+measurement of a complete flat archive's logical extraction footprint before
+admitting retention, without passing a partial scan off as complete. It does not
+predict filesystem physical allocation, supply native database inputs, or prove
+source completeness/live state. A real census still requires a persistent bounded
+caller, immutable generation binding, fresh CPU/RAM/I/O admission and durable
+receipts. The library tests do not constitute a census of the real epoch141 input.
+
 The native crash-shaped fixture also compares direct-tar and digest-bound
 multistream-bzip2 collections byte-for-byte, then performs the complete-CF native
 read-only resolution against the compressed collection. It checks live-file
