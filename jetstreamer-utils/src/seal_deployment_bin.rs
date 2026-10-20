@@ -196,8 +196,11 @@ fn validate_plan(plan: &Plan) -> Result<(), String> {
             ));
         }
         lowercase_sha256(&member.sha256, &format!("{} SHA-256", member.name))?;
-        if !matches!(member.mode, 0o444 | 0o555) {
-            return Err(format!("member {} mode must be 0444 or 0555", member.name));
+        if !matches!(member.mode, 0o400 | 0o444 | 0o555) {
+            return Err(format!(
+                "member {} mode must be 0400, 0444 or 0555",
+                member.name
+            ));
         }
     }
     Ok(())
@@ -733,8 +736,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.bin");
         let mut plan = test_plan(directory.path(), &source, "a".repeat(64));
-        plan.members[0].mode = 0o644;
-        assert!(validate_plan(&plan).unwrap_err().contains("0444 or 0555"));
+        for mode in [0o000, 0o100, 0o440, 0o600, 0o644, 0o777, 0o4755] {
+            plan.members[0].mode = mode;
+            assert!(
+                validate_plan(&plan)
+                    .unwrap_err()
+                    .contains("0400, 0444 or 0555")
+            );
+        }
         plan.members[0].mode = 0o444;
         plan.members[0].name = "SHA256SUMS".to_string();
         assert!(
@@ -742,5 +751,29 @@ mod tests {
                 .unwrap_err()
                 .contains("invalid deployment member")
         );
+    }
+
+    #[test]
+    fn seals_owner_only_read_only_plan_without_relaxing_its_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let source = directory.path().join("source-plan.json");
+        let digest = write_source(&source, b"private authority plan", 0o600);
+        let mut plan = test_plan(directory.path(), &source, digest.clone());
+        plan.members[0].name = "plan.json".to_string();
+        plan.members[0].mode = 0o400;
+        validate_plan(&plan).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let receipt = seal(&plan, &"a".repeat(64), &"c".repeat(64), uid, false).unwrap();
+        let installed = plan.destination.join("plan.json");
+        let metadata = fs::symlink_metadata(&installed).unwrap();
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.mode() & 0o7777, 0o400);
+        assert_eq!(fs::read(&installed).unwrap(), b"private authority plan");
+        assert_eq!(receipt.members[0].mode, "0400");
+        assert_eq!(receipt.members[0].sha256, digest);
+        assert_eq!(fs::metadata(&source).unwrap().mode() & 0o7777, 0o600);
+        assert!(seal(&plan, &"a".repeat(64), &"c".repeat(64), uid, false).is_err());
     }
 }
