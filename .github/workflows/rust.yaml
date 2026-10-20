@@ -88,13 +88,27 @@ jobs:
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: cargo test (${{ matrix.name }})
-        run: cargo test ${{ matrix.scope }} ${{ matrix.flags }}
+        shell: bash
+        run: cargo test ${{ matrix.scope }} ${{ matrix.flags }} 2>&1 | tee "$RUNNER_TEMP/rust-test.log"
       - name: Archive example regressions (${{ matrix.name }})
         if: matrix.examples
         run: |
           cargo test -p jetstreamer-horizon ${{ matrix.flags }} \
             --example reencode_archive \
             --example verify_archive
+      - name: Report test failure in check annotations
+        if: failure()
+        shell: bash
+        run: |
+          # Public check annotations remain readable to SSH-only maintainers,
+          # while the Actions log-download API requires a separate API token.
+          if [[ -f "$RUNNER_TEMP/rust-test.log" ]]; then
+            failure_tail="$(tail -n 100 "$RUNNER_TEMP/rust-test.log" | tail -c 12000)"
+            failure_tail="${failure_tail//'%'/'%25'}"
+            failure_tail="${failure_tail//$'\r'/'%0D'}"
+            failure_tail="${failure_tail//$'\n'/'%0A'}"
+            printf '::error title=Rust test failure details::%s\n' "$failure_tail"
+          fi
 
   cargo-fmt:
     name: cargo fmt

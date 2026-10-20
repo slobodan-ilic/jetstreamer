@@ -60,4 +60,10 @@ fn ci_covers_every_declared_node_mode_independently() {
     assert!(workflow.contains("if: matrix.examples"));
     assert!(workflow.contains("--example reencode_archive"));
     assert!(workflow.contains("--example verify_archive"));
+    assert!(workflow.contains("shell: bash\n        run: cargo test"));
+    assert!(workflow.contains("2>&1 | tee \"$RUNNER_TEMP/rust-test.log\""));
+    assert!(
+        workflow.contains("name: Report test failure in check annotations\n        if: failure()")
+    );
+    assert!(workflow.contains("::error title=Rust test failure details::%s"));
 }
