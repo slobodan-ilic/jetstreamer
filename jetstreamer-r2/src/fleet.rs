@@ -581,6 +581,14 @@ pub(super) fn census(
         let name = value["unit"]
             .as_str()
             .context("discovered unit omits name")?;
+        if name == EPOCH154_SAFETY_GUARD {
+            // This periodic oneshot can be active between census passes. It
+            // never launches replay and must not be mistaken for a new lane.
+            // Do not generalize this to a name-suffix exemption: authenticate
+            // its complete static deployment and exact non-launching command.
+            validate_epoch154_safety_guard(&result)?;
+            continue;
+        }
         let assigned_diagnostic = name.contains('@')
             && name
                 .strip_prefix("horizon-perf-epoch")
@@ -608,6 +616,155 @@ pub(super) fn census(
         }
     }
     Ok(result)
+}
+
+const EPOCH154_SAFETY_GUARD: &str =
+    "horizon-qualify-epoch154-rayon10-growth-20261019-v1-guard.service";
+const EPOCH154_GUARDED_PRODUCER: &str =
+    "horizon-qualify-epoch154-rayon10-growth-20261019-v1.service";
+const EPOCH154_GUARD_BINARY: &str = "/usr/local/lib/jetstreamer/horizon-standalone-guard-target-handoff-20261019-v2/jetstreamer-horizon-standalone-guard";
+const EPOCH154_GUARD_BINARY_SHA: &str =
+    "eca429932ffe9afe71aecba815ab301db46bdddbaf24b4c44af8c88bb74a6194";
+const EPOCH154_GUARD_PLAN: &str =
+    "/usr/local/lib/jetstreamer/horizon-epoch154-growth-bound-guard-20261020-v1/guard-plan.json";
+const EPOCH154_GUARD_PLAN_SHA: &str =
+    "579dccb32a16c2884218cbaa5c2914f0b7b4340d8435bf8416ce083bb36e4bc5";
+const EPOCH154_GUARD_FRAGMENT: &str =
+    "/etc/systemd/system/horizon-qualify-epoch154-rayon10-growth-20261019-v1-guard.service";
+
+fn validate_epoch154_guard_properties(properties: &Value) -> Result<()> {
+    for (key, expected) in [
+        ("Id", EPOCH154_SAFETY_GUARD),
+        ("LoadState", "loaded"),
+        ("Type", "oneshot"),
+        ("User", "root"),
+        ("Group", "root"),
+        ("FragmentPath", EPOCH154_GUARD_FRAGMENT),
+        ("DropInPaths", ""),
+        ("Environment", ""),
+        ("EnvironmentFiles", ""),
+        ("PassEnvironment", ""),
+        ("RootDirectory", ""),
+        ("RootImage", ""),
+        ("ExecStartPre", ""),
+        ("ExecStartPost", ""),
+        ("ExecCondition", ""),
+        ("ExecStop", ""),
+        ("ExecStopPost", ""),
+        ("ExecReload", ""),
+    ] {
+        ensure!(
+            properties[key] == expected,
+            "safety guard property {key} differs"
+        );
+    }
+    let command = properties["ExecStart"]
+        .as_str()
+        .context("guard command missing")?;
+    let prefix = format!(
+        "{{ path={EPOCH154_GUARD_BINARY} ; argv[]={EPOCH154_GUARD_BINARY} {EPOCH154_GUARD_PLAN} --plan-sha256 {EPOCH154_GUARD_PLAN_SHA} --self-sha256 {EPOCH154_GUARD_BINARY_SHA} ; ignore_errors=no ;"
+    );
+    ensure!(
+        command.starts_with(&prefix)
+            && command.ends_with(" }")
+            && command.matches("{ path=").count() == 1
+            && !command.contains('\n'),
+        "safety guard has an unexpected or additional command"
+    );
+    Ok(())
+}
+
+fn pinned_guard_member(path: &str, digest: &str) -> Result<()> {
+    let path = Path::new(path);
+    ensure!(
+        path.canonicalize()? == path,
+        "guard member path is not exact"
+    );
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file()
+            && metadata.uid() == 0
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o022 == 0,
+        "guard member identity or mode differs"
+    );
+    let bytes = read_stable_bounded(path, 32 * 1024 * 1024, "pinned safety guard member")?;
+    ensure!(
+        hex_lower(&Sha256::digest(&bytes)) == digest,
+        "guard member SHA-256 mismatch"
+    );
+    Ok(())
+}
+
+fn validate_empty_guard_array(bytes: &[u8], signature: &str) -> Result<()> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    ensure!(
+        value["type"] == signature && value["data"].as_array().is_some_and(Vec::is_empty),
+        "safety guard has a nonempty or unreadable DBus command/environment array"
+    );
+    Ok(())
+}
+
+fn validate_epoch154_safety_guard(current: &BTreeMap<String, Value>) -> Result<()> {
+    let producer = current
+        .get(EPOCH154_GUARDED_PRODUCER)
+        .context("guard's producer is not in bound fleet")?;
+    ensure!(
+        producer["InvocationID"] == "85214d064b014c2e981bbfa8709f34db"
+            && producer["NRestarts"] == "0"
+            && producer["ActiveState"] == "active"
+            && producer["SubState"] == "running",
+        "guard parent is not the exact bound live producer"
+    );
+    let output = ProcessCommand::new("/usr/bin/systemctl").args(["show", EPOCH154_SAFETY_GUARD, "--all", "--no-pager", "--property=Id,LoadState,Type,User,Group,FragmentPath,DropInPaths,ExecStart,ExecStartPre,ExecStartPost,ExecCondition,ExecStop,ExecStopPost,ExecReload,Environment,EnvironmentFiles,PassEnvironment,RootDirectory,RootImage"]).output()?;
+    ensure!(
+        output.status.success() && output.stdout.len() <= 65536,
+        "cannot inspect pinned safety guard"
+    );
+    let mut properties = serde_json::Map::new();
+    for line in std::str::from_utf8(&output.stdout)?.lines() {
+        let (key, value) = line.split_once('=').context("invalid guard property")?;
+        ensure!(
+            properties.insert(key.to_string(), json!(value)).is_none(),
+            "duplicate guard property"
+        );
+    }
+    // systemctl's custom printers omit empty command and EnvironmentFiles
+    // arrays even with --all. Missing text is not proof of absence: require
+    // exact empty typed DBus arrays before normalizing those fields.
+    for (property, signature) in [
+        ("EnvironmentFiles", "a(sb)"),
+        ("ExecStartPre", "a(sasbttttuii)"),
+        ("ExecStartPost", "a(sasbttttuii)"),
+        ("ExecCondition", "a(sasbttttuii)"),
+        ("ExecStop", "a(sasbttttuii)"),
+        ("ExecStopPost", "a(sasbttttuii)"),
+        ("ExecReload", "a(sasbttttuii)"),
+    ] {
+        let output = ProcessCommand::new("/usr/bin/busctl").args(["--system", "--json=short", "--timeout=10s", "get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/horizon_2dqualify_2depoch154_2drayon10_2dgrowth_2d20261019_2dv1_2dguard_2eservice", "org.freedesktop.systemd1.Service", property]).output()?;
+        ensure!(
+            output.status.success() && output.stdout.len() <= 65536,
+            "cannot inspect safety guard DBus array"
+        );
+        validate_empty_guard_array(&output.stdout, signature)?;
+        ensure!(
+            properties.get(property).is_none_or(|v| v == ""),
+            "guard property contradicts DBus absence"
+        );
+        properties.insert(property.to_string(), json!(""));
+    }
+    validate_epoch154_guard_properties(&Value::Object(properties))?;
+    for (path, sha) in [
+        (
+            EPOCH154_GUARD_FRAGMENT,
+            "e60da7187a75af6aa11917836f0444a4c011ea43260b96eac56dee7acdf7ee4c",
+        ),
+        (EPOCH154_GUARD_BINARY, EPOCH154_GUARD_BINARY_SHA),
+        (EPOCH154_GUARD_PLAN, EPOCH154_GUARD_PLAN_SHA),
+    ] {
+        pinned_guard_member(path, sha)?;
+    }
+    Ok(())
 }
 
 fn live_binding(observed: &Value, current: &Value) -> bool {
@@ -1073,6 +1230,94 @@ pub(super) async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn epoch154_guard_properties() -> Value {
+        json!({
+            "Id":EPOCH154_SAFETY_GUARD,"LoadState":"loaded","Type":"oneshot",
+            "User":"root","Group":"root","FragmentPath":EPOCH154_GUARD_FRAGMENT,
+            "DropInPaths":"","Environment":"","EnvironmentFiles":"","PassEnvironment":"",
+            "RootDirectory":"","RootImage":"","ExecStartPre":"","ExecStartPost":"","ExecCondition":"","ExecStop":"","ExecStopPost":"","ExecReload":"",
+            "ExecStart":format!("{{ path={EPOCH154_GUARD_BINARY} ; argv[]={EPOCH154_GUARD_BINARY} {EPOCH154_GUARD_PLAN} --plan-sha256 {EPOCH154_GUARD_PLAN_SHA} --self-sha256 {EPOCH154_GUARD_BINARY_SHA} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=42 ; code=(null) ; status=0/0 }}")
+        })
+    }
+
+    #[test]
+    fn safety_guard_exemption_requires_the_complete_exact_nonlaunching_command() {
+        let good = epoch154_guard_properties();
+        validate_epoch154_guard_properties(&good).unwrap();
+        for (key, value) in [
+            ("Id", "horizon-qualify-other-guard.service"),
+            ("Type", "simple"),
+            ("User", "sol"),
+            ("ExecStartPre", "/sealed/jetstreamer-node 154 /output"),
+            ("ExecStartPost", "/sealed/replay"),
+            ("ExecCondition", "/sealed/launch"),
+            ("ExecStop", "/sealed/replay"),
+            ("ExecStopPost", "/sealed/replay"),
+            ("ExecReload", "/sealed/replay"),
+            ("Environment", "LD_PRELOAD=/untrusted.so"),
+            ("EnvironmentFiles", "/untrusted"),
+            ("PassEnvironment", "LD_PRELOAD"),
+            ("DropInPaths", "/untrusted"),
+            ("RootImage", "/untrusted"),
+        ] {
+            let mut bad = good.clone();
+            bad[key] = json!(value);
+            assert!(
+                validate_epoch154_guard_properties(&bad).is_err(),
+                "accepted changed {key}"
+            );
+        }
+        for command in [
+            good["ExecStart"]
+                .as_str()
+                .unwrap()
+                .replace(EPOCH154_GUARD_PLAN_SHA, &"a".repeat(64)),
+            format!(
+                "{} {{ path=/sealed/jetstreamer-node ; argv[]=/sealed/jetstreamer-node 154 /output ; }}",
+                good["ExecStart"].as_str().unwrap()
+            ),
+            good["ExecStart"].as_str().unwrap().replace(
+                " ; ignore_errors=no ;",
+                " --extra-launch-argument ; ignore_errors=no ;",
+            ),
+        ] {
+            let mut bad = good.clone();
+            bad["ExecStart"] = json!(command);
+            assert!(validate_epoch154_guard_properties(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn safety_guard_cannot_hide_an_unbound_or_replaced_parent() {
+        assert!(validate_epoch154_safety_guard(&BTreeMap::new()).is_err());
+        let mut parents = BTreeMap::new();
+        parents.insert(EPOCH154_GUARDED_PRODUCER.to_string(), json!({"InvocationID":"replacement","NRestarts":"0","ActiveState":"active","SubState":"running"}));
+        assert!(validate_epoch154_safety_guard(&parents).is_err());
+    }
+
+    #[test]
+    fn safety_guard_absence_requires_exact_empty_typed_dbus_arrays() {
+        validate_empty_guard_array(br#"{"type":"a(sb)","data":[]}"#, "a(sb)").unwrap();
+        for bad in [
+            br#"{"type":"a(sb)","data":null}"#.as_slice(),
+            br#"{"type":"a(sb)"}"#,
+            br#"{"type":"s","data":[]}"#,
+            br#"{"type":"a(sb)","data":[["/untrusted",true]]}"#,
+        ] {
+            assert!(validate_empty_guard_array(bad, "a(sb)").is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "read-only capability check for the exact dev-samjohnson guard deployment"]
+    fn host_epoch154_safety_guard_exact_deployment_is_observational() {
+        let current = BTreeMap::from([(
+            EPOCH154_GUARDED_PRODUCER.to_string(),
+            unit(EPOCH154_GUARDED_PRODUCER).unwrap(),
+        )]);
+        validate_epoch154_safety_guard(&current).unwrap();
+    }
+
     fn pipeline_fixture() -> (PipelineClaim, Value) {
         let claim = PipelineClaim {
             epoch: 213,
