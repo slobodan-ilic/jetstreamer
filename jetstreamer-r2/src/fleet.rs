@@ -277,6 +277,12 @@ fn validate_same_sample_admission(
     // Only these separately pinned private measurement contracts may report
     // one same-sample admission; this never grants launch authority.
     let expected_guard = match claim.epoch {
+        224 if claim
+            .unit
+            .starts_with("horizon-qualify-224-bounded-resource-") =>
+        {
+            "f4f5c0758c1c02b7d9a3b2b1595af7bbc033997f671cd43f2d4a92d38c346c69"
+        }
         225 if claim
             .unit
             .starts_with("horizon-qualify-225-bounded-resource-") =>
@@ -2184,6 +2190,35 @@ mod tests {
         current.pipeline_claims.clear();
         assert!(preserve_pipeline_claims(&previous, &current).is_err());
     }
+    #[test]
+    fn bounded_224_same_sample_admission_requires_its_exact_guard_and_target_path() {
+        let (previous, mut plan, mut guard, mut gp) = admission_fixture();
+        plan.diagnostics[1].epoch = 224;
+        plan.diagnostics[1].unit = "horizon-qualify-224-bounded-resource-test.service".into();
+        plan.diagnostics[1].scratch_path =
+            "/home/ubuntu/.jetstreamer-private/bounded-resource-224-test".into();
+        let claim = &plan.diagnostics[1];
+        guard["producer"]["cgroup"] = json!(format!("/system.slice/{}", claim.unit));
+        gp["unit"] = json!(claim.unit);
+        gp["worker_root"] = json!(claim.scratch_path);
+        gp["bounded_canary"]["maximum_drainage_seconds"] = json!(180);
+        gp["bounded_canary"]["target_stop_intent"] =
+            json!(claim.scratch_path.join("receipts/target-stop.json"));
+        let sample = "2026-10-20T00:04:42Z";
+        assert!(
+            validate_same_sample_admission(&previous, &plan, sample, &guard, &gp, 1792455130)
+                .is_err()
+        );
+        guard["guard_sha256"] =
+            json!("f4f5c0758c1c02b7d9a3b2b1595af7bbc033997f671cd43f2d4a92d38c346c69");
+        validate_same_sample_admission(&previous, &plan, sample, &guard, &gp, 1792455130).unwrap();
+        gp["bounded_canary"]["target_stop_intent"] = json!("/other/receipts/target-stop.json");
+        assert!(
+            validate_same_sample_admission(&previous, &plan, sample, &guard, &gp, 1792455130)
+                .is_err()
+        );
+    }
+
     #[test]
     fn bounded_203_same_sample_event_requires_its_own_guard_and_preserves_cadence() {
         let (previous, mut plan, mut guard, mut gp) = admission_fixture();
