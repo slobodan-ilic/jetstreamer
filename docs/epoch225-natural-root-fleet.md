@@ -45,3 +45,12 @@ After natural completion and independent qualification, a separately reviewed
 epoch-225-only artifact/runtime path, normal full/current-plugin checks and
 authenticated R2 upload/readback are still required. Epoch 226's tail and the
 campaign's eventual epoch-301 tail remain private.
+
+The independent qualification reader accepts the producer's literal
+`output/epoch-225.jet` only inside a direct private
+`qualification-225-v1625-*` root and only for the exact bootstrap/output/terminal,
+v1.6.25 worker digest and 863,465-slot scope above. It additionally binds the
+canonical bootstrap and terminal accounts hashes and exact upstream revision.
+This filename exception does not make the combined artifact a canonical epoch,
+skip the complete reread or sidecar-absence checks, or authorize publication.
+Never rename or independently validate the producer's still-growing archive.

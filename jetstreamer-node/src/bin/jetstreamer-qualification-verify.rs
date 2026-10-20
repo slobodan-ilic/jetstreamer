@@ -312,18 +312,54 @@ fn root_prefix_203(arguments: &Arguments) -> bool {
             == "3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a"
 }
 
+fn complete_span_225(arguments: &Arguments) -> bool {
+    arguments.private_root.parent() == Some(Path::new("/home/ubuntu/.jetstreamer-private"))
+        && arguments
+            .private_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("qualification-225-v1625-"))
+        && arguments.archive == arguments.private_root.join("output/epoch-225.jet")
+        && arguments.expected_epoch == 225
+        && arguments.expected_output_start_slot == 97_200_000
+        && arguments.expected_bootstrap_slot == 97_199_617
+        && arguments.expected_terminal_slot == 98_063_464
+        && arguments.expected_runtime_profile == "solana-v1.6.25"
+        && arguments.expected_worker_sha256
+            == "7cd48efc8719109a69fafcb3209a821ea9f07113e3fb0bfab49db23a6e77a146"
+}
+
 fn validate_archive_name(arguments: &Arguments, archive: &Path) -> Result<(), String> {
     let expected_name = format!(
         "epoch-{}-through-{}.jet",
         arguments.expected_epoch, arguments.expected_terminal_slot
     );
     if archive.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
-        && !(archive == arguments.archive && root_prefix_203(arguments))
+        && !(archive == arguments.archive
+            && (root_prefix_203(arguments) || complete_span_225(arguments)))
     {
         return Err(format!(
             "qualification archive filename must be {expected_name}: {}",
             archive.display()
         ));
+    }
+    Ok(())
+}
+
+fn validate_complete_span_225_roots(
+    arguments: &Arguments,
+    bootstrap_accounts_hash: &str,
+    terminal_accounts_hash: &str,
+    revision: &str,
+) -> Result<(), String> {
+    if complete_span_225(arguments)
+        && (bootstrap_accounts_hash != "HE57JmgvEeZjBKN8cfTLrmyCbUnptJ9PWjUdTzgxSSdi"
+            || terminal_accounts_hash != "4TaJaC5esCEWtHp5Fay2aMS9XjA1o9bwQthcvBeSyYbR"
+            || revision != "7de8a55b54d3e11058b82f9483bb405d143b455c")
+    {
+        return Err(
+            "epoch225 complete span does not bind its canonical roots and runtime revision".into(),
+        );
     }
     Ok(())
 }
@@ -412,6 +448,12 @@ fn verify(arguments: &Arguments) -> Result<serde_json::Value, String> {
     }
     validate_prefix_root_identity(
         arguments,
+        &manifest.terminal.accounts_hash,
+        &manifest.runtime.runtime_revision,
+    )?;
+    validate_complete_span_225_roots(
+        arguments,
+        &manifest.bootstrap.accounts_hash,
         &manifest.terminal.accounts_hash,
         &manifest.runtime.runtime_revision,
     )?;
@@ -767,6 +809,81 @@ mod tests {
         changed[0] = "/private/epoch-204-prefix.jet".into();
         let args = parse_arguments(changed).unwrap();
         assert!(validate_archive_name(&args, &args.archive).is_err());
+    }
+
+    fn complete_span_225_arguments() -> Vec<String> {
+        let root = "/home/ubuntu/.jetstreamer-private/qualification-225-v1625-natural-root-test";
+        vec![
+            format!("{root}/output/epoch-225.jet"),
+            format!("--private-root={root}"),
+            "--expected-epoch=225".into(),
+            "--expected-output-start-slot=97200000".into(),
+            "--expected-bootstrap-slot=97199617".into(),
+            "--expected-terminal-slot=98063464".into(),
+            "--expected-runtime-profile=solana-v1.6.25".into(),
+            "--expected-worker-sha256=7cd48efc8719109a69fafcb3209a821ea9f07113e3fb0bfab49db23a6e77a146".into(),
+        ]
+    }
+
+    #[test]
+    fn complete_span_225_filename_is_exact_private_scope_not_a_canonical_epoch() {
+        let raw = complete_span_225_arguments();
+        let args = parse_arguments(raw.clone()).unwrap();
+        assert!(complete_span_225(&args));
+        validate_archive_name(&args, &args.archive).unwrap();
+        assert_eq!(
+            args.expected_terminal_slot - args.expected_output_start_slot + 1,
+            863_465
+        );
+        for (key, value) in [
+            ("epoch", "224"),
+            ("output-start-slot", "97200001"),
+            ("bootstrap-slot", "97199618"),
+            ("terminal-slot", "97631459"),
+            ("runtime-profile", "solana-v1.6.20"),
+            ("worker-sha256", &"a".repeat(64)),
+        ] {
+            let mut changed = raw.clone();
+            *changed
+                .iter_mut()
+                .find(|s| s.starts_with(&format!("--expected-{key}=")))
+                .unwrap() = format!("--expected-{key}={value}");
+            let args = parse_arguments(changed).unwrap();
+            assert!(!complete_span_225(&args), "{key}");
+            assert!(
+                validate_archive_name(&args, &args.archive).is_err(),
+                "{key}"
+            );
+        }
+        for root in [
+            "/home/ubuntu/horizon",
+            "/home/ubuntu/.jetstreamer-private/unrelated",
+        ] {
+            let mut args = parse_arguments(raw.clone()).unwrap();
+            args.private_root = root.into();
+            args.archive = args.private_root.join("output/epoch-225.jet");
+            assert!(!complete_span_225(&args));
+            assert!(validate_archive_name(&args, &args.archive).is_err());
+        }
+        assert!(validate_archive_name(&args, Path::new("/private/epoch-225.jet")).is_err());
+    }
+
+    #[test]
+    fn complete_span_225_named_artifact_binds_both_roots_and_upstream_revision() {
+        let args = parse_arguments(complete_span_225_arguments()).unwrap();
+        let bootstrap = "HE57JmgvEeZjBKN8cfTLrmyCbUnptJ9PWjUdTzgxSSdi";
+        let terminal = "4TaJaC5esCEWtHp5Fay2aMS9XjA1o9bwQthcvBeSyYbR";
+        let revision = "7de8a55b54d3e11058b82f9483bb405d143b455c";
+        validate_complete_span_225_roots(&args, bootstrap, terminal, revision).unwrap();
+        for (bootstrap, terminal, revision) in [
+            ("wrong-bootstrap", terminal, revision),
+            (bootstrap, "wrong-terminal", revision),
+            (bootstrap, terminal, "wrong-revision"),
+        ] {
+            assert!(
+                validate_complete_span_225_roots(&args, bootstrap, terminal, revision).is_err()
+            );
+        }
     }
 
     #[test]
