@@ -1,5 +1,8 @@
 //! Private epoch225 measurement; no runtime, root, or publication promotion.
 mod profile {
+    pub const NATURAL_ROOT_FINISH: bool = false;
+    pub const ARCHIVE_NAME: &str = "epoch-225-canary.jet";
+    pub const PARENT_SHA: &str = "";
     pub const RAYON_THREADS: u32 = 16;
     pub const EPOCH: u64 = 225;
     pub const TARGET: u64 = 97_202_500;
@@ -29,7 +32,11 @@ mod profile {
     };
     pub const SNAPSHOT: &str = "094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d";
 }
-mod bounded_resource_runner;
+mod bounded_resource_runner {
+    include!("bounded_resource_runner.rs");
+    #[cfg(test)]
+    legacy_profile_tests!();
+}
 fn main() {
     bounded_resource_runner::main();
 }

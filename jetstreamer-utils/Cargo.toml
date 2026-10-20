@@ -15,6 +15,8 @@ sst-capability-tests = ["dep:rocksdb"]
 epoch225-v1-6-25-diagnostic = []
 # Private same-input epoch203 resource comparison; no runtime promotion.
 epoch203-single-thread-resource = []
+# Private, resource-limited canonical-root prefix qualification, not publication.
+epoch203-root-prefix-resource = []
 
 [lib]
 name = "jetstreamer_utils"
@@ -98,6 +100,11 @@ path = "src/epoch203_bounded_resource_bin.rs"
 [[bin]]
 name = "jetstreamer-epoch203-resource-compare"
 path = "src/epoch203_resource_compare_bin.rs"
+
+[[bin]]
+name = "jetstreamer-epoch203-root-prefix-resource"
+path = "src/epoch203_root_prefix_resource_bin.rs"
+required-features = ["epoch203-root-prefix-resource"]
 
 [[bin]]
 name = "jetstreamer-epoch213-private-verify"

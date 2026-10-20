@@ -180,7 +180,10 @@ fn validate_same_sample_admission(
         }
         203 if claim
             .unit
-            .starts_with("horizon-qualify-203-bounded-resource-") =>
+            .starts_with("horizon-qualify-203-bounded-resource-")
+            || claim
+                .unit
+                .starts_with("horizon-qualify-203-root-prefix-resource-") =>
         {
             "cc3536dfcc268c913feccf1603a25e3cdbdf2807289c9061e04884027d1b1560"
         }
@@ -240,7 +243,7 @@ fn validate_same_sample_admission(
             && guard_plan["unit"] == claim.unit
             && guard_plan["invocation_id"] == claim.invocation_id
             && guard_plan["worker_root"].as_str() == claim.scratch_path.to_str()
-            && guard_plan["bounded_canary"]["expected_uid"] == 1000
+            && diagnostic_guard_profile_matches(claim, guard_plan)
             && guard_plan["maximum_worker_vmas"] == 3_500_000
             && guard["maximum_worker_vmas"] == guard_plan["maximum_worker_vmas"]
             && guard["minimum_free_bytes"] == guard_plan["minimum_free_bytes"]
@@ -256,6 +259,24 @@ fn validate_same_sample_admission(
     Ok(())
 }
 
+fn diagnostic_guard_profile_matches(claim: &DiagnosticClaim, plan: &Value) -> bool {
+    if claim.epoch == 203
+        && claim
+            .unit
+            .starts_with("horizon-qualify-203-root-prefix-resource-")
+    {
+        // A natural-completion qualification is not a target-stopped benchmark.
+        // Its first fire must still prove one worker above the old-growth floor.
+        plan.get("bounded_canary").is_none_or(Value::is_null)
+            && plan.get("bounded_measurement").is_none_or(Value::is_null)
+            && plan["minimum_free_bytes"]
+                .as_u64()
+                .is_some_and(|v| v >= 2_158_885_108_875)
+    } else {
+        plan["bounded_canary"]["expected_uid"] == 1000
+    }
+}
+
 fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Result<()> {
     let continuation =
         receipt["schema"] == "jetstreamer-private-epoch213-checkpoint-continuation-launch-v1";
@@ -266,6 +287,8 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
     let bounded_v1625 = receipt["schema"] == "jetstreamer-private-epoch225-v1625-bounded-launch-v1";
     let bounded_203 =
         receipt["schema"] == "jetstreamer-private-epoch203-bounded-resource-launch-v1";
+    let root_prefix_203 =
+        receipt["schema"] == "jetstreamer-private-epoch203-root-prefix-resource-launch-v1";
     let private_verify_213 =
         receipt["schema"] == "jetstreamer-private-epoch213-verification-launch-v1";
     ensure!(
@@ -274,6 +297,7 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             || bounded_resource
             || bounded_v1625
             || bounded_203
+            || root_prefix_203
             || private_verify_213
             || receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1")
             && receipt["launched"] == true
@@ -335,6 +359,45 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
                 == "f39140b9a9659e7c6e8207076a2d0c560a6b69df42cc92e19a421cf46c2b761c"
             && receipt["replay_entries_authorized"] == false
             && receipt["full_cold_epoch_peak_qualified"] == false
+            && receipt["canonical_sidecar_authorized"] == false
+            && receipt["publication_authorized"] == false
+    } else if root_prefix_203 {
+        claim.epoch == 203
+            && claim
+                .unit
+                .starts_with("horizon-qualify-203-root-prefix-resource-")
+            && claim.unit.ends_with(".service")
+            && claim.scratch_path.parent() == Some(Path::new("/home/ubuntu/.jetstreamer-private"))
+            && claim
+                .scratch_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with("root-prefix-resource-203-"))
+            && receipt["epoch"] == 203
+            && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+            && receipt["snapshot_slot"] == 87_695_515u64
+            && receipt["snapshot_sha256"]
+                == "e45584858d0c825f095a43ff5e5909e62a68d197d39c042a76727454525228c4"
+            && receipt["worker_sha256"]
+                == "3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a"
+            && receipt["node_sha256"]
+                == "025757b9b337abf05435c427f143f590d9bfa542b5e4493aae783c158b4f2d3d"
+            && receipt["runner_sha256"]
+                == "dee8959e8436ebd856b5b8d7e18f06464377b26fadb3a7a9f09ab158f9fd4a4e"
+            && receipt["runtime"] == "solana-v1.6.16"
+            && receipt["runtime_semantics_changed"] == false
+            && receipt["solana_rayon_threads"] == 16
+            && receipt["output_slot_start"] == 87_696_000u64
+            && receipt["output_slot_count"] == 431_581u64
+            && receipt["terminal_root_slot"] == 88_127_580u64
+            && receipt["natural_parent_completion_required"] == true
+            && receipt["maximum_terminal_scratch_bytes"] == 768u64 << 30
+            && receipt["maximum_runtime_seconds"] == 259200u64
+            && receipt["root_prefix_resource_attempt_authorized"] == true
+            && receipt["canonical_prefix_independently_qualified"] == false
+            && receipt["full_cold_epoch_peak_qualified"] == false
+            && receipt["ordinary_replay_authorized"] == false
+            && receipt["runtime_promotion_authorized"] == false
             && receipt["canonical_sidecar_authorized"] == false
             && receipt["publication_authorized"] == false
     } else if bounded_203 {
@@ -1435,6 +1498,99 @@ mod tests {
         let guard = json!({"schema":"jetstreamer-horizon-standalone-guard-sample-v1","guard_sha256":"61e189bb50d58fa446b84f016d3b19433c30f490c6d470907130f113a01b644a","recorded_unix_seconds":1792455124u64,"producer_invocation_id":"c".repeat(32),"producer":{"invocation_id":"c".repeat(32),"cgroup":"/system.slice/horizon-qualify-225-bounded-resource-test.service","active":"active","sub":"running","load_state":"loaded","result":"success","restart_policy":"no","kill_mode":"control-group","delegated":false,"restarts":0,"pid":123},"trip_reason":null,"worker_observation_error":null,"canary_target_error":null,"workers":[[124,416937]],"maximum_worker_vmas":3500000,"minimum_free_bytes":2910800286422u64,"available_bytes":3605067464704u64,"r2_mutations":false,"remote_mutations":false});
         let guard_plan = json!({"schema":"jetstreamer-horizon-standalone-guard-plan-v1","unit":"horizon-qualify-225-bounded-resource-test.service","invocation_id":"c".repeat(32),"worker_root":"/new/scratch","bounded_canary":{"expected_uid":1000},"maximum_worker_vmas":3500000,"minimum_free_bytes":2910800286422u64});
         (previous, plan, guard, guard_plan)
+    }
+    #[test]
+    fn natural_root_prefix_admission_still_requires_one_real_worker_and_protection() {
+        let (previous, mut plan, mut guard, mut gp) = admission_fixture();
+        let name = "horizon-qualify-203-root-prefix-resource-test.service";
+        plan.diagnostics[1].epoch = 203;
+        plan.diagnostics[1].unit = name.into();
+        gp["unit"] = json!(name);
+        gp.as_object_mut().unwrap().remove("bounded_canary");
+        guard["producer"]["cgroup"] = json!(format!("/system.slice/{name}"));
+        guard["guard_sha256"] =
+            json!("cc3536dfcc268c913feccf1603a25e3cdbdf2807289c9061e04884027d1b1560");
+        validate_same_sample_admission(
+            &previous,
+            &plan,
+            "2026-10-20T00:04:42Z",
+            &guard,
+            &gp,
+            1792455200,
+        )
+        .unwrap();
+        let mut bad = guard.clone();
+        bad["workers"] = json!([]);
+        assert!(
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &bad,
+                &gp,
+                1792455200
+            )
+            .is_err()
+        );
+        gp["minimum_free_bytes"] = json!(2_158_885_108_874u64);
+        guard["minimum_free_bytes"] = gp["minimum_free_bytes"].clone();
+        assert!(
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &gp,
+                1792455200
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn root_prefix_launch_is_exact_and_not_full_epoch_or_peak_qualification() {
+        let claim = DiagnosticClaim {
+            epoch: 203,
+            unit: "horizon-qualify-203-root-prefix-resource-test.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/home/ubuntu/.jetstreamer-private/root-prefix-resource-203-test".into(),
+            launch_receipt: BoundFile {
+                path: "/sealed/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let r = json!({"schema":"jetstreamer-private-epoch203-root-prefix-resource-launch-v1","launched":true,
+            "epoch":203,"private_run_root":claim.scratch_path,"snapshot_slot":87695515,
+            "snapshot_sha256":"e45584858d0c825f095a43ff5e5909e62a68d197d39c042a76727454525228c4",
+            "worker_sha256":"3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a",
+            "node_sha256":"025757b9b337abf05435c427f143f590d9bfa542b5e4493aae783c158b4f2d3d",
+            "runner_sha256":"dee8959e8436ebd856b5b8d7e18f06464377b26fadb3a7a9f09ab158f9fd4a4e",
+            "runtime":"solana-v1.6.16","runtime_semantics_changed":false,"solana_rayon_threads":16,
+            "output_slot_start":87696000,"output_slot_count":431581,"terminal_root_slot":88127580,
+            "natural_parent_completion_required":true,"maximum_terminal_scratch_bytes":768u64<<30,
+            "maximum_runtime_seconds":259200,"root_prefix_resource_attempt_authorized":true,
+            "canonical_prefix_independently_qualified":false,"full_cold_epoch_peak_qualified":false,
+            "ordinary_replay_authorized":false,"runtime_promotion_authorized":false,
+            "canonical_sidecar_authorized":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false,
+            "evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,
+                "restarts":0,"load_state":"loaded","active_state":"active","sub_state":"running","main_pid":123,"result":"success"}]}});
+        validate_diagnostic_launch(&r, &claim).unwrap();
+        for (key, value) in [
+            ("output_slot_count", json!(432000)),
+            ("terminal_root_slot", json!(88127999)),
+            ("worker_sha256", json!("c".repeat(64))),
+            ("natural_parent_completion_required", json!(false)),
+            ("canonical_prefix_independently_qualified", json!(true)),
+            ("full_cold_epoch_peak_qualified", json!(true)),
+            ("ordinary_replay_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+        ] {
+            let mut bad = r.clone();
+            bad[key] = value;
+            assert!(
+                validate_diagnostic_launch(&bad, &claim).is_err(),
+                "accepted {key}"
+            );
+        }
     }
     #[test]
     fn same_sample_admission_is_one_guarded_event_not_another_poll() {

@@ -1,5 +1,9 @@
 # Epoch 203 bounded prefix resource measurement
 
+For the separately scoped natural-completion canonical-root attempt, see
+[epoch203-root-prefix-resource.md](epoch203-root-prefix-resource.md). Its longer
+target does not change these target-stopped benchmark contracts.
+
 `jetstreamer-epoch203-bounded-resource` is a separate private measurement binary,
 not a complete-prefix replay or complete-epoch qualification. Historical attempts
 stopped at 16.10% and 64.35%; their outputs were retired on October 9. No complete

@@ -1,5 +1,8 @@
 //! Separate store8 epoch203 prefix measurement; not a complete-prefix replay.
 mod profile {
+    pub const NATURAL_ROOT_FINISH: bool = false;
+    pub const ARCHIVE_NAME: &str = "epoch-203-canary.jet";
+    pub const PARENT_SHA: &str = "";
     pub const RAYON_THREADS: u32 = if cfg!(feature = "epoch203-single-thread-resource") {
         1
     } else {
@@ -34,7 +37,11 @@ mod profile {
     pub const WORKER_ENV: &str = "JETSTREAMER_HISTORICAL_WORKER_V1_6_16";
     pub const SNAPSHOT: &str = "e45584858d0c825f095a43ff5e5909e62a68d197d39c042a76727454525228c4";
 }
-mod bounded_resource_runner;
+mod bounded_resource_runner {
+    include!("bounded_resource_runner.rs");
+    #[cfg(test)]
+    legacy_profile_tests!();
+}
 fn main() {
     bounded_resource_runner::main();
 }

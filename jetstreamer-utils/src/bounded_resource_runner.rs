@@ -1,5 +1,5 @@
-//! Private target-stopped resource measurement with a binary-local sealed scope.
-//! This wrapper never imports archives or creates canonical checksum sidecars.
+// Private resource measurement with a binary-local sealed scope.
+// This wrapper never imports archives or creates canonical checksum sidecars.
 use {
     anyhow::{Context, Result, ensure},
     serde::Deserialize,
@@ -181,6 +181,10 @@ fn validate_plan(p: &Plan) -> Result<()> {
         digest(&p.node.sha256) && digest(&p.epoch_hashes.sha256),
         "invalid input digest"
     );
+    ensure!(
+        !NATURAL_ROOT_FINISH || p.node.sha256 == PARENT_SHA,
+        "root-prefix parent differs from the exact capability-bound build"
+    );
     Ok(())
 }
 
@@ -194,9 +198,7 @@ fn command(p: &Plan) -> Command {
         .arg(format!("--epoch-hashes={}", p.epoch_hashes.path.display()))
         .arg(format!(
             "--horizon-output={}",
-            p.run_root
-                .join(format!("output/epoch-{EPOCH}-canary.jet"))
-                .display()
+            p.run_root.join("output").join(ARCHIVE_NAME).display()
         ))
         .arg(format!(
             "--replay-scratch={}",
@@ -547,13 +549,238 @@ fn run() -> Result<()> {
     output.set_permissions(fs::Permissions::from_mode(0o400))?;
     File::open(p.run_root.join("ledger"))?.sync_all()?;
     let mut cmd = command(&p);
-    measure(
+    let execute = if NATURAL_ROOT_FINISH {
+        measure_root
+    } else {
+        measure
+    };
+    execute(
         &p,
         &invocation,
         &cgroup,
         &mut cmd,
         &json!({"plan_path":args[1],"plan_sha256":args[3],"self_sha256":args[5]}),
     )
+}
+
+fn root_manifest_valid(m: &Value) -> Result<()> {
+    ensure!(
+        NATURAL_ROOT_FINISH && EPOCH == 203 && TARGET == TERMINAL,
+        "root completion is not a target-stop profile"
+    );
+    ensure!(
+        m["schema_version"] == 1
+            && m["epoch"] == 203
+            && m["output_slot_start"] == 87_696_000u64
+            && m["output_slot_count"] == 431_581u64
+            && m["worker_executable_sha256"] == WORKER
+            && m["runtime"]["runtime_profile"] == "solana-v1.6.16"
+            && m["bootstrap"]["slot"] == 87_695_515u64
+            && m["bootstrap"]["slot_complete"] == true
+            && m["terminal"]["slot"] == 88_127_580u64
+            && m["terminal"]["slot_complete"] == true
+            && m["terminal"]["accounts_hash"] == "4SeHmKHQrHot4gwifo1bnvDKXZwGELk2vSenotTx9oqf"
+            && m["archive_sha256"]
+                .as_str()
+                .is_some_and(|s| digest(s) && s != "0".repeat(64)),
+        "producer segment does not bind the exact complete canonical-root prefix"
+    );
+    Ok(())
+}
+
+fn root_checkpoint_marker(line: &str) -> bool {
+    let Some((prefix, body)) =
+        line.split_once(" jetstreamer_node::historical_replay] historical checkpoint slot=")
+    else {
+        return false;
+    };
+    prefix.starts_with('[')
+        && prefix.contains(" INFO ")
+        && body.split_whitespace().next() == Some("88127580")
+        && body.split_whitespace().any(|s| s == "complete=true")
+}
+
+fn read_private_manifest(path: &Path) -> Result<(Value, String)> {
+    ensure!(
+        path.is_absolute() && path.canonicalize()? == path,
+        "noncanonical manifest"
+    );
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let before = f.metadata()?;
+    ensure!(
+        before.is_file()
+            && before.uid() == unsafe { libc::geteuid() }
+            && before.nlink() == 1
+            && before.mode() & 0o077 == 0
+            && before.len() <= 1 << 20,
+        "unsafe producer manifest"
+    );
+    let mut bytes = Vec::new();
+    (&mut f).take((1 << 20) + 1).read_to_end(&mut bytes)?;
+    let after = fs::symlink_metadata(path)?;
+    ensure!(
+        bytes.len() as u64 == before.len()
+            && before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+            && after.len() == before.len(),
+        "producer manifest changed"
+    );
+    Ok((
+        serde_json::from_slice(&bytes)?,
+        hex(&Sha256::digest(&bytes)),
+    ))
+}
+
+/// Natural, verified parent completion is mandatory for this distinct profile.
+/// Reaching a progress marker never sends SIGINT or declares a prefix complete.
+fn measure_root(
+    p: &Plan,
+    invocation: &str,
+    cgroup: &Path,
+    cmd: &mut Command,
+    bindings: &Value,
+) -> Result<()> {
+    ensure!(
+        NATURAL_ROOT_FINISH && TARGET == TERMINAL,
+        "not a natural root profile"
+    );
+    let free_before = free_bytes(&p.run_root)?;
+    ensure!(free_before >= p.minimum_free_bytes, "fresh free-space gate");
+    let before = metrics(cgroup)?;
+    install_signals()?;
+    let mut child = ChildGroup(cmd.spawn()?, false);
+    let pid = child.0.id();
+    let (tx, rx) = mpsc::sync_channel(64);
+    reader(child.0.stdout.take().context("stdout")?, tx.clone());
+    reader(child.0.stderr.take().context("stderr")?, tx);
+    let started = Instant::now();
+    let mut capture = Value::Null;
+    let mut capture_error: Option<String> = None;
+    let mut first_progress = Value::Null;
+    let mut last_progress = Value::Null;
+    let mut manifest = Value::Null;
+    let mut manifest_sha = String::new();
+    let mut archive_length = 0;
+    let mut code = None;
+    let outcome = (|| -> Result<()> {
+        loop {
+            ensure!(
+                EXTERNAL_SIGNAL.load(Ordering::SeqCst) == 0,
+                "external signal"
+            );
+            ensure!(
+                started.elapsed().as_secs() < p.maximum_runtime_seconds,
+                "runtime bound"
+            );
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(line)) => {
+                    print!("{line}");
+                    std::io::stdout().flush()?;
+                    if let Some(mut counters) = progress_counters(&line) {
+                        counters["elapsed_millis"] = json!(started.elapsed().as_millis());
+                        if first_progress.is_null() {
+                            first_progress = counters.clone();
+                        }
+                        last_progress = counters;
+                    }
+                    if capture.is_null()
+                        && capture_error.is_none()
+                        && (root_checkpoint_marker(&line) || progress_slot(&line) == Some(TERMINAL))
+                    {
+                        freeze_group(pid)?;
+                        let measured = capture_resources(&p.run_root.join("scratch"), cgroup);
+                        group_signal(pid, libc::SIGCONT)?;
+                        match measured {
+                            Ok(value) => {
+                                ensure!(
+                                    value["scratch"]["physical_bytes"]
+                                        .as_u64()
+                                        .is_some_and(|bytes| bytes <= MAX_SCRATCH),
+                                    "terminal scratch bound"
+                                );
+                                persist(&p.run_root.join("receipts/root-capture.json"), &value)?;
+                                capture = value;
+                            }
+                            // Optional telemetry cannot discard a valid parent result.
+                            Err(e) => capture_error = Some(format!("{e:#}")),
+                        }
+                    }
+                }
+                Ok(Err(e)) => anyhow::bail!("child log: {e}"),
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+            if let Some(status) = child.0.try_wait()? {
+                child.1 = true;
+                code = status.code();
+                ensure!(status.success(), "root-prefix parent failed: {status}");
+                break;
+            }
+        }
+        let archive = p.run_root.join("output").join(ARCHIVE_NAME);
+        let sidecar = PathBuf::from(format!("{}.sha256", archive.display()));
+        ensure!(
+            fs::symlink_metadata(&sidecar).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "private prefix acquired a canonical sidecar"
+        );
+        let metadata = fs::symlink_metadata(&archive)?;
+        ensure!(
+            metadata.is_file()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o077 == 0
+                && metadata.len() > 0,
+            "unsafe private prefix archive"
+        );
+        archive_length = metadata.len();
+        let pair = read_private_manifest(&PathBuf::from(format!(
+            "{}.segment.json",
+            archive.display()
+        )))?;
+        root_manifest_valid(&pair.0)?;
+        manifest = pair.0;
+        manifest_sha = pair.1;
+        Ok(())
+    })();
+    if !child.1 {
+        group_signal(pid, libc::SIGCONT)?;
+        group_signal(pid, libc::SIGKILL)?;
+    }
+    let external = EXTERNAL_SIGNAL.load(Ordering::SeqCst);
+    let outcome = outcome.and_then(|()| {
+        ensure!(external == 0, "external signal after parent completion");
+        Ok(())
+    });
+    let success = outcome.is_ok();
+    let error = outcome.as_ref().err().map(|e| format!("{e:#}"));
+    let payload = json!({"schema":RESULT_SCHEMA,"epoch":EPOCH,"unit":p.unit,
+        "invocation_id":invocation,"plan":{"path":bindings["plan_path"],"sha256":bindings["plan_sha256"]},
+        "runner_sha256":bindings["self_sha256"],"node_sha256":p.node.sha256,"worker_sha256":WORKER,
+        "snapshot_sha256":SNAPSHOT,"target_slot":TARGET,"terminal_root_slot":TERMINAL,
+        "natural_parent_completion_required":true,"child_return_code":code,
+        "external_signal":external,"elapsed_millis":started.elapsed().as_millis(),
+        "solana_rayon_threads":RAYON_THREADS,"first_progress":first_progress,"last_progress":last_progress,
+        "capture":capture,"capture_error":capture_error,"capture_is_peak_proof":false,
+        "cgroup_before":before,"cgroup_after":metrics(cgroup)?,"archive_length":archive_length,
+        "producer_segment_manifest":manifest,"producer_segment_manifest_sha256":manifest_sha,
+        "free_before":free_before,"free_after":free_bytes(&p.run_root)?,"success":success,"error":error,
+        "producer_canonical_root_prefix_present":success,
+        "authority":{"canonical_prefix_independently_qualified":false,"full_cold_epoch_peak_qualified":false,
+            "ordinary_replay_authorized":false,"runtime_promotion_authorized":false,
+            "canonical_sidecar_authorized":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false}});
+    persist(
+        &p.run_root.join(if success {
+            "receipts/root-prefix.json"
+        } else {
+            "receipts/failure.json"
+        }),
+        &payload,
+    )?;
+    outcome
 }
 
 fn measure(
@@ -703,6 +930,273 @@ pub(crate) fn main() {
 }
 
 #[cfg(test)]
+#[allow(unused_macros)]
+macro_rules! root_profile_tests {
+() => {
+mod root_tests {
+    use super::*;
+    fn manifest() -> Value {
+        json!({"schema_version":1,"epoch":203,"output_slot_start":87696000,
+            "output_slot_count":431581,"worker_executable_sha256":WORKER,
+            "runtime":{"runtime_profile":"solana-v1.6.16"},
+            "bootstrap":{"slot":87695515,"slot_complete":true},
+            "terminal":{"slot":88127580,"slot_complete":true,
+                "accounts_hash":"4SeHmKHQrHot4gwifo1bnvDKXZwGELk2vSenotTx9oqf"},
+            "archive_sha256":"a".repeat(64)})
+    }
+    fn plan(root: PathBuf) -> Plan {
+        Plan {
+            schema: PLAN_SCHEMA.into(),
+            unit: format!("{UNIT_PREFIX}test.service"),
+            node: BoundFile {
+                path: "/sealed/node".into(),
+                sha256: PARENT_SHA.into(),
+            },
+            worker: "/sealed/worker".into(),
+            snapshot: PathBuf::from(format!("/sealed/{SNAPSHOT_NAME}")),
+            ledger_directory: "/sealed".into(),
+            epoch_hashes: BoundFile {
+                path: "/sealed/hashes".into(),
+                sha256: "b".repeat(64),
+            },
+            run_root: root,
+            target_slot: TARGET,
+            terminal_slot: TERMINAL,
+            minimum_free_bytes: MINIMUM_FREE,
+            maximum_runtime_seconds: MAX_RUNTIME,
+        }
+    }
+    #[test]
+    fn fixed_root_scope_and_parent_cannot_be_widened() {
+        let root = PathBuf::from(format!(
+            "/home/ubuntu/.jetstreamer-private/{ROOT_PREFIX}test"
+        ));
+        let p = plan(root.clone());
+        validate_plan(&p).unwrap();
+        assert!(NATURAL_ROOT_FINISH && TARGET == TERMINAL);
+        assert_eq!(TARGET, 88127580);
+        assert_eq!(MAX_SCRATCH, 768 << 30);
+        for which in 0..5 {
+            let mut p = plan(root.clone());
+            match which {
+                0 => p.target_slot += 1,
+                1 => p.terminal_slot += 1,
+                2 => p.minimum_free_bytes -= 1,
+                3 => p.node.sha256 = "c".repeat(64),
+                _ => p.maximum_runtime_seconds = MAX_RUNTIME + 1,
+            }
+            assert!(validate_plan(&p).is_err());
+        }
+    }
+    #[test]
+    fn exact_root_prefix_is_not_a_full_epoch_or_successor_tail() {
+        root_manifest_valid(&manifest()).unwrap();
+        for (key, v) in [
+            ("epoch", json!(204)),
+            ("output_slot_start", json!(87695516)),
+            ("output_slot_count", json!(432000)),
+            ("schema_version", json!(2)),
+            ("worker_executable_sha256", json!("b".repeat(64))),
+            ("archive_sha256", json!("0".repeat(64))),
+        ] {
+            let mut m = manifest();
+            m[key] = v;
+            assert!(root_manifest_valid(&m).is_err(), "accepted {key}");
+        }
+        for key in ["slot", "slot_complete", "accounts_hash"] {
+            let mut m = manifest();
+            m["terminal"][key] = Value::Null;
+            assert!(root_manifest_valid(&m).is_err());
+        }
+    }
+    #[test]
+    fn checkpoint_marker_is_parent_only_and_does_not_finish_the_attempt() {
+        let good = "[2026 INFO  jetstreamer_node::historical_replay] historical checkpoint slot=88127580 bank_hash=foo complete=true writes=0";
+        assert!(root_checkpoint_marker(good));
+        for bad in [
+            good.replace("INFO", "ERROR"),
+            good.replace("88127580", "88127579"),
+            good.replace("complete=true", "complete=false"),
+            good.replace("jetstreamer_node::historical_replay", "program_log"),
+        ] {
+            assert!(!root_checkpoint_marker(&bad));
+        }
+    }
+    #[test]
+    fn private_command_retains_full_verification_and_exact_root() {
+        let p = plan(PathBuf::from(format!(
+            "/home/ubuntu/.jetstreamer-private/{ROOT_PREFIX}test"
+        )));
+        let c = command(&p);
+        let args = c
+            .get_args()
+            .map(|s| s.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(args.contains(&"--verify"));
+        assert!(args.contains(&"--qualification-end-slot=88127580"));
+        assert!(
+            args.iter()
+                .any(|s| s.ends_with("/output/epoch-203-prefix.jet"))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|s| s.contains("publish") || s.contains("root-checkpoint-cohort"))
+        );
+    }
+    #[test]
+    fn manifest_reader_rejects_symlinks_and_insecure_metadata() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("manifest.json");
+        fs::write(&p, serde_json::to_vec(&manifest()).unwrap()).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        root_manifest_valid(&read_private_manifest(&p).unwrap().0).unwrap();
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&p, &link).unwrap();
+        assert!(read_private_manifest(&link).is_err());
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_private_manifest(&p).is_err());
+    }
+    #[test]
+    fn natural_success_requires_zero_exit_and_manifest_not_a_progress_line() {
+        let t = tempfile::tempdir().unwrap();
+        for name in ["scratch", "output", "receipts", "cgroup"] {
+            fs::create_dir(t.path().join(name)).unwrap();
+            fs::set_permissions(t.path().join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for name in [
+            "memory.current",
+            "memory.peak",
+            "memory.events",
+            "memory.stat",
+            "cpu.stat",
+            "io.stat",
+            "memory.pressure",
+            "io.pressure",
+        ] {
+            fs::write(t.path().join("cgroup").join(name), b"0\n").unwrap();
+        }
+        let mut p = plan(t.path().to_path_buf());
+        p.minimum_free_bytes = 0;
+        let bindings = json!({"plan_path":"/sealed/plan","plan_sha256":"b".repeat(64),"self_sha256":"c".repeat(64)});
+        let mut cmd = Command::new("/bin/true");
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        assert!(
+            measure_root(
+                &p,
+                &"a".repeat(32),
+                &t.path().join("cgroup"),
+                &mut cmd,
+                &bindings
+            )
+            .is_err()
+        );
+        let failure: Value =
+            serde_json::from_slice(&fs::read(t.path().join("receipts/failure.json")).unwrap())
+                .unwrap();
+        assert_eq!(failure["producer_canonical_root_prefix_present"], false);
+        assert_eq!(
+            failure["authority"]["canonical_prefix_independently_qualified"],
+            false
+        );
+    }
+}
+
+mod root_success_tests {
+    use super::*;
+    #[test]
+    fn natural_zero_exit_with_complete_manifest_still_denies_independent_qualification() {
+        let t = tempfile::tempdir().unwrap();
+        for name in ["scratch", "output", "receipts", "cgroup"] {
+            fs::create_dir(t.path().join(name)).unwrap();
+            fs::set_permissions(t.path().join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for name in [
+            "memory.current",
+            "memory.peak",
+            "memory.events",
+            "memory.stat",
+            "cpu.stat",
+            "io.stat",
+            "memory.pressure",
+            "io.pressure",
+        ] {
+            fs::write(t.path().join("cgroup").join(name), b"0\n").unwrap();
+        }
+        let archive = t.path().join("output").join(ARCHIVE_NAME);
+        fs::write(
+            &archive,
+            b"private fixture; independent archive validation still required",
+        )
+        .unwrap();
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o600)).unwrap();
+        let m = json!({"schema_version":1,"epoch":203,"output_slot_start":87696000,
+            "output_slot_count":431581,"worker_executable_sha256":WORKER,
+            "runtime":{"runtime_profile":"solana-v1.6.16"},"bootstrap":{"slot":87695515,"slot_complete":true},
+            "terminal":{"slot":88127580,"slot_complete":true,"accounts_hash":"4SeHmKHQrHot4gwifo1bnvDKXZwGELk2vSenotTx9oqf"},
+            "archive_sha256":"a".repeat(64)});
+        let side = PathBuf::from(format!("{}.segment.json", archive.display()));
+        fs::write(&side, serde_json::to_vec(&m).unwrap()).unwrap();
+        fs::set_permissions(&side, fs::Permissions::from_mode(0o600)).unwrap();
+        let p = Plan {
+            schema: PLAN_SCHEMA.into(),
+            unit: format!("{UNIT_PREFIX}test.service"),
+            node: BoundFile {
+                path: "/sealed/node".into(),
+                sha256: PARENT_SHA.into(),
+            },
+            worker: "/sealed/worker".into(),
+            snapshot: "/sealed/snapshot".into(),
+            ledger_directory: "/sealed".into(),
+            epoch_hashes: BoundFile {
+                path: "/sealed/hashes".into(),
+                sha256: "b".repeat(64),
+            },
+            run_root: t.path().to_path_buf(),
+            target_slot: TARGET,
+            terminal_slot: TERMINAL,
+            minimum_free_bytes: 0,
+            maximum_runtime_seconds: 600,
+        };
+        let bindings = json!({"plan_path":"/sealed/plan","plan_sha256":"b".repeat(64),"self_sha256":"c".repeat(64)});
+        let mut cmd = Command::new("/bin/true");
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        measure_root(
+            &p,
+            &"a".repeat(32),
+            &t.path().join("cgroup"),
+            &mut cmd,
+            &bindings,
+        )
+        .unwrap();
+        let r: Value =
+            serde_json::from_slice(&fs::read(t.path().join("receipts/root-prefix.json")).unwrap())
+                .unwrap();
+        assert_eq!(r["child_return_code"], 0);
+        assert_eq!(r["producer_canonical_root_prefix_present"], true);
+        assert_eq!(r["capture_is_peak_proof"], false);
+        assert!(
+            r["authority"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|v| v == false)
+        );
+        assert!(!PathBuf::from(format!("{}.sha256", archive.display())).exists());
+    }
+}
+
+};
+}
+
+#[cfg(test)]
+#[allow(unused_macros)]
+macro_rules! legacy_profile_tests {
+() => {
 mod tests {
     use super::*;
     fn fixture_plan() -> Plan {
@@ -1075,4 +1569,6 @@ mod tests {
             json!({"original":true})
         );
     }
+}
+};
 }
