@@ -19,6 +19,10 @@ pub mod horizon_ledger_tar;
 /// Digest-bound diagnostic collection of a retained bzip2 RocksDB tar.
 pub mod horizon_ledger_bzip;
 
+/// Optional, diagnostic complete-census native RocksDB resolution, not source completeness.
+#[cfg(feature = "sst-capability-tests")]
+pub mod horizon_ledger_native;
+
 /// Re-exported ClickHouse utility types and functions.
 pub use clickhouse::{
     ClickhouseError, ClickhouseStartResult, start, start_client, stop, stop_sync,

@@ -253,6 +253,58 @@ fn native_readonly_resolves_manifest_and_wal() {
         assert!(collected_families.contains(&live.column_family_name));
     }
     drop(collected_db);
+    // Exercise the reusable diagnostic core against the same complete native
+    // crash-shaped fixture, not against manually selected SST candidates.
+    let resolution_logs = root.path().join("resolution-logs");
+    fs::create_dir(&resolution_logs).unwrap();
+    fs::set_permissions(&resolution_logs, fs::Permissions::from_mode(0o700)).unwrap();
+    let queries: Vec<_> = (0..=3)
+        .map(
+            |index| jetstreamer_utils::horizon_ledger_native::NativeQuery {
+                family: "data_shred".into(),
+                key: key(index),
+            },
+        )
+        .collect();
+    let result = jetstreamer_utils::horizon_ledger_native::resolve_native_candidates(
+        &collected,
+        &census,
+        &resolution_logs,
+        &families,
+        &queries,
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(result.complete_census_revalidated);
+    assert!(
+        !result.source_completeness_proven
+            && !result.live_state_proven
+            && !result.publication_authorized
+    );
+    assert_eq!(result.candidates[0].value, None);
+    assert_eq!(result.candidates[1].value, None);
+    assert_eq!(
+        result.candidates[2].value.as_deref(),
+        Some(b"new-wal-value".as_slice())
+    );
+    assert_eq!(
+        result.candidates[3].value.as_deref(),
+        Some(b"wal-only-value".as_slice())
+    );
+    let rejected_logs = root.path().join("rejected-resolution-logs");
+    fs::create_dir(&rejected_logs).unwrap();
+    fs::set_permissions(&rejected_logs, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        jetstreamer_utils::horizon_ledger_native::resolve_native_candidates(
+            &collected,
+            &census,
+            &rejected_logs,
+            &["default".into(), "data_shred".into()],
+            &queries,
+            || Ok(())
+        )
+        .is_err()
+    );
     for member in &census.files {
         assert_eq!(
             format!(

@@ -129,6 +129,29 @@ read-only resolution against the compressed collection. It checks live-file
 references, range/point deletions and WAL-only values without modifying either
 the retained compressed input or the collected member census.
 
+With the optional `sst-capability-tests` feature,
+`horizon_ledger_native::resolve_native_candidates` provides a reusable diagnostic
+core for bounded exact-key lookups against a retained complete collection.
+It refuses a census-only result, unknown/omitted column families, missing or extra
+members, writable/linked/mutated inputs, and mismatching CURRENT/MANIFEST/WAL
+bindings. Every member is streamed through SHA-256 before native open and after
+native close; inode/ctime identities must also remain unchanged across the entire
+resolution. Native manifest live-SST references must match the retained census's
+names and lengths. Read checksum verification is explicit. Native logs go only
+to a separate empty private directory. Each requested value is bounded before
+copying the pinned native slice into the aggregate bounded result.
+
+This core preserves the distinction between diagnostic candidates and trusted
+source state: it always denies original-backup completeness, historical live-state
+and publication authority, even when the native read succeeds. Its caller must
+independently authenticate the census, qualify the expected complete family set,
+admit and guard full retention/native memory/I/O/runtime, decode SlotMeta/shreds,
+and validate complete entry/tick/PoH chains plus canonical anchors. There is no
+operational native recovery caller yet. The native fixture exercises this core
+against an entire collected crash-shaped database, including outside-prefix range
+deletion, point deletion, updated WAL and WAL-only values, and rejects an omitted
+family allowlist. These remain disposable-fixture tests, not epoch141 evidence.
+
 `jetstreamer-epoch141-ledger-metadata` is a separate, read-only exact-generation
 gate for `60911751/rocksdb.tar.bz2#1634789748052739` in the regional ledger
 bucket. Its immutable plan and running executable require separate SHA-256
