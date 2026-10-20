@@ -339,8 +339,7 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
                 == "e45584858d0c825f095a43ff5e5909e62a68d197d39c042a76727454525228c4"
             && receipt["worker_sha256"]
                 == "3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a"
-            && receipt["runner_sha256"]
-                == "bc9a75b420210a93b6ab65d28bd82d1fe2748c95541394bfae2e0f0f5153bf12"
+            && epoch203_resource_runner_matches(claim, receipt)
             && receipt["runtime"] == "solana-v1.6.16"
             && receipt["runtime_semantics_changed"] == false
             && receipt["target_slot"] == 87_720_000u64
@@ -417,6 +416,24 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
         "diagnostic launch identity mismatch"
     );
     Ok(())
+}
+
+fn epoch203_resource_runner_matches(claim: &DiagnosticClaim, receipt: &Value) -> bool {
+    match receipt["runner_sha256"].as_str() {
+        Some("bc9a75b420210a93b6ab65d28bd82d1fe2748c95541394bfae2e0f0f5153bf12") => {
+            !claim
+                .unit
+                .starts_with("horizon-qualify-203-bounded-resource-r1-")
+                && receipt.get("solana_rayon_threads").is_none_or(|v| v == 16)
+        }
+        Some("c041979fa0be26f6a35cb7063e962a666e71ddde74b1f680c53c210a0f7b1722") => {
+            claim
+                .unit
+                .starts_with("horizon-qualify-203-bounded-resource-r1-")
+                && receipt["solana_rayon_threads"] == 1
+        }
+        _ => false,
+    }
 }
 
 fn transitions(
@@ -1356,6 +1373,31 @@ mod tests {
             bad[key] = value;
             assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{key}");
         }
+    }
+    #[test]
+    fn bounded_203_r1_runner_requires_its_exact_thread_count_and_namespace() {
+        let mut claim = DiagnosticClaim {
+            epoch: 203,
+            unit: "horizon-qualify-203-bounded-resource-r1-test.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/private/203-r1".into(),
+            launch_receipt: BoundFile {
+                path: "/private/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let mut receipt = json!({"runner_sha256":"c041979fa0be26f6a35cb7063e962a666e71ddde74b1f680c53c210a0f7b1722","solana_rayon_threads":1});
+        assert!(epoch203_resource_runner_matches(&claim, &receipt));
+        receipt["solana_rayon_threads"] = json!(16);
+        assert!(!epoch203_resource_runner_matches(&claim, &receipt));
+        receipt["solana_rayon_threads"] = json!(1);
+        claim.unit = "horizon-qualify-203-bounded-resource-store8-test.service".into();
+        assert!(!epoch203_resource_runner_matches(&claim, &receipt));
+        receipt["runner_sha256"] =
+            json!("bc9a75b420210a93b6ab65d28bd82d1fe2748c95541394bfae2e0f0f5153bf12");
+        assert!(!epoch203_resource_runner_matches(&claim, &receipt));
+        receipt["solana_rayon_threads"] = json!(16);
+        assert!(epoch203_resource_runner_matches(&claim, &receipt));
     }
     #[test]
     fn bounded_203_same_sample_event_requires_its_own_guard_and_preserves_cadence() {
