@@ -3,6 +3,13 @@
 `jetstreamer-r2 status-delete-inactive PLAN --plan-sha256 HEX --self-sha256 HEX
 [--check-only]` is a separate path from completion-only `status-delete`.
 
+The general campaign command, added concurrently by the other host, is
+`status-retire-inactive`; see [its contract](horizon-inactive-status-retirement.md).
+This narrower profile supplies additional host-specific process, local-artifact,
+remote-inventory and multipart checks for the 183–184 incident. Both commands
+delegate to the same canonical-key, ETag-conditional mutation boundary. Qualify
+the chosen command and plan explicitly; do not mix their receipt schemas.
+
 The initial profile intentionally supports only the failed epoch-183/184 owner on
 dev-samjohnson. It binds the exact controller/producer invocation IDs, pinned
 terminal incident, latest authenticated status publication, historical owner
@@ -22,6 +29,9 @@ canonical local artifact, remote staged pair, or multipart transfer fails closed
 The current operational range assignment must remain disjoint across hosts;
 this tool is not a distributed lease or authority to disregard another host's
 authenticated handoff. Do not execute it when such a handoff exists.
+The plan must set `exclusive_local_epoch_ownership: true` and explicitly supply
+`authenticated_other_host_handoffs: []`; both fleet sample and receipt expire
+after 30 minutes.
 
 `--check-only` authenticates remote status bytes/ETag, checks current archive
 inventory and multipart transfers, and performs the local census without writing

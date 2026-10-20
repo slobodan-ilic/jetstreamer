@@ -60,6 +60,7 @@ const STATUS_DELETION_RECEIPT_SCHEMA: &str =
     "jetstreamer-horizon-r2-status-authenticated-deletion-receipt-v1";
 
 mod fleet;
+mod inactive_status;
 mod resource_audit;
 mod resource_verify;
 mod status_inactive;
@@ -1904,13 +1905,7 @@ async fn status_delete(s3: &Client, r2: &R2Config, config: &Config, epoch: u64) 
             current.bytes == epoch_status_bytes(&publication.status)?,
             "current status bytes differ from the bound publication receipt"
         );
-        s3.delete_object()
-            .bucket(&r2.bucket)
-            .key(&key)
-            .if_match(format!("\"{}\"", current.etag))
-            .send()
-            .await
-            .map_err(|error| anyhow!("conditional status deletion failed: {error:?}"))?;
+        conditional_delete_epoch_status(s3, &r2.bucket, epoch, &current.etag).await?;
         true
     } else {
         false
@@ -1942,6 +1937,27 @@ async fn status_delete(s3: &Client, r2: &R2Config, config: &Config, epoch: u64) 
         verified_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     };
     write_status_deletion_receipt(status_receipt_directory, &deletion_receipt)
+}
+
+// The sole remote deletion call site: neither caller can supply an arbitrary key.
+async fn conditional_delete_epoch_status(
+    s3: &Client,
+    bucket: &str,
+    epoch: u64,
+    etag: &str,
+) -> Result<()> {
+    ensure!(
+        !etag.is_empty(),
+        "status deletion requires an observed ETag"
+    );
+    s3.delete_object()
+        .bucket(bucket)
+        .key(format!("epoch-{epoch}.epoch-status.json"))
+        .if_match(format!("\"{etag}\""))
+        .send()
+        .await
+        .map_err(|error| anyhow!("conditional status deletion failed: {error:?}"))?;
+    Ok(())
 }
 
 async fn head_archive(client: &Client, bucket: &str, key: &str) -> Result<Option<RemoteArchive>> {
@@ -3077,6 +3093,9 @@ async fn main() -> Result<()> {
     if env::args().nth(1).as_deref() == Some("fleet-reconcile") {
         return fleet::run().await;
     }
+    if env::args().nth(1).as_deref() == Some("status-retire-inactive") {
+        return inactive_status::run().await;
+    }
     let config = parse_args()?;
     ensure!(
         config.command == Command::Inventory || config.directory.is_dir(),
@@ -3376,7 +3395,7 @@ mod tests {
             .unwrap();
     }
 
-    fn status_publication_receipt(epoch: u64) -> StatusPublicationReceipt {
+    pub(super) fn status_publication_receipt(epoch: u64) -> StatusPublicationReceipt {
         StatusPublicationReceipt {
             schema: STATUS_RECEIPT_SCHEMA.to_owned(),
             bucket: "bucket".to_owned(),
@@ -3970,11 +3989,13 @@ mod tests {
         assert_eq!(source.matches(singular).count(), 1);
         assert!(!source.contains(plural));
         let inactive = include_str!("status_inactive.rs");
-        assert_eq!(inactive.matches(singular).count(), 1);
+        assert_eq!(inactive.matches(singular).count(), 0);
         assert!(!inactive.contains(plural));
         assert!(inactive.contains("owner_matches(publication, publication.epoch)?"));
-        assert!(inactive.contains("format!(\"epoch-{}.epoch-status.json\", publication.epoch)"));
-        assert!(inactive.contains(".if_match("));
+        assert!(inactive.contains("conditional_delete_epoch_status("));
+        let general_inactive = include_str!("inactive_status.rs");
+        let general_inactive = general_inactive.split("#[cfg(test)]").next().unwrap();
+        assert!(!general_inactive.contains(singular) && !general_inactive.contains(plural));
         let start = source.find("async fn status_delete(").unwrap();
         let end = source[start..].find("\nasync fn head_archive(").unwrap() + start;
         let status_delete = &source[start..end];
@@ -3983,7 +4004,9 @@ mod tests {
         let ready_pair_before = status_delete
             .find("validate_authenticated_ready_pair(s3, &r2.bucket, &archive_receipt).await?")
             .unwrap();
-        let deletion = status_delete.find(singular).unwrap();
+        let deletion = status_delete
+            .find("conditional_delete_epoch_status(s3,")
+            .unwrap();
         let ready_pair_after = status_delete
             .rfind("validate_authenticated_ready_pair(s3, &r2.bucket, &archive_receipt).await?")
             .unwrap();

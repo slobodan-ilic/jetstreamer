@@ -32,6 +32,8 @@ struct Plan {
     host: String,
     epoch: u64,
     bucket: String,
+    exclusive_local_epoch_ownership: bool,
+    authenticated_other_host_handoffs: Vec<Value>,
     status_receipt_directory: PathBuf,
     publication: Bound,
     incident: Bound,
@@ -167,20 +169,10 @@ async fn conditional_status_delete(
     publication: &StatusPublicationReceipt,
 ) -> Result<()> {
     owner_matches(publication, publication.epoch)?;
-    // Derive the sole authorized key again at the mutation boundary.
-    let key = format!("epoch-{}.epoch-status.json", publication.epoch);
-    s3.delete_object()
-        .bucket(&r2.bucket)
-        .key(key)
-        .if_match(format!("\"{}\"", publication.object_etag))
-        .send()
+    // The shared boundary derives the sole authorized key; callers cannot pass
+    // an archive, sidecar, prefix, or arbitrary object name.
+    conditional_delete_epoch_status(s3, &r2.bucket, publication.epoch, &publication.object_etag)
         .await
-        .map_err(|e| {
-            anyhow!(
-                "conditional inactive-status delete failed; do not retry unconditionally: {e:?}"
-            )
-        })?;
-    Ok(())
 }
 
 fn terminal(value: &Value) -> bool {
@@ -270,6 +262,15 @@ fn validate_fleet(
     ensure!(
         recorded <= time && time - recorded <= 1800,
         "stale fleet census"
+    );
+    let sampled = fleet::utc_seconds(
+        fleet["sampled_at_utc"]
+            .as_str()
+            .context("fleet sample missing")?,
+    )?;
+    ensure!(
+        sampled <= recorded && time - sampled <= 1800,
+        "stale fleet observation"
     );
     let entries = fleet["epochs"].as_array().context("fleet epochs missing")?;
     let entries: Vec<_> = entries.iter().filter(|e| e["epoch"] == epoch).collect();
@@ -575,6 +576,8 @@ pub(super) async fn run() -> Result<()> {
     ensure!(
         plan.schema == "jetstreamer-r2-inactive-status-plan-v1"
             && plan.host == "dev-samjohnson"
+            && plan.exclusive_local_epoch_ownership
+            && plan.authenticated_other_host_handoffs.is_empty()
             && (183..=184).contains(&plan.epoch),
         "unsupported inactive-cleanup profile"
     );
@@ -829,7 +832,7 @@ mod tests {
     fn fleet_rejects_live_replacement_downstream_and_stale_census() {
         let p = publication();
         let f = json!({"schema":"jetstreamer-horizon-campaign-fleet-v1","first_epoch":101,"last_epoch":200,
-            "inventory":{"anomalies":0},"recorded_unix_seconds":1000,"active":[],
+            "inventory":{"anomalies":0},"recorded_unix_seconds":1000,"sampled_at_utc":"1970-01-01T00:16:40Z","active":[],
             "epochs":[{"epoch":183,"state":"failed-needs-repair","status":{
                 "classification":"stale-or-orphaned","etag":p.object_etag,"payload":p.status}}]});
         validate_fleet(&f, 183, &p, 1000).unwrap();
