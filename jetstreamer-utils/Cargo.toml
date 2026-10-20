@@ -11,6 +11,8 @@ documentation.workspace = true
 
 [features]
 sst-capability-tests = ["dep:rocksdb"]
+# Pins the separate bounded epoch225 upstream-comparison worker, not an era.
+epoch225-v1-6-25-diagnostic = []
 
 [lib]
 name = "jetstreamer_utils"
@@ -74,6 +76,10 @@ path = "src/horizon_standalone_guard_bin.rs"
 [[bin]]
 name = "jetstreamer-epoch225-bounded-resource"
 path = "src/epoch225_bounded_resource_bin.rs"
+
+[[bin]]
+name = "jetstreamer-epoch203-bounded-resource"
+path = "src/epoch203_bounded_resource_bin.rs"
 
 [[bin]]
 name = "jetstreamer-epoch213-private-verify"

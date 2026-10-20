@@ -1,5 +1,17 @@
 mod checkpoint_continuation;
 mod epoch224_qualification;
+mod epoch225_diagnostic;
+
+#[cfg(all(
+    feature = "epoch225-v1-6-25-diagnostic",
+    any(
+        feature = "epoch224-v1-6-25-diagnostic",
+        feature = "epoch224-v1-6-25-qualification",
+        feature = "epoch224-account-delta-diagnostic",
+        feature = "epoch213-checkpoint-continuation-diagnostic"
+    )
+))]
+compile_error!("epoch225 comparison cannot combine unrelated qualification modes");
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -19056,6 +19068,7 @@ async fn main() {
             || cfg!(feature = "epoch224-v1-6-25-qualification")
             || cfg!(feature = "epoch224-v1-6-25-diagnostic")
             || cfg!(feature = "epoch224-account-delta-diagnostic");
+        let forbidden = forbidden || cfg!(feature = "epoch225-v1-6-25-diagnostic");
         if let Err(error) = checkpoint_continuation::validate_cli(
             cfg!(feature = "epoch213-checkpoint-continuation-diagnostic"),
             (start_epoch, end_epoch),
@@ -19235,6 +19248,25 @@ async fn main() {
             exit(2);
         }
     };
+    if cfg!(feature = "epoch225-v1-6-25-diagnostic")
+        && let Err(error) = epoch225_diagnostic::validate_launch(
+            start_epoch,
+            end_epoch,
+            qualification.map(|plan| (plan.bootstrap_slot, plan.end_inclusive)),
+            root_checkpoint_cohort,
+            recover_staged_only
+                || recover_staged_cohort_only
+                || recover_unreceipted_root_cohort_only
+                || inherited_epoch_lease,
+            horizon_output
+                .as_deref()
+                .zip(replay_scratch.as_deref())
+                .map(|(output, scratch)| (dest_dir.as_path(), output, scratch)),
+        )
+    {
+        eprintln!("error: {error}");
+        exit(2);
+    }
     if cfg!(feature = "epoch224-v1-6-25-qualification")
         && let Err(error) = epoch224_qualification::validate_launch(
             start_epoch,

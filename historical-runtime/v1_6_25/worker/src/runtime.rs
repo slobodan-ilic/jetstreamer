@@ -43,6 +43,17 @@ const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 100_656_000;
 // its entries so this diagnostic can never turn into an unbounded epoch replay.
 const DIAGNOSTIC_MAX_ENTRY_SLOT_EXCLUSIVE: u64 = 96_767_527;
 const EPOCH224_V1_6_25_DIAGNOSTIC_SNAPSHOT_SLOT: u64 = 96_767_522;
+const EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT: u64 = 97_199_617;
+const EPOCH225_DIAGNOSTIC_END_EXCLUSIVE: u64 = 97_202_600;
+#[cfg(all(
+    feature = "epoch225-v1-6-25-diagnostic",
+    any(
+        feature = "epoch224-v1-6-25-diagnostic",
+        feature = "epoch224-v1-6-25-qualification",
+        feature = "diagnostic-singleton"
+    )
+))]
+compile_error!("epoch225 comparison cannot combine other diagnostic/qualification modes");
 // Complete epoch 224, then stop at the first compatible canonical root in
 // epoch 225. The suffix is qualification evidence only, never publication.
 const EPOCH224_V1_6_25_QUALIFICATION_END_EXCLUSIVE: u64 = 97_631_460;
@@ -675,6 +686,12 @@ impl RuntimeState {
             ));
         }
         let mut writes = self.freeze_root_and_drain()?;
+        if cfg!(feature = "epoch225-v1-6-25-diagnostic")
+            && (97_199_876..=97_199_878).contains(&self.bank.slot())
+        {
+            let delta = self.bank.accounts().bank_hash_info_at(self.bank.slot());
+            eprintln!("epoch225 v1.6.25 diagnostic boundary: parent_slot={} next_slot={} parent_bank_hash={} account_delta_hash={} signature_count={} last_blockhash={} capitalization={} transaction_count={} next_write_version={} freeze_writes={}",self.bank.slot(),slot,self.bank.hash(),delta.hash,self.bank.signature_count(),self.bank.last_blockhash(),self.bank.capitalization(),self.bank.transaction_count(),self.write_cursor,writes.len());
+        }
         if self.diagnostic_singleton_execution {
             eprintln!(
                 "historical diagnostic boundary: parent_slot={} next_slot={} parent_bank_hash={} capitalization={} transaction_count={} next_write_version={} freeze_writes={}",
@@ -812,6 +829,12 @@ impl RuntimeState {
 }
 
 fn validate_candidate_snapshot_slot(slot: u64) -> Result<(), String> {
+    if cfg!(feature = "epoch225-v1-6-25-diagnostic") && slot != EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT {
+        return Err(format!(
+            "epoch225 diagnostic requires exact snapshot {}",
+            EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT
+        ));
+    }
     if cfg!(any(
         feature = "epoch224-v1-6-25-diagnostic",
         feature = "epoch224-v1-6-25-qualification"
@@ -844,7 +867,9 @@ fn validate_candidate_entry_slot(slot: u64) -> Result<(), String> {
 }
 
 fn effective_min_supported_entry_slot() -> u64 {
-    if cfg!(feature = "epoch224-v1-6-25-qualification") {
+    if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
+        EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT + 1
+    } else if cfg!(feature = "epoch224-v1-6-25-qualification") {
         EPOCH224_V1_6_25_DIAGNOSTIC_SNAPSHOT_SLOT + 1
     } else {
         MIN_SUPPORTED_ENTRY_SLOT
@@ -852,7 +877,9 @@ fn effective_min_supported_entry_slot() -> u64 {
 }
 
 fn effective_max_supported_entry_slot_exclusive() -> u64 {
-    if cfg!(feature = "epoch224-v1-6-25-qualification") {
+    if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
+        EPOCH225_DIAGNOSTIC_END_EXCLUSIVE
+    } else if cfg!(feature = "epoch224-v1-6-25-qualification") {
         EPOCH224_V1_6_25_QUALIFICATION_END_EXCLUSIVE
     } else if cfg!(any(
         feature = "diagnostic-singleton",
@@ -1385,6 +1412,33 @@ fn normalize_instruction_error(error: InstructionError) -> WireInstructionError 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch225_wire_fixture_called_program_writability() {
+        let wire = bs58::decode(
+            include_str!("../../../fixtures/epoch225-writable-token-program.base58").trim(),
+        )
+        .into_vec()
+        .unwrap();
+        let transaction: Transaction = bincode::deserialize(&wire).unwrap();
+        assert_eq!(transaction.signatures[0].to_string(), "4tURm7ubHwvAth4yE8T87NRXh84akr9AhbDYWckdMsgoQVn4TQiBkkLvjBfcM78PVWzn7R4cboadPBgBduENRY7d");
+        let key = transaction.message.account_keys[6];
+        assert_eq!(
+            key.to_string(),
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        );
+        assert!(transaction
+            .message
+            .instructions
+            .iter()
+            .any(|i| i.program_id_index == 6));
+        assert!(transaction.message.is_key_passed_to_program(6));
+        assert!(transaction.message.is_non_loader_key(&key, 6));
+        assert_eq!(transaction.message.is_writable(6), false);
+        let attribution = writable_key_attribution(&[transaction]).unwrap();
+        assert_eq!(attribution.contains_key(key.as_ref()), false);
+    }
+
     use solana_runtime::{
         accounts_index::AccountSecondaryIndexes, genesis_utils::create_genesis_config_with_leader,
     };
@@ -1514,7 +1568,15 @@ mod tests {
 
     #[test]
     fn candidate_range_is_closed_at_both_ends() {
-        if cfg!(any(
+        if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
+            assert!(validate_candidate_snapshot_slot(EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT).is_ok());
+            assert!(
+                validate_candidate_snapshot_slot(EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT - 1).is_err()
+            );
+            assert!(
+                validate_candidate_snapshot_slot(EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT + 1).is_err()
+            );
+        } else if cfg!(any(
             feature = "epoch224-v1-6-25-diagnostic",
             feature = "epoch224-v1-6-25-qualification"
         )) {
@@ -1544,7 +1606,9 @@ mod tests {
         assert!(validate_candidate_entry_slot(entry_end).is_err());
         assert_eq!(
             entry_end,
-            if cfg!(feature = "epoch224-v1-6-25-qualification") {
+            if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
+                EPOCH225_DIAGNOSTIC_END_EXCLUSIVE
+            } else if cfg!(feature = "epoch224-v1-6-25-qualification") {
                 EPOCH224_V1_6_25_QUALIFICATION_END_EXCLUSIVE
             } else if cfg!(any(
                 feature = "diagnostic-singleton",

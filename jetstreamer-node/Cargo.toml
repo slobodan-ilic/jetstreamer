@@ -23,6 +23,8 @@ epoch224-v1-6-25-diagnostic = []
 # Private complete-span epoch-224 qualification after the bounded comparison.
 # The node requires the focused qualification CLI and never publishes a sidecar.
 epoch224-v1-6-25-qualification = []
+# Private epoch225 bounded upstream comparison, never an ordinary era promotion.
+epoch225-v1-6-25-diagnostic = []
 
 [dependencies]
 anyhow.workspace = true

@@ -533,7 +533,8 @@ pub const SOLANA_V1_6_17_CANDIDATE: WorkerProfile = WorkerProfile {
 pub const SOLANA_V1_6_20_CANDIDATE: WorkerProfile = WorkerProfile {
     backend_id: if cfg!(any(
         feature = "epoch224-v1-6-25-diagnostic",
-        feature = "epoch224-v1-6-25-qualification"
+        feature = "epoch224-v1-6-25-qualification",
+        feature = "epoch225-v1-6-25-diagnostic"
     )) {
         SOLANA_V1_6_25_BACKEND_ID
     } else {
@@ -541,7 +542,8 @@ pub const SOLANA_V1_6_20_CANDIDATE: WorkerProfile = WorkerProfile {
     },
     solana_tag: if cfg!(any(
         feature = "epoch224-v1-6-25-diagnostic",
-        feature = "epoch224-v1-6-25-qualification"
+        feature = "epoch224-v1-6-25-qualification",
+        feature = "epoch225-v1-6-25-diagnostic"
     )) {
         SOLANA_V1_6_25_TAG
     } else {
@@ -549,7 +551,8 @@ pub const SOLANA_V1_6_20_CANDIDATE: WorkerProfile = WorkerProfile {
     },
     solana_commit: if cfg!(any(
         feature = "epoch224-v1-6-25-diagnostic",
-        feature = "epoch224-v1-6-25-qualification"
+        feature = "epoch224-v1-6-25-qualification",
+        feature = "epoch225-v1-6-25-diagnostic"
     )) {
         SOLANA_V1_6_25_COMMIT
     } else {
