@@ -92,6 +92,7 @@ serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 sha2.workspace = true
 anyhow.workspace = true
+tar.workspace = true
 rocksdb = { version = "0.23", default-features = false, features = ["lz4"], optional = true }
 
 [dev-dependencies]

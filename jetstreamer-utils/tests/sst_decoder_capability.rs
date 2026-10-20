@@ -1,7 +1,8 @@
 //! Proves why point-prefix scans cannot by themselves establish RocksDB live state.
+use jetstreamer_utils::horizon_ledger_tar::{CollectionLimits, collect_rocksdb_tar};
 use rocksdb::{ColumnFamilyDescriptor, DB, DBCompressionType, Options};
 use sha2::{Digest, Sha256};
-use std::{env, fs, process::Command};
+use std::{env, fs, io::Cursor, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 // A separate process exits without dropping DB, leaving acknowledged, synced
 // writes in the WAL rather than turning the fixture into an SST-only test.
@@ -117,6 +118,115 @@ fn native_readonly_resolves_manifest_and_wal() {
             "native read-only open changed a manifest/WAL/SST input"
         );
     }
+
+    // Exercise the bounded collector against the entire real native fixture,
+    // not selected SSTs. Its census retains WALs and every CF's table files.
+    // This is still a disposable fixture, not a historical ledger generation.
+    let mut archive = tar::Builder::new(Vec::new());
+    let mut source_files: Vec<_> = fs::read_dir(&path)
+        .unwrap()
+        .map(|item| item.unwrap().path())
+        .collect();
+    source_files.sort();
+    for source in &source_files {
+        assert!(source.is_file());
+        archive
+            .append_file(
+                Path::new("rocksdb").join(source.file_name().unwrap()),
+                &mut fs::File::open(source).unwrap(),
+            )
+            .unwrap();
+    }
+    let bytes = archive.into_inner().unwrap();
+    let collected = root.path().join("collected-db");
+    fs::create_dir(&collected).unwrap();
+    fs::set_permissions(&collected, fs::Permissions::from_mode(0o700)).unwrap();
+    let census = collect_rocksdb_tar(
+        Cursor::new(bytes),
+        Path::new("rocksdb"),
+        &collected,
+        CollectionLimits {
+            maximum_files: 128,
+            maximum_file_bytes: 16 * 1024 * 1024,
+            maximum_total_bytes: 64 * 1024 * 1024,
+            maximum_trailer_bytes: 1024 * 1024,
+        },
+    )
+    .unwrap();
+    assert_eq!(census.files.len(), source_files.len());
+    assert!(!census.wal_files.is_empty());
+    assert!(!census.source_completeness_proven && !census.live_state_resolved);
+    assert!(!census.publication_authorized);
+    for source in &source_files {
+        assert_eq!(
+            fs::read(source).unwrap(),
+            fs::read(collected.join(source.file_name().unwrap())).unwrap()
+        );
+    }
+    // Isolate any native diagnostic log output from the immutable input census.
+    let log_path = root.path().join("collected-readonly-logs");
+    fs::create_dir(&log_path).unwrap();
+    let mut collected_options = Options::default();
+    collected_options.set_db_log_dir(&log_path);
+    let collected_families = DB::list_cf(&collected_options, &collected).unwrap();
+    assert_eq!(collected_families, families);
+    let collected_db =
+        DB::open_cf_for_read_only(&collected_options, &collected, &collected_families, false)
+            .unwrap();
+    let collected_cf = collected_db.cf_handle("data_shred").unwrap();
+    assert_eq!(collected_db.get_cf(collected_cf, key(0)).unwrap(), None);
+    assert_eq!(collected_db.get_cf(collected_cf, key(1)).unwrap(), None);
+    assert_eq!(
+        collected_db
+            .get_cf(collected_cf, key(2))
+            .unwrap()
+            .as_deref(),
+        Some(b"new-wal-value".as_slice())
+    );
+    assert_eq!(
+        collected_db
+            .get_cf(collected_cf, key(3))
+            .unwrap()
+            .as_deref(),
+        Some(b"wal-only-value".as_slice())
+    );
+    let live_files = collected_db.live_files().unwrap();
+    assert!(!live_files.is_empty());
+    for live in live_files {
+        let name = live.name.trim_start_matches('/');
+        assert!(
+            census
+                .files
+                .iter()
+                .any(|file| file.name == name && file.bytes == live.size as u64)
+        );
+        assert!(collected_families.contains(&live.column_family_name));
+    }
+    drop(collected_db);
+    for member in &census.files {
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(fs::read(collected.join(&member.name)).unwrap())
+            ),
+            member.sha256,
+            "native resolution changed collected input {}",
+            member.name
+        );
+    }
+    let mut after_names: Vec<_> = fs::read_dir(&collected)
+        .unwrap()
+        .map(|item| item.unwrap().file_name().into_string().unwrap())
+        .collect();
+    after_names.sort();
+    assert_eq!(
+        after_names,
+        census
+            .files
+            .iter()
+            .map(|file| file.name.clone())
+            .collect::<Vec<_>>()
+    );
 
     // A successful native open is not by itself proof that a backup is complete.
     // Preserve every file except WALs in a second disposable database and show
