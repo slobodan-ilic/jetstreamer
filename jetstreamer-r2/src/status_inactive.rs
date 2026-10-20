@@ -139,7 +139,7 @@ fn validate_absence_recovery(
     Ok(())
 }
 
-async fn no_remote_delivery(s3: &Client, r2: &R2Config, epoch: u64) -> Result<()> {
+pub(super) async fn no_remote_delivery(s3: &Client, r2: &R2Config, epoch: u64) -> Result<()> {
     ensure!(
         inventory_epoch(s3, r2, epoch).await?.state == InventoryState::Missing,
         "remote pair/staged archive exists; reconcile delivery rather than deleting status"
