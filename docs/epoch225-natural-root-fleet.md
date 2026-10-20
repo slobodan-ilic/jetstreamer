@@ -54,3 +54,36 @@ canonical bootstrap and terminal accounts hashes and exact upstream revision.
 This filename exception does not make the combined artifact a canonical epoch,
 skip the complete reread or sidecar-absence checks, or authorize publication.
 Never rename or independently validate the producer's still-growing archive.
+
+## Independent verification handoff
+
+The observational `jetstreamer-private-epoch225-verification-launch-v1` contract
+recognizes a distinct `horizon-qualify-225-private-verification-*.service`, not a
+relabeled epoch-213 verifier or a production pipeline. Its root-private receipt
+directory must be a direct `/var/lib/jetstreamer/horizon-225-private-scan-*`
+member. It pins reader `4cfa32a6…`, the literal private source archive, original
+producer invocation `ac9aee3d…`, exact complete-span coverage, and the private
+226 tail. The live systemd command must equal the launch receipt's bound command
+and invoke the exact immutable reader path. Both epochs remain protected from
+overlapping replay/delivery; neither gains a public countdown or sidecar.
+
+Before the fleet accepts that launch, it rehashes the separately bound terminal
+receipt with schema `jetstreamer-private-epoch225-natural-root-outcome-v1`.
+That receipt must report natural parent exit zero, no deliberate stop, all
+863,465 output slots through 98,063,464, and canonical SHA-256 bindings for the
+segment manifest and both producer/manager journals. It must explicitly deny
+independent full-span qualification, runtime promotion, sidecar creation,
+publication and remote mutations. Those journal/manifest bindings must come
+from preserved primary terminal evidence: this schema is not permission to
+invent a terminal outcome or treat a benchmark's normalized exit as natural
+completion. Fleet recognition does not replace the launcher's terminal check,
+fresh complete scan admission, or independent durable reread.
+
+Keep any prepared service dormant until the exact parent is terminal, its
+durable manifest matches the full scope, fresh scan resource admission passes,
+and the private receipt directory exists with root-only permissions. The scan
+may write only its private validation receipt. Its cgroup settings are safety
+ceilings, not proof of memory or I/O admission. No production plugin, canonical
+import, sidecar, upload, or local retirement follows from this private check.
+Never replace a running metadata coordinator's pinned R2 binary to introduce
+this profile; qualify and seal a new future deployment instead.

@@ -4,6 +4,7 @@ use serde_json::json;
 use std::{collections::BTreeMap, process::Command as ProcessCommand};
 
 const SCHEMA: &str = "jetstreamer-horizon-campaign-fleet-v1";
+const PRIVATE_225_READER: &str = "/var/lib/jetstreamer/horizon-qualification225-reader-b261913-v1/jetstreamer-qualification-verify";
 
 #[derive(Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -34,15 +35,66 @@ struct DiagnosticClaim {
 
 fn diagnostic_scope(claim: &DiagnosticClaim) -> std::ops::RangeInclusive<u64> {
     if claim.epoch == 225
-        && claim
+        && (claim
             .unit
             .starts_with("horizon-qualify-225-natural-root-resource-")
+            || private_225_verification(claim))
     {
         // The tail is private diagnostic work, never a second ordinary claim.
         225..=226
     } else {
         claim.epoch..=claim.epoch
     }
+}
+
+fn private_225_verification(claim: &DiagnosticClaim) -> bool {
+    claim.epoch == 225
+        && claim
+            .unit
+            .starts_with("horizon-qualify-225-private-verification-")
+        && claim.unit.ends_with(".service")
+}
+
+fn canonical_digest(value: &Value) -> bool {
+    value.as_str().is_some_and(|s| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn validate_private_225_terminal(value: &Value) -> Result<()> {
+    ensure!(
+        value["schema"] == "jetstreamer-private-epoch225-natural-root-outcome-v1"
+            && value["epoch"] == 225
+            && value["producer_invocation_id"] == "ac9aee3d47eb41e483a5e008ed43d030"
+            && value["natural_parent_exit_code"] == 0
+            && value["deliberate_stop"] == false
+            && value["output_slot_start"] == 97_200_000u64
+            && value["terminal_slot"] == 98_063_464u64
+            && value["output_slot_count"] == 863_465u64
+            && canonical_digest(&value["segment_manifest_sha256"])
+            && canonical_digest(&value["producer_journal_sha256"])
+            && canonical_digest(&value["manager_journal_sha256"])
+            && value["full_span_independently_qualified"] == false
+            && value["runtime_promotion_authorized"] == false
+            && value["canonical_sidecar_authorized"] == false
+            && value["publication_authorized"] == false
+            && value["remote_mutations"] == false
+            && value["r2_mutations"] == false,
+        "epoch225 verifier needs exact natural-completion terminal evidence, not a stopped benchmark"
+    );
+    Ok(())
+}
+
+fn checked_diagnostic_launch(claim: &DiagnosticClaim) -> Result<Value> {
+    let launch = bound_json(&claim.launch_receipt)?;
+    validate_diagnostic_launch(&launch, claim)?;
+    if private_225_verification(claim) {
+        let evidence: BoundFile = serde_json::from_value(launch["terminal_evidence"].clone())?;
+        validate_private_225_terminal(&bound_json(&evidence)?)?;
+    }
+    Ok(launch)
 }
 
 fn register_live_diagnostic_scope(
@@ -467,6 +519,8 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
         receipt["schema"] == "jetstreamer-private-epoch225-natural-root-resource-launch-v1";
     let private_verify_213 =
         receipt["schema"] == "jetstreamer-private-epoch213-verification-launch-v1";
+    let private_verify_225 =
+        receipt["schema"] == "jetstreamer-private-epoch225-verification-launch-v1";
     ensure!(
         (continuation
             || bootstrap_resource
@@ -477,6 +531,7 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             || root_prefix_203
             || natural_root_225
             || private_verify_213
+            || private_verify_225
             || receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1")
             && receipt["launched"] == true
             && receipt["remote_mutations"] == false
@@ -493,6 +548,41 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
             && receipt["replay_slot_start"] == 92_447_543u64
             && receipt["replay_slot_end_inclusive"] == 92_447_999u64
+            && receipt["canonical_sidecar_authorized"] == false
+            && receipt["publication_authorized"] == false
+    } else if private_verify_225 {
+        private_225_verification(claim)
+            && receipt["epoch"] == 225
+            && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+            && claim.scratch_path.parent() == Some(Path::new("/var/lib/jetstreamer"))
+            && claim
+                .scratch_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("horizon-225-private-scan-"))
+            && receipt["verifier_sha256"]
+                == "4cfa32a6956c3482891b9efe3b9e7c58135c8caddd40736bcf39a0bc7b6d9e2b"
+            && receipt["producer_invocation_id"] == "ac9aee3d47eb41e483a5e008ed43d030"
+            && receipt["archive_path"]
+                == "/home/ubuntu/.jetstreamer-private/qualification-225-v1625-natural-root-63a2717-v1/output/epoch-225.jet"
+            && receipt["output_slot_start"] == 97_200_000u64
+            && receipt["terminal_slot"] == 98_063_464u64
+            && receipt["output_slot_count"] == 863_465u64
+            && receipt["private_verification_tail_epoch"] == 226
+            && receipt["private_verification_tail_slots"] == 431_465u64
+            && receipt["producer_natural_completion_confirmed"] == true
+            && canonical_digest(&receipt["plan_sha256"])
+            && canonical_digest(&receipt["terminal_evidence"]["sha256"])
+            && receipt["terminal_evidence"]["path"]
+                .as_str()
+                .is_some_and(|s| Path::new(s).is_absolute())
+            && receipt["expected_exec_start"].as_str().is_some_and(|s| {
+                s.starts_with(&format!(
+                    "{{ path={PRIVATE_225_READER} ; argv[]={PRIVATE_225_READER} "
+                ))
+            })
+            && receipt["replay_entries_authorized"] == false
+            && receipt["runtime_promotion_authorized"] == false
             && receipt["canonical_sidecar_authorized"] == false
             && receipt["publication_authorized"] == false
     } else if private_verify_213 {
@@ -1349,7 +1439,7 @@ pub(super) async fn run() -> Result<()> {
                 && diagnostic_units.insert(claim.unit.clone()),
             "duplicate or out-of-range diagnostic claim"
         );
-        validate_diagnostic_launch(&bound_json(&claim.launch_receipt)?, claim)?;
+        checked_diagnostic_launch(claim)?;
         for replay in replays {
             let replay_scope = parse_observer_claim_range(observer_string(replay, &["range"])?)?;
             ensure!(
@@ -1485,6 +1575,13 @@ pub(super) async fn run() -> Result<()> {
                 current["InvocationID"] == claim.invocation_id && current["NRestarts"] == "0",
                 "diagnostic live invocation changed"
             );
+            if private_225_verification(claim) {
+                let launch = bound_json(&claim.launch_receipt)?;
+                ensure!(
+                    current["ExecStart"] == launch["expected_exec_start"],
+                    "private225 verifier live command changed"
+                );
+            }
             ensure!(
                 claim.scratch_path.canonicalize()? == claim.scratch_path
                     && claim.scratch_path.is_dir(),
@@ -1493,6 +1590,7 @@ pub(super) async fn run() -> Result<()> {
             let phase = if claim
                 .unit
                 .starts_with("horizon-qualify-213-private-verification-")
+                || private_225_verification(claim)
             {
                 "private-verification"
             } else {
@@ -2426,6 +2524,168 @@ mod tests {
         let mut substituted = receipt;
         substituted["private_run_root"] = json!(wrong.scratch_path);
         assert!(validate_diagnostic_launch(&substituted, &wrong).is_err());
+    }
+
+    #[test]
+    fn private_225_verification_is_exact_nonpromoting_and_covers_its_private_tail() {
+        let mut claim = DiagnosticClaim {
+            epoch: 225,
+            unit: "horizon-qualify-225-private-verification-test-v1.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/var/lib/jetstreamer/horizon-225-private-scan-test".into(),
+            launch_receipt: BoundFile {
+                path: "/sealed/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let receipt = json!({
+            "schema":"jetstreamer-private-epoch225-verification-launch-v1",
+            "launched":true,"epoch":225,"private_run_root":claim.scratch_path,
+            "verifier_sha256":"4cfa32a6956c3482891b9efe3b9e7c58135c8caddd40736bcf39a0bc7b6d9e2b",
+            "producer_invocation_id":"ac9aee3d47eb41e483a5e008ed43d030",
+            "archive_path":"/home/ubuntu/.jetstreamer-private/qualification-225-v1625-natural-root-63a2717-v1/output/epoch-225.jet",
+            "output_slot_start":97200000,"terminal_slot":98063464,"output_slot_count":863465,
+            "private_verification_tail_epoch":226,"private_verification_tail_slots":431465,
+            "producer_natural_completion_confirmed":true,"plan_sha256":"c".repeat(64),
+            "terminal_evidence":{"path":"/sealed/terminal.json","sha256":"d".repeat(64)},
+            "expected_exec_start":format!("{{ path={PRIVATE_225_READER} ; argv[]={PRIVATE_225_READER} /private/archive ; ignore_errors=no }}"),
+            "replay_entries_authorized":false,"runtime_promotion_authorized":false,
+            "canonical_sidecar_authorized":false,"publication_authorized":false,
+            "remote_mutations":false,"r2_mutations":false,
+            "evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,
+                "restarts":0,"load_state":"loaded","active_state":"active","sub_state":"running",
+                "main_pid":123,"result":"success"}]}
+        });
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        assert_eq!(diagnostic_scope(&claim), 225..=226);
+        // Exercise the production pre-census loader: structurally valid launch
+        // JSON must not hide missing, substituted or stopped-producer evidence.
+        let root = tempfile::tempdir().unwrap();
+        let terminal_path = root.path().join("terminal.json");
+        let launch_path = root.path().join("launch.json");
+        let terminal = private_225_terminal_fixture();
+        let terminal_bytes = serde_json::to_vec(&terminal).unwrap();
+        let mut checked_launch = receipt.clone();
+        checked_launch["terminal_evidence"] = json!({"path":terminal_path,
+            "sha256":hex_lower(&Sha256::digest(&terminal_bytes))});
+        let launch_bytes = serde_json::to_vec(&checked_launch).unwrap();
+        fs::write(&launch_path, &launch_bytes).unwrap();
+        claim.launch_receipt = BoundFile {
+            path: launch_path,
+            sha256: hex_lower(&Sha256::digest(&launch_bytes)),
+        };
+        assert!(checked_diagnostic_launch(&claim).is_err());
+        fs::write(&terminal_path, &terminal_bytes).unwrap();
+        checked_diagnostic_launch(&claim).unwrap();
+        fs::write(&terminal_path, b"{}\n").unwrap();
+        assert!(checked_diagnostic_launch(&claim).is_err());
+        let mut stopped = terminal;
+        stopped["deliberate_stop"] = json!(true);
+        let bytes = serde_json::to_vec(&stopped).unwrap();
+        fs::write(&terminal_path, &bytes).unwrap();
+        checked_launch["terminal_evidence"]["sha256"] = json!(hex_lower(&Sha256::digest(&bytes)));
+        let bytes = serde_json::to_vec(&checked_launch).unwrap();
+        fs::write(&claim.launch_receipt.path, &bytes).unwrap();
+        claim.launch_receipt.sha256 = hex_lower(&Sha256::digest(&bytes));
+        assert!(checked_diagnostic_launch(&claim).is_err());
+        let mut live = BTreeSet::new();
+        register_live_diagnostic_scope(&mut live, &claim).unwrap();
+        assert!(register_live_diagnostic_scope(&mut live, &claim).is_err());
+        assert_eq!(live, BTreeSet::from([225, 226]));
+        for (key, value) in [
+            (
+                "schema",
+                json!("jetstreamer-private-epoch213-verification-launch-v1"),
+            ),
+            ("epoch", json!(226)),
+            ("private_run_root", json!("/home/ubuntu/horizon")),
+            ("verifier_sha256", json!("0".repeat(64))),
+            ("producer_invocation_id", json!("0".repeat(32))),
+            ("archive_path", json!("/home/ubuntu/horizon/epoch-225.jet")),
+            ("output_slot_start", json!(97200001)),
+            ("terminal_slot", json!(97631999)),
+            ("output_slot_count", json!(432000)),
+            ("private_verification_tail_epoch", json!(225)),
+            ("private_verification_tail_slots", json!(0)),
+            ("producer_natural_completion_confirmed", json!(false)),
+            ("plan_sha256", json!("c".repeat(63))),
+            (
+                "terminal_evidence",
+                json!({"path":"relative","sha256":"d".repeat(64)}),
+            ),
+            ("expected_exec_start", json!("/bin/true")),
+            ("replay_entries_authorized", json!(true)),
+            ("runtime_promotion_authorized", json!(true)),
+            ("canonical_sidecar_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+            ("remote_mutations", json!(true)),
+            ("r2_mutations", json!(true)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[key] = value;
+            assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{key}");
+            let mut missing = receipt.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                validate_diagnostic_launch(&missing, &claim).is_err(),
+                "missing{key}"
+            );
+        }
+        claim.scratch_path = "/home/ubuntu/horizon".into();
+        let mut bad = receipt.clone();
+        bad["private_run_root"] = json!(claim.scratch_path);
+        assert!(validate_diagnostic_launch(&bad, &claim).is_err());
+        claim.epoch = 213;
+        assert!(!private_225_verification(&claim));
+    }
+
+    fn private_225_terminal_fixture() -> Value {
+        json!({"schema":"jetstreamer-private-epoch225-natural-root-outcome-v1",
+            "epoch":225,"producer_invocation_id":"ac9aee3d47eb41e483a5e008ed43d030",
+            "natural_parent_exit_code":0,"deliberate_stop":false,"output_slot_start":97200000,
+            "terminal_slot":98063464,"output_slot_count":863465,"segment_manifest_sha256":"a".repeat(64),
+            "producer_journal_sha256":"b".repeat(64),"manager_journal_sha256":"c".repeat(64),
+            "full_span_independently_qualified":false,"runtime_promotion_authorized":false,
+            "canonical_sidecar_authorized":false,"publication_authorized":false,
+            "remote_mutations":false,"r2_mutations":false})
+    }
+
+    #[test]
+    fn private_225_verification_rejects_stopped_incomplete_or_unbound_terminal_evidence() {
+        let receipt = private_225_terminal_fixture();
+        validate_private_225_terminal(&receipt).unwrap();
+        for (key, value) in [
+            (
+                "schema",
+                json!("jetstreamer-private-epoch225-v1625-bounded-outcome-v1"),
+            ),
+            ("epoch", json!(224)),
+            ("producer_invocation_id", json!("a".repeat(32))),
+            ("natural_parent_exit_code", json!(1)),
+            ("deliberate_stop", json!(true)),
+            ("output_slot_start", json!(97200001)),
+            ("terminal_slot", json!(97631459)),
+            ("output_slot_count", json!(432000)),
+            ("segment_manifest_sha256", json!("A".repeat(64))),
+            ("producer_journal_sha256", json!("")),
+            ("manager_journal_sha256", json!(null)),
+            ("full_span_independently_qualified", json!(true)),
+            ("runtime_promotion_authorized", json!(true)),
+            ("canonical_sidecar_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+            ("remote_mutations", json!(true)),
+            ("r2_mutations", json!(true)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[key] = value;
+            assert!(validate_private_225_terminal(&bad).is_err(), "{key}");
+            let mut missing = receipt.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                validate_private_225_terminal(&missing).is_err(),
+                "missing{key}"
+            );
+        }
     }
     #[test]
     fn bounded_203_has_an_exact_nonpromoting_launch_schema() {
