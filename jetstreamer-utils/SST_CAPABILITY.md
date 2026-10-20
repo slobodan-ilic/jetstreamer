@@ -122,6 +122,53 @@ disposable sleep child, and proves no-clobber receipt writes beneath a valid
 root-private directory. Do not apply the older metadata observer's
 epoch203–212 capability assumptions to epoch141.
 
+`jetstreamer-epoch141-ledger-download` provides a separate **fresh-attempt-only**
+private transfer wrapper for that same fixed generation. It shares the existing
+metadata, UID/GID-drop and receipt primitives with the metadata executable; the
+previously sealed metadata deployment is unchanged. Require independent plan and
+executable hashes, the exact passed metadata receipt and a passed performance
+admission receipt whose file census binds this downloader and metadata receipt.
+The admission filesystem must match the staging filesystem, and its free-byte
+threshold must cover the complete compressed input plus 64 MiB of transfer slack
+above the plan's protected older-growth/century-floor threshold.
+
+The SDK is only the byte transporter. The wrapper pins its script before exec,
+uses the operator's exact login configuration, reobserves the generation before
+and after transfer, and independently streams the complete file through CRC32C,
+MD5 and SHA-256 in Rust. SDK success alone is not verification. Transfer runs in
+its own disposable UID1001/GID1003 process group with empty supplementary groups.
+The wrapper explicitly disables sliced downloads and pins SDK process/thread
+counts to one; operator configuration cannot silently enlarge the transfer's
+temporary-file or process envelope. Check the current SDK's property definitions
+and download selector before operational deployment.
+`waitid(WNOWAIT)` retains the leader identity until group cleanup, avoiding a
+reaped-PID/PGID reuse window. Every second the wrapper checks actual free space,
+elapsed runtime, regular-file identities and bounded aggregate staging length.
+A guard trip writes a durable stop intent before killing/reaping that owned
+group, then writes completion. It never stops a replay or controller.
+The first passing check writes a separate fsynced initial-guard receipt binding
+the invocation, child PID and the exact free/staged byte sample that passed.
+Require that receipt and its actual sandboxed service before unattended transfer.
+
+Give the staging directory a canonical root-owned mode-0711 parent so the
+unprivileged SDK can traverse it; keep receipt parents root-owned mode 0700.
+The wrapper creates the staging leaf no-clobber and refuses an existing attempt,
+including a failed partial. After SDK termination it freezes that leaf and the
+completed compressed file as root before independent hashing. A successful
+root-private no-clobber receipt binds the generation, three digests and file
+identity. No retry may discard or overwrite a partial: reviewed SDK tracker or
+same-generation resume support is still required before reusing a failed attempt.
+
+Before operational use, seal the exact build, qualify the ignored root SDK-drop/
+process-group test under the actual minimal sandbox, run fresh complete resource
+admission and bind all older growth claims/guards. Use `Restart=no`,
+`KillMode=control-group`, sufficient start timeout and only the capabilities needed
+for traversal, UID/GID drop, ownership freeze and owned-child kill. The wrapper's
+tests are not production download evidence. A compressed download receipt still
+does not prove complete backup contents, native live state, recovered PoH hashes,
+runtime compatibility or publication. Bounded complete tar collection and all
+subsequent native/PoH/canonical gates remain independently required.
+
 `horizon_legacy_shred::assemble_v1_4_25_padded_batches` provides bounded,
 diagnostic-only data-shred assembly for revision
 `893cc7647248a3536fb6e6d0b5e51c71446b862d`. It requires a complete contiguous

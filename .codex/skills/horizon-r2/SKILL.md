@@ -58,8 +58,13 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
 
 ### In-flight epoch status objects
 
+- Own the accuracy and lifecycle of these objects: they drive a live dashboard, not an archival
+  history view. Read [references/dashboard-status.md](references/dashboard-status.md) before
+  changing an ETA model, handling a dropped/failed lane, or retiring stale status metadata.
+  A plausible old countdown is not an acceptable substitute for a current, evidence-backed estimate.
 - Publish one mutable R2 object named `epoch-N.epoch-status.json` for every epoch currently claimed
-  by a live replay and not yet committed by its canonical `.sha256` sidecar. Keep these objects out
+  by a live replay or an authenticated active post-replay delivery stage and not yet committed by
+  its canonical `.sha256` sidecar. Keep these objects out
   of `HORIZON_DIR`; build them in private state and publish them with reviewed Rust tooling. The
   object is operational metadata, never an archive, verification receipt, lease, or publication
   gate.
@@ -92,6 +97,11 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   failed or identity-changing sample publishes no replacement. For a legacy multi-epoch replay,
   publish a status object for every still-uncommitted epoch claimed by that replay, even when a
   later member has not begun and its current size is `0`.
+  Handle positively observed failure, dropout, phase handoff and sidecar-completion events promptly
+  without adding a routine polling loop. Update a genuinely active downstream phase with a supported,
+  evidence-bound publisher; do not keep labeling it replay or delete it just because replay ended.
+  Confirmed inactive work must have its misleading status removed through the separate inactive-status
+  lifecycle below, rather than retaining a countdown until an archive eventually completes.
 - Status objects are the sole routine R2 mutation exception: later 30-minute samples may replace
   only the matching `epoch-N.epoch-status.json`, preferably with an ETag/version precondition so an
   older writer cannot replace a newer sample. Verify the exact uploaded bytes through authenticated
@@ -154,7 +164,10 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   Require the per-epoch replay-offset and downstream-allowance maps to cover the modeled range
   exactly. If that model is unavailable or its evidence is incomplete, leave the affected status
   objects unchanged rather than publishing the old pairwise ETA.
-- Delete only that epoch's `epoch-N.epoch-status.json`, and only after the canonical `.jet` has been
+- There are two authorized status-deletion lifecycles: verified archive completion, and positively
+  confirmed inactive/orphaned work. Both apply only to the exact `epoch-N.epoch-status.json` key;
+  neither authorizes an archive, sidecar, receipt, prefix, or bulk deletion.
+- For verified completion, delete that epoch's status after the canonical `.jet` has been
   uploaded and read back, its `.sha256` sidecar has been created, and the complete pair has durable
   authenticated verification evidence. Status deletion does not wait for an anonymous public
   origin. A missing status object is not archive completion evidence. Never use this exception to
@@ -184,6 +197,14 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   verify authenticated absence, and fsync a private no-clobber deletion receipt. Its idempotent
   recovery path may accept an already-absent status only when the exact authenticated publication
   receipt proves that object previously existed and the ready pair still passes every gate.
+- For confirmed inactive/orphaned work, remove the status promptly even when no ready archive exists.
+  Require durable terminal/ownership evidence, no replacement replay or active downstream/handoff,
+  an authenticated match to the exact owner's latest status-publication receipt, a fresh race check,
+  conditional deletion of only that key using its current ETag, authenticated absence verification,
+  and a private durable deletion receipt. Follow the dashboard-status reference. The existing
+  completion-only `status-delete` command must not be tricked into this path with fabricated ready
+  evidence. If no reviewed Rust inactive-cleanup path is deployed, implement and qualify it promptly;
+  report the remaining stale dashboard object explicitly until authenticated cleanup succeeds.
 
 ### Campaign fleet reconciliation
 
@@ -207,14 +228,31 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   epoch range, scratch/output paths, and the current observer receipt. Compare the census with the
   prior ledger so a disappeared invocation, restart, new claim, freed lane, or stalled downstream
   stage becomes an explicit transition rather than silently falling out of monitoring.
+- Keep every failed epoch in the complete-range ledger and a durable open-repair backlog through
+  status deletion, scratch retirement, unit garbage collection, restarts and handoffs. Bind its
+  failed invocation, cause/slot/phase, preserved evidence, artifact disposition, repair commits/tests,
+  remaining qualification gates, concrete next action, blocker and last substantive progress.
+  Reconcile this backlog in the same 30-minute cycle and on observed failure events; removal from
+  the live dashboard is never removal from the work queue or proof of recovery.
+- Make diagnosis and qualified recovery of known failures a priority over additional discretionary
+  cold work. Start the smallest safe diagnostic/repair action in the current cycle rather than
+  repeatedly quarantining the epoch or choosing only easier new work. Keep healthy producers and
+  ready delivery stages moving. If repair genuinely depends on missing source, capacity or external
+  input, record that exact blocker and the next unblocking action, continue independent useful work,
+  and revisit the repair at each coordinated reconciliation. Never use priority to justify a blind
+  retry, an unqualified deployment or a weakened integrity/resource gate. Keep the incident open
+  until a qualified recovery reaches the verified ready-pair outcome; a source commit, passing unit
+  test, queued retry or new invocation alone does not close it.
 - Authenticated-read every in-range `epoch-N.epoch-status.json` that exists and compare its epoch,
   sample timestamp, controller/producer binding from the local publication receipt when available,
   and corresponding live claim. Report its freshness separately from its ETA. If no matching live
   invocation exists, classify the object as stale/orphaned operational metadata, exclude that epoch
   from the active list, and never present its remaining-milliseconds value or projected finish time
-  as current. Under the existing lifecycle rule, leave such an object unchanged until a valid
-  replacement live claim publishes a newer sample or the ready-pair gate authorizes `status-delete`;
-  its presence does not authorize deletion or a blind replay restart.
+  as current. Check for a replacement live invocation, downstream delivery stage or authenticated
+  handoff before declaring work inactive. When inactivity and ownership are positively established,
+  perform the conditional inactive-status cleanup promptly; a missing ready pair must not keep a
+  dead job visible on the dashboard. Uncertain ownership or a transient failed probe is not deletion
+  authority. Status cleanup never authorizes restarting a replay or declaring the epoch complete.
 - Push every reconciled epoch forward in the same control cycle when a safe next action is already
   authorized: dispatch ready verification/upload/readback stages, perform fresh admission for the
   next disjoint staged epoch when capacity and integrity gates pass, and promptly backfill a lane
@@ -1065,9 +1103,10 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
   different current-login socket is healthy. After any shell initialization, rediscover all
   candidate sockets and select only one whose `ssh-add -l` succeeds and lists an identity; never
   treat the socket exported by the startup file itself as proof that Git authentication is ready.
-- Never delete from R2 during cleanup or retries. The only routine deletion authority is the exact
-  post-ready-pair removal of `epoch-N.epoch-status.json` described above; it never extends to an
-  archive, sidecar, receipt, or any other key.
+- Never delete archives, sidecars, receipts or other R2 keys during cleanup or retries. The only
+  routine deletion exception is the exact `epoch-N.epoch-status.json` lifecycle above: verified
+  ready-pair completion or positively proven inactive/orphaned work, with authenticated conditional
+  deletion and durable evidence. No prefix or bulk deletion is authorized.
 - Never use `--overwrite-existing` without both positive evidence that the existing remote `.jet` is erroneous and explicit user authorization for its replacement.
 - Upload the sidecar only after the complete `.jet` has passed remote readback and local source revalidation; the matching sidecar is the readiness marker.
 - Never remove a local archive before its durable receipt exists and both remote objects have been re-observed.

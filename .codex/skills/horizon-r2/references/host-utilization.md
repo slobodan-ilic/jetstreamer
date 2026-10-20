@@ -102,6 +102,13 @@ short-job scheduling must not silently skip it or indefinitely starve older admi
 healthy legacy cohorts and cross-host ownership, stay within the assigned publication range, and
 keep the epoch-301 verification tail private.
 
+Known failures are a priority repair backlog, not candidates to drop from consideration when a
+shorter new singleton becomes available. Advance safe diagnosis or qualified recovery before
+additional discretionary cold admissions. When a specific repair is blocked, keep its evidence,
+next unblocking action and last substantive progress in the fleet's durable repair record while
+independent work continues. Neither reclaiming failed scratch nor deleting stale dashboard status
+closes the repair incident; reconcile it until qualified recovery reaches a verified ready pair.
+
 ## Scale beyond the proven point
 
 Increase beyond the proven operating point by exactly one replay lane at a time; capacity at or
