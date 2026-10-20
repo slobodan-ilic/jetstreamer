@@ -57,6 +57,10 @@ Use a reviewed, sealed Rust cleanup path with the following gates:
 Keep all publication and deletion receipts as history. Classify the epoch honestly in the fleet
 ledger after cleanup (`failed-needs-repair`, `blocked-qualification`, etc.), not `remote-ready`.
 Diagnosis, preservation, backfill and eventual replay remain separate obligations.
+Retain an open repair entry with its failure evidence and next action even after authenticated
+status deletion succeeds. Prioritize safe diagnosis/qualified recovery, carry that entry across
+controller or chat restarts, and close it only when the recovered epoch reaches a verified ready
+pair. Status cleanup fixes the dashboard; it does not fix or erase the failed epoch.
 
 The documented `jetstreamer-r2 status-delete` completion path requires a verified ready pair; it
 does not automatically implement inactive cleanup. Never fake its archive evidence or use a raw

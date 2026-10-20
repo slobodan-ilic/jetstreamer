@@ -228,6 +228,21 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   epoch range, scratch/output paths, and the current observer receipt. Compare the census with the
   prior ledger so a disappeared invocation, restart, new claim, freed lane, or stalled downstream
   stage becomes an explicit transition rather than silently falling out of monitoring.
+- Keep every failed epoch in the complete-range ledger and a durable open-repair backlog through
+  status deletion, scratch retirement, unit garbage collection, restarts and handoffs. Bind its
+  failed invocation, cause/slot/phase, preserved evidence, artifact disposition, repair commits/tests,
+  remaining qualification gates, concrete next action, blocker and last substantive progress.
+  Reconcile this backlog in the same 30-minute cycle and on observed failure events; removal from
+  the live dashboard is never removal from the work queue or proof of recovery.
+- Make diagnosis and qualified recovery of known failures a priority over additional discretionary
+  cold work. Start the smallest safe diagnostic/repair action in the current cycle rather than
+  repeatedly quarantining the epoch or choosing only easier new work. Keep healthy producers and
+  ready delivery stages moving. If repair genuinely depends on missing source, capacity or external
+  input, record that exact blocker and the next unblocking action, continue independent useful work,
+  and revisit the repair at each coordinated reconciliation. Never use priority to justify a blind
+  retry, an unqualified deployment or a weakened integrity/resource gate. Keep the incident open
+  until a qualified recovery reaches the verified ready-pair outcome; a source commit, passing unit
+  test, queued retry or new invocation alone does not close it.
 - Authenticated-read every in-range `epoch-N.epoch-status.json` that exists and compare its epoch,
   sample timestamp, controller/producer binding from the local publication receipt when available,
   and corresponding live claim. Report its freshness separately from its ETA. If no matching live
