@@ -182,8 +182,11 @@ fn validate_guard(
             && sample
                 .get("worker_observation_error")
                 .is_some_and(Value::is_null)
+            && sample.get("canary_target_error").is_none()
+            && sample["bounded_measurement"] == false
+            && sample.get("target_handoff").is_some_and(Value::is_null)
             && sample
-                .get("canary_target_error")
+                .get("target_handoff_error")
                 .is_some_and(Value::is_null)
             && sample["recorded_unix_seconds"]
                 .as_u64()
@@ -208,7 +211,7 @@ fn validate_guard(
             && guard_plan["worker_root"].as_str() == plan.private_run_root.to_str()
             && guard_plan["filesystem"] == "/home/sol"
             && guard_plan["bounded_measurement"].is_null()
-            && guard_plan["bounded_canary"].is_null()
+            && guard_plan.get("bounded_canary").is_none()
             && guard_plan["maximum_worker_vmas"] == 3_500_000
             && sample["maximum_worker_vmas"] == guard_plan["maximum_worker_vmas"]
             && sample["plan_sha256"] == plan.guard_plan.sha256
@@ -363,7 +366,8 @@ mod tests {
             "producer_invocation_id":p.invocation_id,"producer":{"invocation_id":p.invocation_id,
                 "pid":123,"active":"active","sub":"running","restarts":0,"restart_policy":"no",
                 "kill_mode":"control-group","delegated":false,"cgroup":format!("/system.slice/{}",p.unit)},
-            "trip_reason":null,"worker_observation_error":null,"canary_target_error":null,
+            "trip_reason":null,"worker_observation_error":null,"bounded_measurement":false,
+            "target_handoff":null,"target_handoff_error":null,
             "recorded_unix_seconds":1000,"workers":[[456,400000]],"plan_sha256":p.guard_plan.sha256,
             "maximum_worker_vmas":3500000,"minimum_free_bytes":FLOOR,"available_bytes":FLOOR+1,
             "r2_mutations":false,"remote_mutations":false});
@@ -412,7 +416,7 @@ mod tests {
             ("/producer/restarts", json!(1)),
             ("/trip_reason", json!("reserve")),
             ("/worker_observation_error", json!("unreadable")),
-            ("/canary_target_error", json!("bad intent")),
+            ("/target_handoff_error", json!("bad intent")),
             ("/recorded_unix_seconds", json!(879)),
             ("/recorded_unix_seconds", json!(1002)),
             ("/workers", json!([])),
@@ -438,6 +442,32 @@ mod tests {
         bad["filesystem"] = json!("/");
         assert!(validate_guard(&p, &g, &bad, 1001, 123).is_err());
     }
+    #[test]
+    fn actual_pinned_eca_emit_schema_needs_no_invented_canary_fields() {
+        let (p, _, _, _, gp) = fixture();
+        let mut emitted: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/epoch140-eca-guard-sample.json"
+        ))
+        .unwrap();
+        assert!(emitted.get("canary_target_error").is_none());
+        emitted["producer_invocation_id"] = json!(p.invocation_id);
+        emitted["producer"]["invocation_id"] = json!(p.invocation_id);
+        emitted["producer"]["cgroup"] = json!(format!("/system.slice/{}", p.unit));
+        emitted["producer"]["pid"] = json!(123);
+        emitted["plan_sha256"] = json!(p.guard_plan.sha256);
+        emitted["recorded_unix_seconds"] = json!(1000);
+        validate_guard(&p, &emitted, &gp, 1001, 123).unwrap();
+        let mut bad = emitted.clone();
+        bad["canary_target_error"] = Value::Null;
+        assert!(validate_guard(&p, &bad, &gp, 1001, 123).is_err());
+        bad = emitted.clone();
+        bad["bounded_measurement"] = json!(true);
+        assert!(validate_guard(&p, &bad, &gp, 1001, 123).is_err());
+        let mut bad_plan = gp;
+        bad_plan["bounded_canary"] = Value::Null;
+        assert!(validate_guard(&p, &emitted, &bad_plan, 1001, 123).is_err());
+    }
+
     #[test]
     fn strict_plan_rejects_unknown_authority_or_replay_fields() {
         let (mut p, r, _, _, _) = fixture();

@@ -699,6 +699,10 @@ root with `PLAN --plan-sha256 HEX --self-sha256 HEX`; it rechecks the exact serv
 running executable, zero-restart policy and guard identities before a no-clobber private receipt.
 The completed guard service must match the sample's actual systemd invocation and exact command,
 strict/read-only filesystem sandbox, private network, no-new-privileges and DAC/ptrace-only capabilities.
+The pinned `eca42993…` guard predates bounded-canary fields: omit `bounded_canary` entirely,
+even when null. Its generic samples contain `bounded_measurement: false` and null
+`target_handoff`/`target_handoff_error`; they do not contain `canary_target_error`.
+Capture/fleet readers must validate that actual schema rather than edit old samples or invent fields.
 It never starts or stops the probe and cannot replace fresh resource admission or native results.
 Success is only a native consensus comparison, not independent prefix validation, a segment
 manifest, proof of the original executed worker ELF, suffix execution, provenance/import promotion,

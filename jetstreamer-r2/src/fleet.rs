@@ -484,7 +484,17 @@ fn validate_same_sample_admission(
             && guard
                 .get("worker_observation_error")
                 .is_some_and(Value::is_null)
-            && guard.get("canary_target_error").is_some_and(Value::is_null)
+            && if native_restore_140(claim) {
+                // The pinned eca guard predates bounded-canary fields.
+                guard.get("canary_target_error").is_none()
+                    && guard["bounded_measurement"] == false
+                    && guard.get("target_handoff").is_some_and(Value::is_null)
+                    && guard
+                        .get("target_handoff_error")
+                        .is_some_and(Value::is_null)
+            } else {
+                guard.get("canary_target_error").is_some_and(Value::is_null)
+            }
             && guard["r2_mutations"] == false
             && guard["remote_mutations"] == false,
         "admission lacks exact clean sandboxed guard evidence"
@@ -523,7 +533,7 @@ fn validate_same_sample_admission(
 
 fn diagnostic_guard_profile_matches(claim: &DiagnosticClaim, plan: &Value) -> bool {
     if native_restore_140(claim) {
-        plan.get("bounded_canary").is_none_or(Value::is_null)
+        plan.get("bounded_canary").is_none()
             && plan.get("bounded_measurement").is_none_or(Value::is_null)
             && plan["filesystem"] == "/home/sol"
             && plan["minimum_free_bytes"]
@@ -3403,12 +3413,35 @@ mod tests {
         guard["producer"]["cgroup"] = json!(format!("/system.slice/{}", claim.unit));
         guard["minimum_free_bytes"] = json!(5153080892870u64);
         guard["available_bytes"] = json!(5153080892871u64);
+        guard.as_object_mut().unwrap().remove("canary_target_error");
+        guard["bounded_measurement"] = json!(false);
+        guard["target_handoff"] = Value::Null;
+        guard["target_handoff_error"] = Value::Null;
         gp["unit"] = json!(claim.unit);
         gp["worker_root"] = json!(claim.scratch_path);
         gp["filesystem"] = json!("/home/sol");
         gp["minimum_free_bytes"] = guard["minimum_free_bytes"].clone();
-        gp["bounded_canary"] = Value::Null;
+        gp.as_object_mut().unwrap().remove("bounded_canary");
         gp["bounded_measurement"] = Value::Null;
+        // Preserve the actual old binary's emitted schema as a regression,
+        // replacing only fixture identities/time and its bound plan digest.
+        let mut emitted: Value = serde_json::from_str(include_str!(
+            "../../jetstreamer-utils/tests/fixtures/epoch140-eca-guard-sample.json"
+        ))
+        .unwrap();
+        emitted["producer_invocation_id"] = guard["producer_invocation_id"].clone();
+        emitted["producer"] = guard["producer"].clone();
+        emitted["recorded_unix_seconds"] = guard["recorded_unix_seconds"].clone();
+        emitted["plan_sha256"] = guard["plan_sha256"].clone();
+        validate_same_sample_admission(
+            &previous,
+            &plan,
+            "2026-10-20T00:04:42Z",
+            &emitted,
+            &gp,
+            1792455200,
+        )
+        .unwrap();
         validate_same_sample_admission(
             &previous,
             &plan,
