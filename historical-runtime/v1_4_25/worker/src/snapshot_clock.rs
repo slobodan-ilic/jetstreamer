@@ -202,22 +202,23 @@ struct Guard {
     floor: u64,
 }
 impl Guard {
-    fn check(&self) -> io::Result<()> {
+    fn check(&self) -> io::Result<u64> {
         let path = std::ffi::CString::new("/home/sol").unwrap();
         let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
         let stat = unsafe { stat.assume_init() };
-        if self.start.elapsed().as_secs() >= MAX_SECONDS
-            || stat.f_bavail.checked_mul(stat.f_frsize).unwrap_or(0) < self.floor
-        {
+        let available = stat.f_bavail.checked_mul(stat.f_frsize).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "free-byte arithmetic overflow")
+        })?;
+        if self.start.elapsed().as_secs() >= MAX_SECONDS || available < self.floor {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "snapshot observation reserve/runtime stop",
             ));
         }
-        Ok(())
+        Ok(available)
     }
 }
 struct Guarded<'a, R> {
@@ -314,12 +315,15 @@ pub fn run() -> Result<(), String> {
     if initial == output {
         return Err("guard/output overlap".into());
     }
+    let initial_available = guard.check().map_err(|e| e.to_string())?;
     write_json(
         &initial,
         &serde_json::json!({
             "schema":"jetstreamer-epoch140-serialized-snapshot-clock-initial-guard-v1",
             "invocation_id":invocation,"self_sha256":exe_sha,"input":INPUT,
             "input_device":before.dev(),"input_inode":before.ino(),"minimum_free_bytes":floor,
+            "available_bytes":initial_available,
+            "recorded_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e|e.to_string())?.as_secs(),
             "maximum_runtime_seconds":MAX_SECONDS,"guard_on_each_compressed_read":true,
             "trip":false,"replay_launch_authorized":false,"publication_authorized":false,
             "remote_mutations":false,"r2_mutations":false
