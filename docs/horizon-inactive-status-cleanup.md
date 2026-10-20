@@ -6,17 +6,20 @@
 The general campaign command, added concurrently by the other host, is
 `status-retire-inactive`; see [its contract](horizon-inactive-status-retirement.md).
 This narrower profile supplies additional host-specific process, local-artifact,
-remote-inventory and multipart checks for the 183–184 incident. Both commands
+remote-inventory and multipart checks for the original 183–186 incident. Both commands
 delegate to the same canonical-key, ETag-conditional mutation boundary. Qualify
 the chosen command and plan explicitly; do not mix their receipt schemas.
 
-The initial profile intentionally supports only the failed epoch-183/184 owner on
+The profile intentionally supports only epochs 183, 184 and 186 from the failed original 183–186 owner on
 dev-samjohnson. It binds the exact controller/producer invocation IDs, pinned
 terminal incident, latest authenticated status publication, historical owner
 observer, current complete-range fleet, and persistent open repair backlog.
 It does not grant archive completion, replay, retirement, or incident closure.
 Extending it to other failures requires source review and separate qualification;
 do not change plan fields to impersonate this owner.
+Epoch 185's live replacement is explicitly excluded. Epoch 186's new dormant
+controller is not the old status owner; its terminal/no-trigger state and the
+complete absence of active or queued replacement work must still pass every gate.
 
 The root-owned sealed plan names the actual campaign directories, bucket,
 unique intent/completion paths in an existing root-private directory, and exact

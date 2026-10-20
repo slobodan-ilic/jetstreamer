@@ -1,4 +1,4 @@
-//! Deliberately narrow initial inactive-status cleanup profile: failed 183–184
+//! Deliberately narrow inactive-status cleanup profile: dropped 183, 184, 186
 //! on dev-samjohnson. Never handles archives, sidecars, prefixes, or live work.
 //! Extending the profile requires source review and new qualification evidence.
 use super::*;
@@ -9,6 +9,10 @@ const INCIDENT_SHA: &str = "960943ad5242e96ff56635d773703f1c00a34e0704b8c2bca248
 const CONTROLLER_ID: &str = "4734b0f6e8214f7ba794fc228654bfe8";
 const PRODUCER_ID: &str = "180f132f59cf4477a36a48f905985262";
 const INTENT_SCHEMA: &str = "jetstreamer-r2-inactive-status-intent-v1";
+
+fn profile_epoch(epoch: u64) -> bool {
+    matches!(epoch, 183 | 184 | 186)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -100,7 +104,7 @@ fn persist(path: &Path, value: &Value) -> Result<()> {
 
 fn owner_matches(publication: &StatusPublicationReceipt, epoch: u64) -> Result<()> {
     ensure!(
-        (183..=184).contains(&epoch)
+        profile_epoch(epoch)
             && publication.epoch == epoch
             && publication.controller_invocation_id == CONTROLLER_ID
             && publication.producer_invocation_id == PRODUCER_ID
@@ -385,7 +389,8 @@ fn validate_fleet(
     let entries: Vec<_> = entries.iter().filter(|e| e["epoch"] == epoch).collect();
     ensure!(
         entries.len() == 1
-            && entries[0]["state"] == "failed-needs-repair"
+            && (entries[0]["state"] == "failed-needs-repair"
+                || (epoch == 186 && entries[0]["state"] == "blocked-qualification"))
             && entries[0]["status"]["classification"] == "stale-or-orphaned"
             && entries[0]["status"]["etag"] == publication.object_etag
             && entries[0]["status"]["payload"] == serde_json::to_value(&publication.status)?,
@@ -698,7 +703,7 @@ pub(super) async fn run() -> Result<()> {
             && plan.host == "dev-samjohnson"
             && plan.exclusive_local_epoch_ownership
             && plan.authenticated_other_host_handoffs.is_empty()
-            && (183..=184).contains(&plan.epoch),
+            && profile_epoch(plan.epoch),
         "unsupported inactive-cleanup profile"
     );
     ensure!(
@@ -890,6 +895,37 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_queued_186_is_supported_but_live_185_and_other_owners_are_protected() {
+        let mut p = publication();
+        p.epoch = 186;
+        p.status.epoch = 186;
+        p.key = "epoch-186.epoch-status.json".into();
+        owner_matches(&p, 186).unwrap();
+        p.producer_invocation_id = "c".repeat(32);
+        assert!(owner_matches(&p, 186).is_err());
+        p.producer_invocation_id = PRODUCER_ID.into();
+        p.epoch = 185;
+        p.status.epoch = 185;
+        p.key = "epoch-185.epoch-status.json".into();
+        assert!(owner_matches(&p, 185).is_err());
+        assert!(!profile_epoch(182));
+        assert!(!profile_epoch(187));
+        p.epoch = 186;
+        p.status.epoch = 186;
+        p.key = "epoch-186.epoch-status.json".into();
+        let mut current = json!({"schema":"jetstreamer-horizon-campaign-fleet-v1","first_epoch":101,"last_epoch":200,
+            "inventory":{"anomalies":0},"recorded_unix_seconds":1000,"sampled_at_utc":"1970-01-01T00:16:40Z",
+            "active":[],"epochs":[{"epoch":186,"state":"blocked-qualification","status":{
+                "classification":"stale-or-orphaned","etag":p.object_etag,"payload":p.status}}]});
+        validate_fleet(&current, 186, &p, 1000).unwrap();
+        current["active"] = json!([{"epoch":186,"phase":"replay"}]);
+        assert!(validate_fleet(&current, 186, &p, 1000).is_err());
+        current["active"] = json!([]);
+        current["epochs"][0]["state"] = json!("staged-admissible");
+        assert!(validate_fleet(&current, 186, &p, 1000).is_err());
+    }
 
     #[test]
     fn repeated_start_hooks_are_all_checked_but_duplicate_identity_is_rejected() {
