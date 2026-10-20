@@ -38,3 +38,27 @@ leaving it unattended. Keep earlier attempts and receipts; never restart or muta
 a healthy ordinary producer. Any mismatch remains fatal. Even a matching Bank at
 the diagnostic boundary requires full checkpoint/plugin qualification before era
 promotion or archive publication.
+
+## Bounded comparison result, 2026-10-20
+
+Invocation `a7523ee4cdb54cbfa59a0cc9ed4428b4` reached the target and was
+controlled-stopped at observed slot `97,202,504`. The frozen parent Bank at
+`97,199,877` was
+`3uMcx4shPW8rToYyXRQgiD9DSzx5qDCv2uFw9NanuWPK`, matching canonical votes;
+v1.6.20 had produced
+`G6BFd1oz8QNkVMdPsrqkJBEF8UBpeGsbfWEEdP4ysJiJ`. The v1.6.25 run passed
+the formerly failing successful vote at `97,199,878`. This is evidence of an
+actual version-dependent replay improvement, not yet causal isolation of one
+upstream change or canonical-root qualification.
+
+The resource receipt SHA-256 is
+`c9f7de000bb2495bf6e687de21e7f32ac1d2ab608f33bdbb0ee9b9055f0a8ea4`.
+It retains actual child exit 1 after the authenticated target-stop, no external
+signal, no OOM kill, and matching pre-shutdown capture. The complete journal and
+outcome receipts are preserved in a root-sealed private evidence bundle. No
+canonical sidecar was created and no runtime/publication gate was promoted.
+
+The underlying canonical root `97,631,459` is itself 540 slots before the end of
+epoch225. Even reproducing that root would not make this prefix a complete
+epoch225 archive. Full cold-resource admission and a separately qualified
+complete-span or checkpoint-continuation path remain necessary.

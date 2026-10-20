@@ -91,7 +91,31 @@ fn read_canary_evidence(path: &Path, uid: u32, maximum: u64) -> Result<Vec<u8>> 
     Ok(bytes)
 }
 
+fn canary_scope(unit: &str) -> Result<(&'static str, u64)> {
+    ensure!(
+        unit.ends_with(".service")
+            && unit
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+        "invalid bounded-canary unit"
+    );
+    if unit.starts_with("horizon-qualify-225-bounded-resource-") {
+        Ok((
+            "jetstreamer-private-epoch225-canary-target-stop-v1",
+            97_202_500,
+        ))
+    } else if unit.starts_with("horizon-qualify-203-bounded-resource-") {
+        Ok((
+            "jetstreamer-private-epoch203-canary-target-stop-v1",
+            87_720_000,
+        ))
+    } else {
+        anyhow::bail!("unknown bounded-canary unit")
+    }
+}
+
 fn validate_canary_target(
+    unit: &str,
     intent: &Value,
     capture: &Value,
     invocation: &str,
@@ -99,13 +123,14 @@ fn validate_canary_target(
     now: u64,
     maximum_age: u64,
 ) -> Result<()> {
+    let (schema, target) = canary_scope(unit)?;
     ensure!(
-        intent["schema"] == "jetstreamer-private-epoch225-canary-target-stop-v1"
+        intent["schema"] == schema
             && intent["invocation_id"] == invocation
-            && intent["target_slot"] == 97_202_500u64
+            && intent["target_slot"] == target
             && intent["observed_slot"]
                 .as_u64()
-                .is_some_and(|s| (97_202_500..=97_203_500).contains(&s))
+                .is_some_and(|s| (target..=target + 1000).contains(&s))
             && intent["child_pid"]
                 .as_u64()
                 .is_some_and(|p| p > 1 && p <= i32::MAX as u64)
@@ -173,6 +198,7 @@ fn canary_target(p: &Plan, c: &BoundedCanary, now: u64) -> Result<Option<Value>>
     let intent: Value = serde_json::from_slice(&intent_raw)?;
     let capture: Value = serde_json::from_slice(&capture_raw)?;
     validate_canary_target(
+        &p.unit,
         &intent,
         &capture,
         &p.invocation_id,
@@ -545,8 +571,7 @@ fn run() -> Result<()> {
     );
     if let Some(c) = &plan.bounded_canary {
         ensure!(
-            plan.unit
-                .starts_with("horizon-qualify-225-bounded-resource-")
+            canary_scope(&plan.unit).is_ok()
                 && c.expected_uid == 1000
                 && c.target_stop_intent == plan.worker_root.join("receipts/target-stop.json")
                 && (60..=180).contains(&c.maximum_drainage_seconds),
@@ -1012,15 +1037,51 @@ mod tests {
     fn canary_target_binds_scope_time_capture_and_absence_of_external_signal() {
         let root = Path::new("/private/canary");
         let (intent, capture) = target_fixture(root);
-        validate_canary_target(&intent, &capture, &"a".repeat(32), root, 1100, 180).unwrap();
+        validate_canary_target(
+            "horizon-qualify-225-bounded-resource-test.service",
+            &intent,
+            &capture,
+            &"a".repeat(32),
+            root,
+            1100,
+            180,
+        )
+        .unwrap();
         assert!(
-            validate_canary_target(&intent, &capture, &"b".repeat(32), root, 1100, 180).is_err()
+            validate_canary_target(
+                "horizon-qualify-225-bounded-resource-test.service",
+                &intent,
+                &capture,
+                &"b".repeat(32),
+                root,
+                1100,
+                180
+            )
+            .is_err()
         );
         assert!(
-            validate_canary_target(&intent, &capture, &"a".repeat(32), root, 999, 180).is_err()
+            validate_canary_target(
+                "horizon-qualify-225-bounded-resource-test.service",
+                &intent,
+                &capture,
+                &"a".repeat(32),
+                root,
+                999,
+                180
+            )
+            .is_err()
         );
         assert!(
-            validate_canary_target(&intent, &capture, &"a".repeat(32), root, 1181, 180).is_err()
+            validate_canary_target(
+                "horizon-qualify-225-bounded-resource-test.service",
+                &intent,
+                &capture,
+                &"a".repeat(32),
+                root,
+                1181,
+                180
+            )
+            .is_err()
         );
         for (key, value) in [
             ("target_slot", json!(97202501)),
@@ -1034,15 +1095,32 @@ mod tests {
             let mut bad = intent.clone();
             bad[key] = value;
             assert!(
-                validate_canary_target(&bad, &capture, &"a".repeat(32), root, 1100, 180).is_err(),
+                validate_canary_target(
+                    "horizon-qualify-225-bounded-resource-test.service",
+                    &bad,
+                    &capture,
+                    &"a".repeat(32),
+                    root,
+                    1100,
+                    180
+                )
+                .is_err(),
                 "{key}"
             );
         }
         let mut substituted = capture.clone();
         substituted["accounts_state"]["regular_files"] = json!(2);
         assert!(
-            validate_canary_target(&intent, &substituted, &"a".repeat(32), root, 1100, 180)
-                .is_err()
+            validate_canary_target(
+                "horizon-qualify-225-bounded-resource-test.service",
+                &intent,
+                &substituted,
+                &"a".repeat(32),
+                root,
+                1100,
+                180
+            )
+            .is_err()
         );
         let mut escaped = capture.clone();
         escaped["accounts_state"]["path"] = json!("/other/accounts-state");
@@ -1050,8 +1128,59 @@ mod tests {
         forged["capture_canonical_json_sha256"] =
             json!(sha(&serde_json::to_vec(&escaped).unwrap()));
         assert!(
-            validate_canary_target(&forged, &escaped, &"a".repeat(32), root, 1100, 180).is_err()
+            validate_canary_target(
+                "horizon-qualify-225-bounded-resource-test.service",
+                &forged,
+                &escaped,
+                &"a".repeat(32),
+                root,
+                1100,
+                180
+            )
+            .is_err()
         );
+    }
+    #[test]
+    fn epoch203_target_cannot_borrow_epoch225_handoff_or_renew_it() {
+        let root = Path::new("/private/canary");
+        let (mut intent, capture) = target_fixture(root);
+        let unit = "horizon-qualify-203-bounded-resource-test.service";
+        assert!(
+            validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1100, 180)
+                .is_err()
+        );
+        intent["schema"] = json!("jetstreamer-private-epoch203-canary-target-stop-v1");
+        intent["target_slot"] = json!(87_720_000);
+        intent["observed_slot"] = json!(87_720_005);
+        validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1100, 180).unwrap();
+        assert!(
+            validate_canary_target(
+                "horizon-qualify-225-bounded-resource-test.service",
+                &intent,
+                &capture,
+                &"a".repeat(32),
+                root,
+                1100,
+                180
+            )
+            .is_err()
+        );
+        assert!(
+            validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1181, 180)
+                .is_err()
+        );
+        intent["observed_slot"] = json!(87_721_001);
+        assert!(
+            validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1100, 180)
+                .is_err()
+        );
+        for bad in [
+            "horizon-qualify-204-bounded-resource-test.service",
+            "horizon-qualify-203-bounded-resource-test.timer",
+            "horizon-qualify-203-bounded-resource-test@.service",
+        ] {
+            assert!(canary_scope(bad).is_err());
+        }
     }
     #[test]
     fn canary_evidence_is_private_readonly_and_never_a_symlink() {

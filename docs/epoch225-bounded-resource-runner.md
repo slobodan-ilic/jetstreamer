@@ -4,6 +4,11 @@
 not qualify the full cold-epoch peak, promote a runtime, import an archive, or
 authorize a canonical checksum sidecar or R2 publication.
 
+The target-stop/capture mechanics are shared with a distinct compile-time
+[epoch203 profile](epoch203-bounded-resource-runner.md). Neither binary accepts
+the other profile's plan, unit, private root, snapshot or target. Already-sealed
+runner and guard deployments are unchanged.
+
 The exact bootstrap is slot `97,199,617`, accounts hash
 `HE57JmgvEeZjBKN8cfTLrmyCbUnptJ9PWjUdTzgxSSdi`. The unchanged v1.6.20 worker
 and snapshot SHA-256 values are compiled into the runner. Replay stops when the

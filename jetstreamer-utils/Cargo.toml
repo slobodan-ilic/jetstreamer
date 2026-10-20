@@ -78,6 +78,10 @@ name = "jetstreamer-epoch225-bounded-resource"
 path = "src/epoch225_bounded_resource_bin.rs"
 
 [[bin]]
+name = "jetstreamer-epoch203-bounded-resource"
+path = "src/epoch203_bounded_resource_bin.rs"
+
+[[bin]]
 name = "jetstreamer-epoch213-private-verify"
 path = "src/epoch213_private_verify_bin.rs"
 
