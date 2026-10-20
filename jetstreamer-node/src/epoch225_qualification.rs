@@ -158,6 +158,8 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("private");
         std::fs::create_dir(&root).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let ledger = root.join("ledger");
         validate_filesystem(&ledger).unwrap();
         let alias = parent.path().join("alias");
