@@ -265,21 +265,34 @@ fn unit(name: &str) -> Result<Value> {
     ensure!(valid_unit_name(name), "invalid unit name");
     let out = Command::new("systemctl").args(["show", name, "--no-pager",
         "--property=Id,LoadState,ActiveState,SubState,InvocationID,NRestarts,MainPID,ExecStart,ExecStartPre,ExecStartPost,TriggeredBy,Result"]).output()?;
-    let mut v = serde_json::Map::new();
-    for line in std::str::from_utf8(&out.stdout)?.lines() {
-        let (k, val) = line.split_once('=').context("invalid systemctl property")?;
-        ensure!(
-            v.insert(k.into(), json!(val)).is_none(),
-            "duplicate unit property"
-        );
-    }
-    let v = Value::Object(v);
+    let v = parse_unit_properties(&out.stdout)
+        .with_context(|| format!("invalid properties for {name}"))?;
     ensure!(
         v["Id"] == name
             && (out.status.success() || (v["LoadState"] == "not-found" && terminal(&v))),
         "failed unit probe"
     );
     Ok(v)
+}
+
+fn parse_unit_properties(bytes: &[u8]) -> Result<Value> {
+    let mut values = serde_json::Map::<String, Value>::new();
+    for line in std::str::from_utf8(bytes)?.lines() {
+        let (key, value) = line.split_once('=').context("invalid systemctl property")?;
+        if let Some(old) = values.get_mut(key) {
+            ensure!(
+                matches!(key, "ExecStart" | "ExecStartPre" | "ExecStartPost"),
+                "ambiguous duplicate non-command property {key}"
+            );
+            *old = json!(format!(
+                "{}\n{value}",
+                old.as_str().context("command must be text")?
+            ));
+        } else {
+            values.insert(key.into(), json!(value));
+        }
+    }
+    Ok(Value::Object(values))
 }
 
 // Match whole numeric epoch tokens/ranges in unit namespaces, not dates or
@@ -877,6 +890,19 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_start_hooks_are_all_checked_but_duplicate_identity_is_rejected() {
+        let v=parse_unit_properties(b"Id=unit.service\nExecStartPre=/bin/true\nExecStartPre=/sealed/jetstreamer-node 183 /output\n").unwrap();
+        let command = start_commands(&v)
+            .unwrap()
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join("\0");
+        assert!(replay_command_claims(command.as_bytes(), 183));
+        assert!(parse_unit_properties(b"Id=one.service\nId=two.service\n").is_err());
+        assert!(parse_unit_properties(b"MainPID=0\nMainPID=123\n").is_err());
+    }
 
     #[test]
     fn complete_census_accepts_real_systemd_hex_escapes_without_options_or_paths() {
