@@ -32,6 +32,31 @@ struct DiagnosticClaim {
     launch_receipt: BoundFile,
 }
 
+fn diagnostic_scope(claim: &DiagnosticClaim) -> std::ops::RangeInclusive<u64> {
+    if claim.epoch == 225
+        && claim
+            .unit
+            .starts_with("horizon-qualify-225-natural-root-resource-")
+    {
+        // The tail is private diagnostic work, never a second ordinary claim.
+        225..=226
+    } else {
+        claim.epoch..=claim.epoch
+    }
+}
+
+fn register_live_diagnostic_scope(
+    epochs: &mut BTreeSet<u64>,
+    claim: &DiagnosticClaim,
+) -> Result<()> {
+    ensure!(
+        diagnostic_scope(claim).all(|epoch| !epochs.contains(&epoch)),
+        "overlapping live private diagnostic claims"
+    );
+    epochs.extend(diagnostic_scope(claim));
+    Ok(())
+}
+
 // Observational only: these claims never authorize launch, publication or upload.
 // Keep delivery distinct from private diagnostics, which forbid remote mutation.
 #[derive(Deserialize, Eq, PartialEq)]
@@ -291,6 +316,14 @@ fn validate_same_sample_admission(
         {
             "61e189bb50d58fa446b84f016d3b19433c30f490c6d470907130f113a01b644a"
         }
+        225 if claim
+            .unit
+            .starts_with("horizon-qualify-225-natural-root-resource-") =>
+        {
+            // The unchanged standalone guard's natural-completion profile,
+            // never a target-stop or zero-worker benchmark exemption.
+            "cc3536dfcc268c913feccf1603a25e3cdbdf2807289c9061e04884027d1b1560"
+        }
         203 if claim
             .unit
             .starts_with("horizon-qualify-203-bounded-resource-")
@@ -373,7 +406,20 @@ fn validate_same_sample_admission(
 }
 
 fn diagnostic_guard_profile_matches(claim: &DiagnosticClaim, plan: &Value) -> bool {
-    if claim.epoch == 224
+    if claim.epoch == 225
+        && claim
+            .unit
+            .starts_with("horizon-qualify-225-natural-root-resource-")
+    {
+        plan.get("bounded_canary").is_none_or(Value::is_null)
+            && plan.get("bounded_measurement").is_none_or(Value::is_null)
+            // Lower bound only: fresh admission must additionally protect the
+            // remaining 203 debt. This does not adopt the proposed 512GiB
+            // replacement for the still-live 576GiB 216-219 growth claim.
+            && plan["minimum_free_bytes"]
+                .as_u64()
+                .is_some_and(|v| v >= 231_874_716_783 + ((576 + 640 + 64) << 30))
+    } else if claim.epoch == 224
         && claim
             .unit
             .starts_with("horizon-qualify-224-bounded-resource-")
@@ -417,6 +463,8 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
         receipt["schema"] == "jetstreamer-private-epoch224-bounded-resource-launch-v1";
     let root_prefix_203 =
         receipt["schema"] == "jetstreamer-private-epoch203-root-prefix-resource-launch-v1";
+    let natural_root_225 =
+        receipt["schema"] == "jetstreamer-private-epoch225-natural-root-resource-launch-v1";
     let private_verify_213 =
         receipt["schema"] == "jetstreamer-private-epoch213-verification-launch-v1";
     ensure!(
@@ -427,6 +475,7 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             || bounded_203
             || bounded_224
             || root_prefix_203
+            || natural_root_225
             || private_verify_213
             || receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1")
             && receipt["launched"] == true
@@ -488,6 +537,46 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
                 == "f39140b9a9659e7c6e8207076a2d0c560a6b69df42cc92e19a421cf46c2b761c"
             && receipt["replay_entries_authorized"] == false
             && receipt["full_cold_epoch_peak_qualified"] == false
+            && receipt["canonical_sidecar_authorized"] == false
+            && receipt["publication_authorized"] == false
+    } else if natural_root_225 {
+        claim.epoch == 225
+            && claim
+                .unit
+                .starts_with("horizon-qualify-225-natural-root-resource-")
+            && claim.unit.ends_with(".service")
+            && claim.scratch_path.parent() == Some(Path::new("/home/ubuntu/.jetstreamer-private"))
+            && claim
+                .scratch_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with("qualification-225-v1625-natural-root-"))
+            && receipt["epoch"] == 225
+            && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+            && receipt["snapshot_slot"] == 97_199_617u64
+            && receipt["snapshot_sha256"]
+                == "094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d"
+            && receipt["worker_sha256"]
+                == "7cd48efc8719109a69fafcb3209a821ea9f07113e3fb0bfab49db23a6e77a146"
+            && receipt["node_sha256"]
+                == "945f36fe11824263258ad561dba106e377148b702f2c615522b171c4ba97ed3b"
+            && receipt["runtime"] == "solana-v1.6.25"
+            && receipt["runtime_semantics_changed"] == true
+            && receipt["solana_rayon_threads"] == 16
+            && receipt["output_slot_start"] == 97_200_000u64
+            && receipt["output_slot_count"] == 863_465u64
+            && receipt["canonical_epoch_end"] == 97_631_999u64
+            && receipt["terminal_root_slot"] == 98_063_464u64
+            && receipt["required_checkpoints"] == json!([97_199_617, 97_631_459, 98_063_464])
+            && receipt["private_verification_tail_epoch"] == 226
+            && receipt["private_verification_tail_slots"] == 431_465u64
+            && receipt["natural_parent_completion_required"] == true
+            && receipt["maximum_runtime_seconds"] == 604_800u64
+            && receipt["natural_root_resource_attempt_authorized"] == true
+            && receipt["full_span_independently_qualified"] == false
+            && receipt["full_cold_epoch_peak_qualified"] == false
+            && receipt["ordinary_replay_authorized"] == false
+            && receipt["runtime_promotion_authorized"] == false
             && receipt["canonical_sidecar_authorized"] == false
             && receipt["publication_authorized"] == false
     } else if root_prefix_203 {
@@ -1262,9 +1351,9 @@ pub(super) async fn run() -> Result<()> {
         );
         validate_diagnostic_launch(&bound_json(&claim.launch_receipt)?, claim)?;
         for replay in replays {
+            let replay_scope = parse_observer_claim_range(observer_string(replay, &["range"])?)?;
             ensure!(
-                !parse_observer_claim_range(observer_string(replay, &["range"])?)?
-                    .contains(&claim.epoch),
+                !diagnostic_scope(claim).any(|epoch| replay_scope.contains(&epoch)),
                 "diagnostic overlaps an ordinary replay claim"
             );
         }
@@ -1351,6 +1440,7 @@ pub(super) async fn run() -> Result<()> {
     let mut entries = Vec::new();
     let mut active = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut live_diagnostic_epochs = BTreeSet::new();
     let mut pipelines = Vec::new();
     let mut live_pipeline_stages = BTreeSet::new();
     for claim in &plan.pipeline_claims {
@@ -1371,7 +1461,8 @@ pub(super) async fn run() -> Result<()> {
                 !plan
                     .diagnostics
                     .iter()
-                    .any(|d| d.epoch == claim.epoch && before[&d.unit]["ActiveState"] == "active"),
+                    .any(|d| diagnostic_scope(d).contains(&claim.epoch)
+                        && before[&d.unit]["ActiveState"] == "active"),
                 "live delivery overlaps private diagnostic work"
             );
             for replay in replays {
@@ -1389,6 +1480,7 @@ pub(super) async fn run() -> Result<()> {
         let current = &before[&claim.unit];
         let is_active = current["ActiveState"] == "active" && current["SubState"] == "running";
         if is_active {
+            register_live_diagnostic_scope(&mut live_diagnostic_epochs, claim)?;
             ensure!(
                 current["InvocationID"] == claim.invocation_id && current["NRestarts"] == "0",
                 "diagnostic live invocation changed"
@@ -1409,10 +1501,14 @@ pub(super) async fn run() -> Result<()> {
             active.push(json!({"epoch":claim.epoch,"phase":phase,"producer":current,
                 "scratch_path":claim.scratch_path,"launch_receipt":claim.launch_receipt.path,
                 "launch_receipt_sha256":claim.launch_receipt.sha256,"sampled_at_utc":sample,
+                "scope_first_epoch":diagnostic_scope(claim).start(),
+                "scope_last_epoch":diagnostic_scope(claim).end(),
                 "resource_basis":"hash-bound private diagnostic launch and invocation identity; consult bound admission, guard and terminal evidence",
                 "ordinary_replay_claim":false,"current_sidecar_eta_valid":false}));
         }
         diagnostics.push(json!({"epoch":claim.epoch,"unit":current,"live":is_active,
+            "scope_first_epoch":diagnostic_scope(claim).start(),
+            "scope_last_epoch":diagnostic_scope(claim).end(),
             "launch_invocation_id":claim.invocation_id,"launch_receipt":claim.launch_receipt.path,
             "launch_receipt_sha256":claim.launch_receipt.sha256,
             "terminal_outcome_requires_canary_receipt":!is_active}));
@@ -1432,11 +1528,25 @@ pub(super) async fn run() -> Result<()> {
         let gate = &plan.gates[&epoch];
         let mut state = gate.state.as_str();
         let mut next = gate.next_action.as_str();
-        if diagnostics
-            .iter()
-            .any(|claim| claim["epoch"] == epoch && claim["live"] == true)
-        {
+        if diagnostics.iter().any(|claim| {
+            claim["live"] == true
+                && claim["scope_first_epoch"]
+                    .as_u64()
+                    .is_some_and(|first| first <= epoch)
+                && claim["scope_last_epoch"]
+                    .as_u64()
+                    .is_some_and(|last| epoch <= last)
+        }) {
             state = "blocked-qualification";
+            if epoch == 226
+                && diagnostics.iter().any(|claim| {
+                    claim["epoch"] == 225
+                        && claim["scope_last_epoch"] == 226
+                        && claim["live"] == true
+                })
+            {
+                next = "Preserve private epoch-226 tail of live epoch-225 natural-root qualification; no ordinary replay, plugin publication or sidecar until a separately qualified handoff";
+            }
         }
         if pipelines
             .iter()
@@ -1852,6 +1962,167 @@ mod tests {
         register_live_pipeline_stage(&mut stages, &claim).unwrap();
     }
     use super::*;
+    #[test]
+    fn natural_root_225_launch_keeps_the_complete_span_and_tail_private() {
+        let mut claim = DiagnosticClaim {
+            epoch: 225,
+            unit: "horizon-qualify-225-natural-root-resource-test.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path:
+                "/home/ubuntu/.jetstreamer-private/qualification-225-v1625-natural-root-test".into(),
+            launch_receipt: BoundFile {
+                path: "/sealed/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        assert_eq!(diagnostic_scope(&claim), 225..=226);
+        assert!(!diagnostic_scope(&claim).contains(&224));
+        assert!(!diagnostic_scope(&claim).contains(&227));
+        let mut live_epochs = BTreeSet::new();
+        register_live_diagnostic_scope(&mut live_epochs, &claim).unwrap();
+        let mut overlapping = DiagnosticClaim {
+            epoch: 226,
+            unit: "horizon-qualify-226-test.service".into(),
+            invocation_id: "c".repeat(32),
+            scratch_path: "/private/226".into(),
+            launch_receipt: BoundFile {
+                path: "/sealed/226.json".into(),
+                sha256: "d".repeat(64),
+            },
+        };
+        assert!(register_live_diagnostic_scope(&mut live_epochs, &overlapping).is_err());
+        assert_eq!(live_epochs, BTreeSet::from([225, 226]));
+        overlapping.epoch = 227;
+        register_live_diagnostic_scope(&mut live_epochs, &overlapping).unwrap();
+        let receipt = json!({
+            "schema":"jetstreamer-private-epoch225-natural-root-resource-launch-v1",
+            "launched":true,"epoch":225,"private_run_root":claim.scratch_path,
+            "snapshot_slot":97199617,
+            "snapshot_sha256":"094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d",
+            "worker_sha256":"7cd48efc8719109a69fafcb3209a821ea9f07113e3fb0bfab49db23a6e77a146",
+            "node_sha256":"945f36fe11824263258ad561dba106e377148b702f2c615522b171c4ba97ed3b",
+            "runtime":"solana-v1.6.25","runtime_semantics_changed":true,"solana_rayon_threads":16,
+            "output_slot_start":97200000,"output_slot_count":863465,"canonical_epoch_end":97631999,
+            "terminal_root_slot":98063464,"required_checkpoints":[97199617,97631459,98063464],
+            "private_verification_tail_epoch":226,"private_verification_tail_slots":431465,
+            "natural_parent_completion_required":true,"maximum_runtime_seconds":604800,
+            "natural_root_resource_attempt_authorized":true,"full_span_independently_qualified":false,
+            "full_cold_epoch_peak_qualified":false,"ordinary_replay_authorized":false,
+            "runtime_promotion_authorized":false,"canonical_sidecar_authorized":false,
+            "publication_authorized":false,"remote_mutations":false,"r2_mutations":false,
+            "evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,
+                "restarts":0,"load_state":"loaded","active_state":"active","sub_state":"running",
+                "main_pid":123,"result":"success"}]}
+        });
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        for (key, value) in [
+            (
+                "schema",
+                json!("jetstreamer-private-epoch225-v1625-bounded-launch-v1"),
+            ),
+            ("epoch", json!(226)),
+            ("snapshot_slot", json!(97199618)),
+            ("snapshot_sha256", json!("c".repeat(64))),
+            ("worker_sha256", json!("c".repeat(64))),
+            ("node_sha256", json!("c".repeat(64))),
+            ("runtime", json!("solana-v1.6.20")),
+            ("runtime_semantics_changed", json!(false)),
+            ("solana_rayon_threads", json!(1)),
+            ("output_slot_start", json!(97199618)),
+            ("output_slot_count", json!(432000)),
+            ("canonical_epoch_end", json!(97631459)),
+            ("terminal_root_slot", json!(97631459)),
+            ("required_checkpoints", json!([97199617, 98063464])),
+            ("private_verification_tail_epoch", json!(225)),
+            ("private_verification_tail_slots", json!(0)),
+            ("natural_parent_completion_required", json!(false)),
+            ("maximum_runtime_seconds", json!(604801)),
+            ("natural_root_resource_attempt_authorized", json!(false)),
+            ("full_span_independently_qualified", json!(true)),
+            ("full_cold_epoch_peak_qualified", json!(true)),
+            ("ordinary_replay_authorized", json!(true)),
+            ("runtime_promotion_authorized", json!(true)),
+            ("canonical_sidecar_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+            ("remote_mutations", json!(true)),
+            ("r2_mutations", json!(true)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[key] = value;
+            assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{key}");
+            bad = receipt.clone();
+            bad.as_object_mut().unwrap().remove(key);
+            assert!(
+                validate_diagnostic_launch(&bad, &claim).is_err(),
+                "missing {key}"
+            );
+        }
+        let mut bad = receipt.clone();
+        bad["evidence"]["units"][0]["invocation_id"] = json!("c".repeat(32));
+        assert!(validate_diagnostic_launch(&bad, &claim).is_err());
+        claim.unit = "horizon-qualify-225-bounded-resource-test.service".into();
+        assert_eq!(diagnostic_scope(&claim), 225..=225);
+        assert!(validate_diagnostic_launch(&receipt, &claim).is_err());
+        claim.unit = "horizon-qualify-225-natural-root-resource-test.service".into();
+        claim.scratch_path = "/home/ubuntu/horizon".into();
+        bad = receipt.clone();
+        bad["private_run_root"] = json!(claim.scratch_path);
+        assert!(validate_diagnostic_launch(&bad, &claim).is_err());
+    }
+
+    #[test]
+    fn natural_root_225_admission_is_not_a_target_stop_exemption() {
+        let (previous, mut plan, mut guard, mut gp) = admission_fixture();
+        let name = "horizon-qualify-225-natural-root-resource-test.service";
+        plan.diagnostics[1].unit = name.into();
+        gp["unit"] = json!(name);
+        gp.as_object_mut().unwrap().remove("bounded_canary");
+        guard["producer"]["cgroup"] = json!(format!("/system.slice/{name}"));
+        guard["guard_sha256"] =
+            json!("cc3536dfcc268c913feccf1603a25e3cdbdf2807289c9061e04884027d1b1560");
+        let sample = "2026-10-20T00:04:42Z";
+        validate_same_sample_admission(&previous, &plan, sample, &guard, &gp, 1792455200).unwrap();
+        for (key, value) in [
+            ("bounded_canary", json!({"expected_uid":1000})),
+            ("bounded_measurement", json!({})),
+            ("minimum_free_bytes", json!(1_606_264_251_502u64)),
+        ] {
+            let mut bad = gp.clone();
+            bad[key] = value;
+            let mut matching_guard = guard.clone();
+            matching_guard["minimum_free_bytes"] = bad["minimum_free_bytes"].clone();
+            assert!(
+                validate_same_sample_admission(
+                    &previous,
+                    &plan,
+                    sample,
+                    &matching_guard,
+                    &bad,
+                    1792455200
+                )
+                .is_err(),
+                "{key}"
+            );
+        }
+        for (key, value) in [
+            ("workers", json!([])),
+            ("workers", json!([[123, 100], [124, 100]])),
+            ("workers", json!([[123, 3500001]])),
+            (
+                "guard_sha256",
+                json!("61e189bb50d58fa446b84f016d3b19433c30f490c6d470907130f113a01b644a"),
+            ),
+        ] {
+            let mut bad = guard.clone();
+            bad[key] = value;
+            assert!(
+                validate_same_sample_admission(&previous, &plan, sample, &bad, &gp, 1792455200)
+                    .is_err(),
+                "{key}"
+            );
+        }
+    }
+
     fn admission_fixture() -> (Value, Plan, Value, Value) {
         let prior = json!({"epoch":213,"unit":{"Id":"old.service"},"launch_invocation_id":"a".repeat(32),"launch_receipt":"/old/launch.json","launch_receipt_sha256":"b".repeat(64)});
         let old_claim = json!({"epoch":213,"unit":"old.service","invocation_id":"a".repeat(32),"scratch_path":"/old/scratch","launch_receipt":{"path":"/old/launch.json","sha256":"b".repeat(64)}});
