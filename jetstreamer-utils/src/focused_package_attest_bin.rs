@@ -703,6 +703,8 @@ fn validate_receipt_path(path: &Path, epoch: u64) -> Result<()> {
         .context("invalid receipt name")?;
     let prefix = if epoch == 224 {
         "epoch224-complete-span-v1-6-25-immutable-package-01879c4-".to_string()
+    } else if epoch == 225 {
+        "epoch225-complete-span-v1-6-25-immutable-package-63a2717-".to_string()
     } else {
         format!("epoch{epoch}-complete-span-store8-immutable-package-ca2e38b-")
     };
@@ -722,6 +724,10 @@ fn validate_receipt_path(path: &Path, epoch: u64) -> Result<()> {
 }
 
 fn canonical_package_path(epoch: u64) -> String {
+    if epoch == 225 {
+        return "/var/lib/jetstreamer/horizon-focused-225-complete-span-v1-6-25-63a2717-v1"
+            .to_string();
+    }
     if epoch == 224 {
         return "/var/lib/jetstreamer/horizon-focused-224-complete-span-v1-6-25-01879c4-v1"
             .to_string();
@@ -746,7 +752,7 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         "plan schema mismatch"
     );
     ensure!(
-        (203..=212).contains(&plan.epoch) || plan.epoch == 224,
+        (203..=212).contains(&plan.epoch) || matches!(plan.epoch, 224 | 225),
         "epoch outside approved focused range"
     );
     if plan.epoch == 224 {
@@ -765,6 +771,24 @@ fn validate_plan(plan: &Plan) -> Result<()> {
                 && plan.terminal_root_slot == 97_631_459
                 && plan.successor_tail_slots == 431_460,
             "epoch 224 snapshot or complete-span checkpoint binding mismatch"
+        );
+    }
+    if plan.epoch == 225 {
+        ensure!(
+            plan.schema == PLAN_SCHEMA_V3,
+            "epoch 225 requires century-floor evidence"
+        );
+        ensure!(
+            plan.snapshot_name
+                == "snapshot-97199617-HE57JmgvEeZjBKN8cfTLrmyCbUnptJ9PWjUdTzgxSSdi.tar.zst"
+                && plan.snapshot_sha256
+                    == "094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d"
+                && plan.checkpoint_sha256
+                    == "1dd033b1df75c58abe07098c48be763ee10ad5d4b4c749efa6c0240a13e7f403"
+                && plan.epoch_end_slot == 97_631_999
+                && plan.terminal_root_slot == 98_063_464
+                && plan.successor_tail_slots == 431_465,
+            "epoch 225 snapshot or complete-span checkpoint binding mismatch"
         );
     }
     match plan.schema.as_str() {
@@ -956,10 +980,20 @@ fn validate_manifest(
         gates.complete_epoch_span_covered,
         "complete-span gate failed"
     );
-    ensure!(
-        gates.exact_node_complete_span_capability_passed || external_capability_validated,
-        "node capability gate failed"
-    );
+    if plan.epoch == 225 {
+        // This package must be attested before its exact-package capability
+        // probe. Do not claim an unperformed probe or borrow another package's
+        // evidence. The receipt still denies launch and every publication gate.
+        ensure!(
+            !gates.exact_node_complete_span_capability_passed && !external_capability_validated,
+            "epoch 225 initial attestation must precede its independent capability probe"
+        );
+    } else {
+        ensure!(
+            gates.exact_node_complete_span_capability_passed || external_capability_validated,
+            "node capability gate failed"
+        );
+    }
     if external_capability_validated {
         ensure!(
             matches!(plan.schema.as_str(), PLAN_SCHEMA_V2 | PLAN_SCHEMA_V3) && plan.epoch == 203,
@@ -1063,6 +1097,28 @@ fn validate_deployment_receipt(
         .cloned()
         .collect();
     ensure!(seen == expected, "deployment receipt member set mismatch");
+    Ok(())
+}
+
+fn validate_epoch225_binaries(epoch: u64, members: &BTreeMap<String, FileIdentity>) -> Result<()> {
+    if epoch != 225 {
+        return Ok(());
+    }
+    for (name, expected) in [
+        (
+            "jetstreamer-node",
+            "945f36fe11824263258ad561dba106e377148b702f2c615522b171c4ba97ed3b",
+        ),
+        (
+            "jetstreamer-historical-worker-v1-6-25",
+            "7cd48efc8719109a69fafcb3209a821ea9f07113e3fb0bfab49db23a6e77a146",
+        ),
+    ] {
+        ensure!(
+            members.get(name).is_some_and(|m| m.sha256 == expected),
+            "epoch 225 must use its exact complete-span binary: {name}"
+        );
+    }
     Ok(())
 }
 
@@ -1444,6 +1500,7 @@ fn validate_century_floor_evidence(
     ))
 }
 
+#[allow(clippy::unnecessary_cast)] // libc statvfs field widths vary by target.
 fn filesystem_free_bytes(path: &Path) -> Result<u64> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let mut value = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -1571,6 +1628,7 @@ fn run() -> Result<()> {
     let deployment: DeploymentReceipt =
         read_json(&plan.package.join("deployment-seal-receipt.json"))?;
     validate_deployment_receipt(&plan, &deployment, &members)?;
+    validate_epoch225_binaries(plan.epoch, &members)?;
     let capability_evidence = validate_external_capability(&plan, &members)?;
     let manifest: Manifest = read_json(&plan.package.join("deployment-manifest.json"))?;
     validate_manifest(&plan, &manifest, capability_evidence.is_some())?;
@@ -1797,6 +1855,110 @@ mod tests {
                 floor_bytes: 201,
             },
         }
+    }
+
+    fn epoch225_plan() -> Plan {
+        let mut plan = valid_plan(225);
+        plan.schema = PLAN_SCHEMA_V3.into();
+        plan.snapshot_name =
+            "snapshot-97199617-HE57JmgvEeZjBKN8cfTLrmyCbUnptJ9PWjUdTzgxSSdi.tar.zst".into();
+        plan.snapshot_sha256 =
+            "094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d".into();
+        plan.checkpoint_sha256 =
+            "1dd033b1df75c58abe07098c48be763ee10ad5d4b4c749efa6c0240a13e7f403".into();
+        plan.terminal_root_slot = 98_063_464;
+        plan.successor_tail_slots = 431_465;
+        plan.receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch225-complete-span-v1-6-25-immutable-package-63a2717-test.json".into();
+        plan.century_floor_evidence = Some("/sealed/century-floor.json".into());
+        plan.century_floor_evidence_sha256 = Some("f".repeat(64));
+        plan
+    }
+
+    #[test]
+    fn epoch225_attestation_pins_complete_span_and_checkpoint_bytes() {
+        let mut plan = epoch225_plan();
+        validate_plan(&plan).unwrap();
+        let checkpoints = include_bytes!(
+            "../../historical-runtime/v1_6_25/epoch225-complete-span-epoch-hashes.txt"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(checkpoints)),
+            plan.checkpoint_sha256
+        );
+        plan.terminal_root_slot = 97_631_459;
+        assert!(validate_plan(&plan).is_err());
+        plan = epoch225_plan();
+        plan.snapshot_sha256 = "a".repeat(64);
+        assert!(validate_plan(&plan).is_err());
+        plan = epoch225_plan();
+        plan.century_floor_evidence = None;
+        assert!(validate_plan(&plan).is_err());
+        plan = epoch225_plan();
+        plan.schema = PLAN_SCHEMA_V1.into();
+        assert!(validate_plan(&plan).is_err());
+        plan = epoch225_plan();
+        plan.package = canonical_package_path(224).into();
+        assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn epoch225_initial_attestation_does_not_claim_capability_or_launch() {
+        let plan = epoch225_plan();
+        let manifest = serde_json::json!({
+            "schema":MANIFEST_SCHEMA,"epoch":225,
+            "bootstrap":{"filename":plan.snapshot_name,"sha256":plan.snapshot_sha256},
+            "checkpoint":{"filename":plan.checkpoint_name,"sha256":plan.checkpoint_sha256,"terminal_slot":plan.terminal_root_slot},
+            "focused_plan":{"epoch":225,"output_slot_start":97_200_000,"epoch_end_slot":97_631_999,
+                "terminal_root_slot":98_063_464,"complete_epoch_span_covered":true,"private_verification_tail":true,
+                "successor_tail_slots":431_465,"canonical_sidecar_authorized":false},
+            "gates":{"complete_epoch_span_covered":true,"exact_node_complete_span_capability_passed":false,
+                "source_content_revalidated":true,"immutable_package_sealed":true,"fresh_replay_resource_admission_passed":false,
+                "launch_authorized":false,"plugin_verification_authorized":false,"publication_authorized":false,"r2_upload_authorized":false},
+            "mutations":{"new_replay_launched":false,"remote_mutations":false,"r2_mutations":false}});
+        let decode = |v| serde_json::from_value::<Manifest>(v).unwrap();
+        validate_manifest(&plan, &decode(manifest.clone()), false).unwrap();
+        assert!(validate_manifest(&plan, &decode(manifest.clone()), true).is_err());
+        for key in [
+            "exact_node_complete_span_capability_passed",
+            "fresh_replay_resource_admission_passed",
+            "launch_authorized",
+            "plugin_verification_authorized",
+            "publication_authorized",
+            "r2_upload_authorized",
+        ] {
+            let mut invalid = manifest.clone();
+            invalid["gates"][key] = serde_json::json!(true);
+            assert!(validate_manifest(&plan, &decode(invalid), false).is_err());
+        }
+    }
+
+    #[test]
+    fn epoch225_binaries_are_not_borrowed_from_the_bounded_comparison() {
+        let identity = |sha: &str| FileIdentity {
+            sha256: sha.into(),
+            bytes: 1,
+            device: 1,
+            inode: 1,
+            links: 1,
+            uid: 0,
+            gid: 0,
+            mode: "0555".into(),
+        };
+        let mut members = BTreeMap::from([
+            (
+                "jetstreamer-node".into(),
+                identity("945f36fe11824263258ad561dba106e377148b702f2c615522b171c4ba97ed3b"),
+            ),
+            (
+                "jetstreamer-historical-worker-v1-6-25".into(),
+                identity("7cd48efc8719109a69fafcb3209a821ea9f07113e3fb0bfab49db23a6e77a146"),
+            ),
+        ]);
+        validate_epoch225_binaries(225, &members).unwrap();
+        members.get_mut("jetstreamer-node").unwrap().sha256 =
+            "3915f57819e5822e7112ee1932dc47caf5e9812605ad56cc309976e4f681f242".into();
+        assert!(validate_epoch225_binaries(225, &members).is_err());
+        assert!(validate_epoch225_binaries(224, &members).is_ok());
     }
 
     #[test]
