@@ -661,6 +661,36 @@ v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers the complete
 epoch-266-301 execution envelope, with publication ending at epoch 300 and epoch 301 retained as
 the private verification tail.
 
+`jetstreamer-epoch140-native-restore-probe` is a separate opt-in, private restore-only
+diagnostic for the exact slot-60,911,751 snapshot and retained v1.4.25 worker. Build with
+`cargo build --release -p jetstreamer-node --features epoch140-native-restore-diagnostic
+--bin jetstreamer-epoch140-native-restore-probe`; invoke only its sealed executable as host
+UID 1001 in a persistent, non-restarting sandbox using
+`PLAN --plan-sha256 HEX --self-sha256 HEX`.
+Its strict `jetstreamer-private-epoch140-native-restore-probe-plan-v1` plan contains `worker`,
+`snapshot`, `ledger_directory`, `scratch_directory`, `output`, `minimum_free_bytes`, and
+four `{path, sha256}` bindings: `original_journal`, `serialized_clock`, `admission_manifest`,
+and `admission_receipt`. The exact root-owned immutable snapshot must be a direct member of
+the sealed ledger with the pinned genesis archive and no shadowing `genesis.bin`; private,
+initially empty scratch and no-clobber receipt paths must use the campaign filesystem.
+The probe mechanically derives its expectations from the preserved original checkpoint journal,
+cross-checks the typed serialized clock, then uses only Initialize/FreezeCheckpoint/Shutdown.
+It compares Bank, accounts and PoH hashes, capitalization, transactions, tick height, complete-slot
+state and 64 ticks per slot, requires zero bootstrap writes, and records independent native and
+original write cursors without forcing equality between validators. The native cursor must not
+advance during bootstrap. A comparison failure preserves a private outcome, never an archive.
+Require the exact bounded environment `SOLANA_RAYON_THREADS=2` and
+`JETSTREAMER_HISTORICAL_{CONTROL,INITIALIZE,CHECKPOINT,REAP}_TIMEOUT_SECS` values
+`60`, `900`, `600`, `120`, respectively. Launch additionally requires a fresh complete fleet
+admission, a separately proven invocation-bound reserve/VMA guard, and qualified fleet recognition;
+source tests or a sealed binary alone grant no launch authority. Admission must protect all older
+growth claims, the century floor, restore/index/copy peak and output reservation.
+Success is only a native consensus comparison, not independent prefix validation, a segment
+manifest, proof of the original executed worker ELF, suffix execution, provenance/import promotion,
+publication, retirement or R2 authority. An eventual suffix worker must repeat this native check
+before sending entries. Shutdown acknowledgement does not prove that every worker or scratch
+reference has disappeared; retain the normal complete process-reference retirement gates.
+
 `jetstreamer-checkpoint-restore-probe` is a private, restore-only test for the retained
 epoch-213 prefix. It uses the unchanged pinned v1.6.16 worker and the existing bounded historical
 client to load the SHA-256-bound slot-92,447,542 snapshot, then compares every consensus checkpoint
