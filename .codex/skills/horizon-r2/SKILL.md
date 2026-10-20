@@ -600,12 +600,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   not authorize deleting its scratch, restarting it automatically, modifying remote objects, or
   stopping any unbound invocation.
   After operator review, a reserve-stopped run whose exact pinned node demonstrably restarts from
-  its retained sealed bootstrap (rather than a scratch cursor) may retire only that run's scratch
-  with `scripts/retire_reserve_stopped_replay_scratch.py`. Run its `--check-only` gate first; bind
-  the exact guard intent/completion, controller and producer invocation IDs, cursor-free cohort
-  state, and repeated deletion path. Preserve the run directory, retained input, partial archives,
-  state, journals, and receipts. Do not use this path for a replay that can resume its live state
-  from scratch or before the bound controller and producer are terminal.
+  its retained sealed bootstrap (rather than a scratch cursor) may retire only that run's scratch.
+  Read [references/reserve-stop-retirement.md](references/reserve-stop-retirement.md) first. Prefer
+  the reviewed Rust `jetstreamer-r2 reserve-retire-scratch` profile where its exact package/layout
+  gates apply; preserve an already-bound, unchanged legacy scratch retirer only for a layout it
+  actually supports. Run check-only qualification before deletion. Bind the guard receipts, exact
+  owners, cursor-free state, retained archive/input hashes and deletion target. Preserve the run,
+  bootstrap, partial archives, state, journals and receipts. Do not use this path for in-place
+  resumable state, live owners, or an unsupported layout; qualify a Rust profile instead of
+  rewriting package metadata to mimic another schema.
   For a producer owned by a live adaptive controller, use
   `scripts/guard_adaptive_replay_reserve.py` and bind both invocation IDs. It must stop and confirm
   the controller first, then resample and stop only the selected producer; otherwise the controller

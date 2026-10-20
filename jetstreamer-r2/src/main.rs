@@ -64,6 +64,7 @@ const STATUS_DELETION_RECEIPT_SCHEMA: &str =
 mod fleet;
 mod inactive_status;
 mod pipeline_status;
+mod reserve_scratch;
 mod reserve_stop;
 mod resource_audit;
 mod resource_verify;
@@ -3121,6 +3122,9 @@ async fn main() -> Result<()> {
     }
     if env::args().nth(1).as_deref() == Some("status-retire-inactive") {
         return inactive_status::run().await;
+    }
+    if env::args().nth(1).as_deref() == Some("reserve-retire-scratch") {
+        return reserve_scratch::run();
     }
     let config = parse_args()?;
     ensure!(

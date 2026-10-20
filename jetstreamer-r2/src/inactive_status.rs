@@ -240,7 +240,7 @@ pub(super) fn queued_job_units(bytes: &[u8]) -> Result<Vec<&str>> {
     Ok(names)
 }
 
-fn no_pending_owner_trigger(name: &str, collected: bool) -> Result<()> {
+pub(super) fn no_pending_owner_trigger(name: &str, collected: bool) -> Result<()> {
     if !collected {
         let output = ProcessCommand::new("systemctl")
             .args(["show", name, "--value", "--property=TriggeredBy"])
