@@ -49,13 +49,6 @@ pub(super) fn pipeline_unit_range(
     phase: &str,
     unit: &str,
 ) -> Result<std::ops::RangeInclusive<u64>> {
-    let prefix = match phase {
-        "full-verification" => "horizon-full-verify-",
-        "plugin-verification" => "horizon-plugin-verify-",
-        "local-publication" => "horizon-publish-",
-        "upload-readback" => "horizon-upload-",
-        _ => anyhow::bail!("invalid pipeline phase"),
-    };
     ensure!(
         unit.len() <= 255
             && unit
@@ -63,6 +56,42 @@ pub(super) fn pipeline_unit_range(
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
         "invalid pipeline unit name"
     );
+    // Adaptive controllers use this namespace for the same local-publication
+    // stage. Parsing its scope is observational only; the exact live command,
+    // invocation, evidence and assigned publication boundary remain mandatory.
+    if phase == "local-publication"
+        && let Some(scope) = unit.strip_prefix("jetstreamer-root-import-")
+    {
+        let scope = scope
+            .strip_suffix(".service")
+            .context("root importer lacks service suffix")?;
+        let (controller, scope) = scope
+            .rsplit_once("-e")
+            .context("root importer lacks epoch scope")?;
+        ensure!(!controller.is_empty(), "root importer lacks controller ID");
+        let fields: Vec<_> = scope.split('-').collect();
+        ensure!(fields.len() == 3, "invalid root importer scope");
+        let number = |value: &str| -> Result<u64> {
+            let parsed: u64 = value.parse()?;
+            ensure!(value == parsed.to_string(), "noncanonical importer number");
+            Ok(parsed)
+        };
+        let start = number(fields[0])?;
+        let end = number(fields[1])?;
+        let sequence = number(fields[2])?;
+        ensure!(
+            sequence > 0 && start <= end && end - start <= 1000,
+            "invalid root importer range or sequence"
+        );
+        return Ok(start..=end);
+    }
+    let prefix = match phase {
+        "full-verification" => "horizon-full-verify-",
+        "plugin-verification" => "horizon-plugin-verify-",
+        "local-publication" => "horizon-publish-",
+        "upload-readback" => "horizon-upload-",
+        _ => anyhow::bail!("invalid pipeline phase"),
+    };
     let scope = unit
         .strip_prefix(prefix)
         .and_then(|s| s.strip_suffix(".service"))
@@ -1615,6 +1644,49 @@ mod tests {
         validate_pipeline_claim(&claim, 201, 300).unwrap();
         claim.phase = "plugin-verification".into();
         assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+    }
+
+    #[test]
+    fn root_importer_is_an_exact_scoped_local_publication_claim() {
+        let (mut claim, current) = pipeline_fixture();
+        claim.epoch = 206;
+        claim.phase = "local-publication".into();
+        claim.unit = "jetstreamer-root-import-horizon-206-cf9b7e9-v1-e206-206-3.service".into();
+        validate_pipeline_claim(&claim, 201, 300).unwrap();
+        let mut current = current;
+        current["Id"] = json!(claim.unit);
+        assert!(pipeline_live(&claim, &current).unwrap());
+        claim.phase = "upload-readback".into();
+        assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+        claim.phase = "local-publication".into();
+        claim.epoch = 207;
+        assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+        claim.epoch = 300;
+        claim.unit = "jetstreamer-root-import-tail-e298-301-1.service".into();
+        assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+    }
+
+    #[test]
+    fn root_importer_rejects_ambiguous_or_noncanonical_names() {
+        for unit in [
+            "jetstreamer-root-import--e206-206-1.service",
+            "jetstreamer-root-import-test-e206-206-0.service",
+            "jetstreamer-root-import-test-e0206-206-1.service",
+            "jetstreamer-root-import-test-e206-0206-1.service",
+            "jetstreamer-root-import-test-e206-206-01.service",
+            "jetstreamer-root-import-test-e207-206-1.service",
+            "jetstreamer-root-import-test-e206-206-retry.service",
+            "jetstreamer-root-import-test-e206-206-1-extra.service",
+            "jetstreamer-root-import-test-e206-206-1.timer",
+            "jetstreamer-root-import-test-e206-206-1/service",
+            "jetstreamer-root-import-test-e206-206-1.service\n",
+            "jetstreamer-root-import-test-e0-1001-1.service",
+        ] {
+            assert!(
+                pipeline_unit_range("local-publication", unit).is_err(),
+                "{unit}"
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,14 @@ receipt-waiting uploader may coexist for one epoch. Two live claims for the same
 epoch and stage remain an error; a replacement must not masquerade as another
 independent stage.
 
+For `local-publication`, the ordinary adaptive importer namespace
+`jetstreamer-root-import-CONTROLLER-eSTART-END-SEQUENCE.service` is also supported.
+The controller ID must be nonempty; epoch and positive sequence numbers must be
+canonical decimal integers. The entire importer range must fit the assigned
+campaign, including its publication end boundary. This only permits observing
+the exact importer invocation/command and publishing its properly bound phase;
+it grants no import, replay, runtime, or archive-publication authority.
+
 A legacy delivery unit may cover a range, such as
 `horizon-plugin-verify-216-219-cached-v1.service`. Give each claimed epoch its own
 entry with identical unit, invocation, command and evidence. The entire unit
