@@ -19,6 +19,17 @@ Its compile-time profile pins:
   free space of at least `3,185,678,193,366` bytes. Fresh whole-host admission may
   require more; this constant is not proof that the work fits.
 
+The separate `epoch203-single-thread-resource` utility feature keeps the exact
+snapshot, worker, target, root and resource limits above, but pins
+`SOLANA_RAYON_THREADS=1` instead of 16. It requires `r1` unit/run-root namespaces
+and records the actual thread count in its result. This is a same-input storage
+fan-out/throughput comparison, not a runtime change or full-prefix qualification.
+The retained store8 worker uses `min(rayon_threads, 8)` eager stores; compare the
+new result with the preserved 16-thread run at equal slots/transactions, including
+restore overhead, physical bytes, VMAs and phase timing. Do not extrapolate a
+short-window saving into a full-epoch budget. The default 203 profile and both
+225 profiles remain at 16 threads; healthy deployments remain untouched.
+
 The immutable hash-bound plan uses
 `jetstreamer-private-epoch203-bounded-resource-plan-v1`, with the strict fields
 described for [epoch225](epoch225-bounded-resource-runner.md). It instead requires
