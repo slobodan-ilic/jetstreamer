@@ -309,3 +309,54 @@ three golden boundary hashes and a bincode1.3.1 SlotMeta wire digest, asserted b
 the modern decoders. These are synthetic SDK primitive/layout checks, **not** a
 real-ledger run, upstream full Entry-crate qualification, recovered epoch141
 boundaries or canonical checkpoint/plugin/publication evidence.
+
+`horizon_legacy_recovery` binds the exact logical lookup set to the entire
+independently supplied post-gap target census. The pinned blockstore keys are
+eight big-endian slot bytes for `meta`, and two big-endian u64s (slot/index) for
+`data_shred`; layout is checked against revision893cc764's `blockstore_db.rs`
+SHA-256 `7391732d9c41d09cdf4f1c9997c9ee37ccace9040aa5845249918084bcc0b046`.
+An initial complete metadata query determines every owed contiguous data index.
+A second native read must include unchanged metadata and every planned data key.
+Each native call still requires the same complete admitted census, independent
+family allowlist and the native core's full before/after integrity checks.
+
+The bridge rejects missing, extra, reordered, substituted or absent logical
+records before assembling all batches, decoding all entries and verifying all
+target chains under one aggregate hash-work bound. It also rejects a reused
+boundary across separate targets. Its eleven-target integration is synthetic,
+not actual epoch141 recovery or native provenance. Borrowed candidate records
+are not authenticated merely because this bridge accepts them. Trusted real
+clock, canonical anchors, backup/native evidence and persistent guarded receipt
+production remain separate caller obligations; there is no operational native
+recovery caller or runtime/publication promotion here.
+The explicit native crash-shaped WAL fixture also writes eleven synthetic
+SlotMeta/shred pairs, collects the complete database through multistream bzip2,
+performs both full-census native query stages and verifies all 33 synthetic
+boundaries through this bridge. This is end-to-end disposable-fixture evidence,
+not original-backup completeness or real historical PoH recovery.
+
+`jetstreamer-epoch141-ledger-native` is a separate feature-gated, offline native
+**candidate** runner. It requires exact source verification, a successful retained
+collection and its independently bound complete census, the fixed authenticated
+eleven-target gap audit, an explicit complete family policy and fresh admission
+of the exact executable plus 256 MiB for outputs/logs above the unchanged protected
+floor. Database, private logs and results must share the admitted filesystem.
+Each of its two native reads rehashes the entire retained census before/after.
+Topology-only query planning never invents or assumes a PoH clock.
+
+The first metadata result is durable even when an absent/incomplete SlotMeta
+prevents further planning. The second result preserves missing candidates or
+metadata changes explicitly and exits unsuccessfully for either case. Candidate
+bytes use bounded base64 rather than unbounded pretty-printed byte arrays. No
+result proves original backup completeness, historical live state, trusted clock,
+recovered boundaries or replay/publication eligibility. A candidate artifact is
+not a successful terminal service receipt. Preserve failed attempts and logs;
+do not reuse their paths, retry automatically or silently drop missing records.
+
+Seal the exact executable and plan, qualify the actual sandbox/read paths, run
+fresh admission and prove its first real guard before use. Enforce independent
+CPU, memory, task and oneshot start-time limits; a read callback cannot interrupt
+blocked native syscalls. The current tests cover source/census/target/admission
+substitution, native fixtures and root-private no-clobber receipt writes only.
+No real retained epoch141 database or actual-source native run is established by
+this source. Trusted clock/anchored PoH and all canonical gates remain separate.

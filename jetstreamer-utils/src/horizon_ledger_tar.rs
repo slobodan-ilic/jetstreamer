@@ -9,7 +9,7 @@
 
 use {
     anyhow::{Context, Result, ensure},
-    serde::Serialize,
+    serde::{Deserialize, Serialize},
     sha2::{Digest, Sha256},
     std::{
         collections::BTreeSet,
@@ -34,7 +34,8 @@ pub struct CollectionLimits {
 }
 
 /// One preserved member, mechanically bound to its complete content.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectedFile {
     /// Exact flat basename within the independently specified archive root.
     pub name: String,
@@ -45,7 +46,8 @@ pub struct CollectedFile {
 }
 
 /// Complete tar-member census, never a live-state or source-completeness proof.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticCollection {
     /// True only when every member was retained and fsynced, not merely counted.
     pub files_retained: bool,

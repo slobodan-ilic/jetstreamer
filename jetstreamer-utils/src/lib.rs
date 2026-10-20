@@ -16,6 +16,9 @@ pub mod horizon_legacy_entry;
 /// Bounded diagnostic verification of pinned legacy entry/tick/PoH chains.
 pub mod horizon_legacy_poh;
 
+/// Exact-key diagnostic binding from native legacy candidates to complete PoH chains.
+pub mod horizon_legacy_recovery;
+
 /// Bounded diagnostic collection of a complete flat RocksDB tar file set.
 pub mod horizon_ledger_tar;
 

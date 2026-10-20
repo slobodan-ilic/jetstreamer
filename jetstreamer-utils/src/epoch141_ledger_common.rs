@@ -25,7 +25,32 @@ pub(super) const CRC: &str = "6seTSA==";
 pub(super) const MD5: &str = "EAYCyVn1bOWJ0TbSdb/I0g==";
 pub(super) const URI: &str =
     "gs://mainnet-beta-ledger-us-ny5/60911751/rocksdb.tar.bz2#1634789748052739";
+pub(super) const FROZEN_INPUT: &str =
+    "/home/sol/.jetstreamer-private/epoch141-ledger-source-20261020-v1/download/rocksdb.tar.bz2";
+pub(super) const FROZEN_SHA: &str =
+    "7af478aec31809cebdeae761d44c19bb90bf06e15d2430813b3b0fe691e6a70b";
 pub(super) const MAX_METADATA: u64 = 16 * 1024;
+
+// Metadata-only sibling executables do not consume an offline source receipt.
+#[allow(dead_code)]
+pub(super) fn validate_reverification(receipt: &Value) -> Result<()> {
+    ensure!(
+        receipt["schema"] == "jetstreamer-epoch141-ledger-reverification-receipt-v1"
+            && receipt["epoch"] == 141
+            && receipt["compressed_input_verified"] == true
+            && receipt["path"] == FROZEN_INPUT
+            && receipt["bytes"] == SIZE
+            && receipt["sha256"] == FROZEN_SHA
+            && receipt["uri"] == URI
+            && receipt["generation"] == GENERATION
+            && receipt["crc32c_base64"] == CRC
+            && receipt["md5_base64"] == MD5
+            && receipt["source_modified"] == false
+            && receipt["download_performed"] == false,
+        "wrong compressed-source verification"
+    );
+    Ok(())
+}
 
 pub(super) fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))

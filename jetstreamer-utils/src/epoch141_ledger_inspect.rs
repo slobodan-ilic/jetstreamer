@@ -9,7 +9,8 @@ mod epoch141_ledger_common;
 use {
     anyhow::{Context, Result, ensure},
     epoch141_ledger_common::{
-        CRC, GENERATION, MD5, SIZE, URI, bound_file, identity, is_sha, write_receipt,
+        FROZEN_INPUT as INPUT, FROZEN_SHA as SOURCE_SHA, GENERATION, SIZE, URI, bound_file,
+        identity, is_sha, validate_reverification as validate_source, write_receipt,
     },
     jetstreamer_utils::{
         horizon_ledger_bzip::{census_bound_bzip2_guarded, collect_bound_bzip2_guarded},
@@ -27,10 +28,6 @@ use {
         time::{Instant, SystemTime, UNIX_EPOCH},
     },
 };
-
-const INPUT: &str =
-    "/home/sol/.jetstreamer-private/epoch141-ledger-source-20261020-v1/download/rocksdb.tar.bz2";
-const SOURCE_SHA: &str = "7af478aec31809cebdeae761d44c19bb90bf06e15d2430813b3b0fe691e6a70b";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,25 +65,6 @@ struct Retention {
 
 fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
-}
-
-fn validate_source(receipt: &Value) -> Result<()> {
-    ensure!(
-        receipt["schema"] == "jetstreamer-epoch141-ledger-reverification-receipt-v1"
-            && receipt["epoch"] == 141
-            && receipt["compressed_input_verified"] == true
-            && receipt["path"] == INPUT
-            && receipt["bytes"] == SIZE
-            && receipt["sha256"] == SOURCE_SHA
-            && receipt["uri"] == URI
-            && receipt["generation"] == GENERATION
-            && receipt["crc32c_base64"] == CRC
-            && receipt["md5_base64"] == MD5
-            && receipt["source_modified"] == false
-            && receipt["download_performed"] == false,
-        "wrong compressed-source verification"
-    );
-    Ok(())
 }
 
 fn validate_census(plan: &Plan, receipt: &Value, device: u64, inode: u64) -> Result<Value> {
@@ -566,6 +544,7 @@ pub(crate) fn run(retain: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::epoch141_ledger_common::{CRC, MD5};
     use super::*;
 
     fn plan() -> Plan {
