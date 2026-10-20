@@ -1,0 +1,42 @@
+# Inactive dashboard status cleanup
+
+`jetstreamer-r2 status-delete-inactive PLAN --plan-sha256 HEX --self-sha256 HEX
+[--check-only]` is a separate path from completion-only `status-delete`.
+
+The initial profile intentionally supports only the failed epoch-183/184 owner on
+dev-samjohnson. It binds the exact controller/producer invocation IDs, pinned
+terminal incident, latest authenticated status publication, historical owner
+observer, current complete-range fleet, and persistent open repair backlog.
+It does not grant archive completion, replay, retirement, or incident closure.
+Extending it to other failures requires source review and separate qualification;
+do not change plan fields to impersonate this owner.
+
+The root-owned sealed plan names the actual campaign directories, bucket,
+unique intent/completion paths in an existing root-private directory, and exact
+passive watcher identities/commands. Only the explicitly reviewed idle receipt
+watchers may be excepted. They still cannot hold the target archive open. The
+tool examines all loaded service commands, queued jobs, terminal owner state,
+automatic triggers, and process commands/maps/cwd/root/exe/descriptors. A failed
+observation, permission denial, replacement, queued launch, archive reference,
+canonical local artifact, remote staged pair, or multipart transfer fails closed.
+The current operational range assignment must remain disjoint across hosts;
+this tool is not a distributed lease or authority to disregard another host's
+authenticated handoff. Do not execute it when such a handoff exists.
+
+`--check-only` authenticates remote status bytes/ETag, checks current archive
+inventory and multipart transfers, and performs the local census without writing
+an intent or making a remote mutation. Production rechecks claims and publication
+ownership, fsyncs a no-clobber intent, conditionally deletes only the derived
+`epoch-N.epoch-status.json` key using its exact ETag, verifies authenticated
+absence, rechecks claims and remote delivery, then fsyncs completion. A 412 is a
+hard stop, never an unconditional retry. Interrupted work may recover only with
+its matching intent and evidence; unexplained absence is not successful cleanup.
+If the old fleet evidence has expired, preserve the intent and investigate rather
+than changing its bound plan or bypassing freshness. A new owner after deletion
+requires normal evidence-bound fresh status publication; no completion receipt
+is written for that race.
+
+Publication/deletion receipts and the open repair backlog are retained. Removing
+stale metadata never marks these epochs ready. A passing unit test, source commit,
+or documented policy is not evidence of deployment or authenticated cleanup;
+record those separately after sealed qualification and actual execution.

@@ -3,8 +3,9 @@
 //!
 //! The archive API surface is intentionally append-only. The sole remote
 //! deletion operation is the fail-closed removal of a mutable
-//! `epoch-N.epoch-status.json` after the canonical archive and sidecar have
-//! durable authenticated completion evidence. A local archive is removed only after its exact
+//! `epoch-N.epoch-status.json` after durable authenticated completion evidence,
+//! or through the separately qualified, exact-owner inactive cleanup profile.
+//! A local archive is removed only after its exact
 //! SHA-256 sidecar, length, multipart ETag, and immutable metadata have been
 //! observed in R2 and a private receipt has been fsynced. The sidecar is
 //! published last and serves as the remote completion marker.
@@ -61,6 +62,7 @@ const STATUS_DELETION_RECEIPT_SCHEMA: &str =
 mod fleet;
 mod resource_audit;
 mod resource_verify;
+mod status_inactive;
 
 #[derive(Debug)]
 struct Config {
@@ -3063,6 +3065,9 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().nth(1).as_deref() == Some("status-delete-inactive") {
+        return status_inactive::run().await;
+    }
     if env::args().nth(1).as_deref() == Some("private-resource-audit-verify") {
         return resource_verify::run();
     }
@@ -3958,12 +3963,18 @@ mod tests {
     }
 
     #[test]
-    fn source_confines_remote_deletion_to_one_status_object_operation() {
+    fn source_confines_remote_deletion_to_the_two_status_lifecycles() {
         let source = include_str!("main.rs");
         let singular = concat!(".delete_", "object()");
         let plural = concat!(".delete_", "objects()");
         assert_eq!(source.matches(singular).count(), 1);
         assert!(!source.contains(plural));
+        let inactive = include_str!("status_inactive.rs");
+        assert_eq!(inactive.matches(singular).count(), 1);
+        assert!(!inactive.contains(plural));
+        assert!(inactive.contains("owner_matches(publication, publication.epoch)?"));
+        assert!(inactive.contains("format!(\"epoch-{}.epoch-status.json\", publication.epoch)"));
+        assert!(inactive.contains(".if_match("));
         let start = source.find("async fn status_delete(").unwrap();
         let end = source[start..].find("\nasync fn head_archive(").unwrap() + start;
         let status_delete = &source[start..end];
