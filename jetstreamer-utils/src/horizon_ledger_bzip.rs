@@ -10,7 +10,7 @@ use {
         CollectionLimits, DiagnosticCollection, census_rocksdb_tar, collect_rocksdb_tar,
     },
     anyhow::{Context, Result, ensure},
-    serde::Serialize,
+    serde::{Deserialize, Serialize},
     sha2::{Digest, Sha256},
     std::{
         fs::{self, Metadata, OpenOptions},
@@ -68,7 +68,8 @@ impl<R: Read> Read for HashReader<R> {
 }
 
 /// A complete private collection bound to an independently supplied digest.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BoundBzipCollection {
     /// SHA-256 verified before decompression and again over consumed input.
     pub compressed_sha256: String,

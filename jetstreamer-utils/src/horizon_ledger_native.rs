@@ -274,6 +274,8 @@ pub fn resolve_native_candidates(
     let before_directory = fs::symlink_metadata(path)?;
     let mut options = Options::default();
     options.set_db_log_dir(log_path);
+    options.set_max_log_file_size(4 * 1024 * 1024);
+    options.set_keep_log_file_num(2);
     options.set_max_open_files(128);
     options.set_paranoid_checks(true);
     guard()?;

@@ -32,9 +32,28 @@ pub struct ResolvedLegacyRecord<'a> {
     pub value: Option<&'a [u8]>,
 }
 
+/// Independently allowed post-gap scope, without any clock or PoH claim.
+#[derive(Clone, Copy, Debug)]
+pub struct LegacySlotScope {
+    /// Finalized visible block after the skipped interval.
+    pub slot: u64,
+    /// Finalized parent before that interval.
+    pub parent_slot: u64,
+}
+
+fn scopes(expected: &[PohExpectation]) -> Vec<LegacySlotScope> {
+    expected
+        .iter()
+        .map(|e| LegacySlotScope {
+            slot: e.slot,
+            parent_slot: e.parent_slot,
+        })
+        .collect()
+}
+
 fn metadata(
     records: &[ResolvedLegacyRecord<'_>],
-    expected: &[PohExpectation],
+    expected: &[LegacySlotScope],
 ) -> Result<Vec<DiagnosticSlotMeta>, String> {
     if expected.is_empty() || expected.len() > 64 || records.len() != expected.len() {
         return Err("incomplete or oversized exact target census".into());
@@ -76,6 +95,15 @@ fn metadata(
 pub fn plan_v1_4_25_shred_queries(
     first_metadata: &[ResolvedLegacyRecord<'_>],
     expected: &[PohExpectation],
+) -> Result<Vec<LegacyLookup>, String> {
+    plan_v1_4_25_scope_queries(first_metadata, &scopes(expected))
+}
+
+/// Plan every exact native query from topology alone, without guessing a clock.
+/// This performs no PoH work and grants no trust to the returned candidate values.
+pub fn plan_v1_4_25_scope_queries(
+    first_metadata: &[ResolvedLegacyRecord<'_>],
+    expected: &[LegacySlotScope],
 ) -> Result<Vec<LegacyLookup>, String> {
     let metas = metadata(first_metadata, expected)?;
     let mut count = metas.len();
@@ -145,7 +173,7 @@ pub fn recover_v1_4_25_records(
             return Err("wrong, missing or reordered complete logical record".into());
         }
     }
-    let metas = metadata(first_metadata, expected)?;
+    let metas = metadata(first_metadata, &scopes(expected))?;
     let mut offset = 0usize;
     let mut results = Vec::with_capacity(expected.len());
     let mut boundaries = std::collections::BTreeSet::new();

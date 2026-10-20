@@ -76,6 +76,11 @@ name = "jetstreamer-epoch141-ledger-collect"
 path = "src/epoch141_ledger_collect_bin.rs"
 
 [[bin]]
+name = "jetstreamer-epoch141-ledger-native"
+path = "src/epoch141_ledger_native_bin.rs"
+required-features = ["sst-capability-tests"]
+
+[[bin]]
 name = "jetstreamer-horizon-boundary-bridge"
 path = "src/horizon_boundary_bridge_bin.rs"
 

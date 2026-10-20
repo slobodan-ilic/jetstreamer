@@ -334,3 +334,29 @@ SlotMeta/shred pairs, collects the complete database through multistream bzip2,
 performs both full-census native query stages and verifies all 33 synthetic
 boundaries through this bridge. This is end-to-end disposable-fixture evidence,
 not original-backup completeness or real historical PoH recovery.
+
+`jetstreamer-epoch141-ledger-native` is a separate feature-gated, offline native
+**candidate** runner. It requires exact source verification, a successful retained
+collection and its independently bound complete census, the fixed authenticated
+eleven-target gap audit, an explicit complete family policy and fresh admission
+of the exact executable plus 256 MiB for outputs/logs above the unchanged protected
+floor. Database, private logs and results must share the admitted filesystem.
+Each of its two native reads rehashes the entire retained census before/after.
+Topology-only query planning never invents or assumes a PoH clock.
+
+The first metadata result is durable even when an absent/incomplete SlotMeta
+prevents further planning. The second result preserves missing candidates or
+metadata changes explicitly and exits unsuccessfully for either case. Candidate
+bytes use bounded base64 rather than unbounded pretty-printed byte arrays. No
+result proves original backup completeness, historical live state, trusted clock,
+recovered boundaries or replay/publication eligibility. A candidate artifact is
+not a successful terminal service receipt. Preserve failed attempts and logs;
+do not reuse their paths, retry automatically or silently drop missing records.
+
+Seal the exact executable and plan, qualify the actual sandbox/read paths, run
+fresh admission and prove its first real guard before use. Enforce independent
+CPU, memory, task and oneshot start-time limits; a read callback cannot interrupt
+blocked native syscalls. The current tests cover source/census/target/admission
+substitution, native fixtures and root-private no-clobber receipt writes only.
+No real retained epoch141 database or actual-source native run is established by
+this source. Trusted clock/anchored PoH and all canonical gates remain separate.
