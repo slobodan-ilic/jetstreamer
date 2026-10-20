@@ -329,3 +329,8 @@ are not authenticated merely because this bridge accepts them. Trusted real
 clock, canonical anchors, backup/native evidence and persistent guarded receipt
 production remain separate caller obligations; there is no operational native
 recovery caller or runtime/publication promotion here.
+The explicit native crash-shaped WAL fixture also writes eleven synthetic
+SlotMeta/shred pairs, collects the complete database through multistream bzip2,
+performs both full-census native query stages and verifies all 33 synthetic
+boundaries through this bridge. This is end-to-end disposable-fixture evidence,
+not original-backup completeness or real historical PoH recovery.

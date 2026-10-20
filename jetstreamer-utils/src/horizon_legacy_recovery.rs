@@ -266,7 +266,7 @@ mod tests {
                 .map(|(index, q)| ResolvedLegacyRecord {
                     family: q.family,
                     key: &q.key,
-                    value: Some(if index % 2 == 0 {
+                    value: Some(if index.is_multiple_of(2) {
                         &self.metas[index / 2]
                     } else {
                         &self.shreds[index / 2]

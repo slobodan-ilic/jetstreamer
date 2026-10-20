@@ -2,7 +2,65 @@
 use jetstreamer_utils::{
     horizon_ledger_bzip::collect_bound_bzip2,
     horizon_ledger_tar::{CollectionLimits, collect_rocksdb_tar},
+    horizon_legacy_poh::PohExpectation,
+    horizon_legacy_recovery::{
+        ResolvedLegacyRecord, plan_v1_4_25_shred_queries, recover_v1_4_25_records,
+    },
 };
+
+// Synthetic exact-layout records, shared by the crash-shaped writer and reader.
+// These are not epoch141 records or independently authenticated real anchors.
+fn legacy_gap_fixture() -> Vec<(PohExpectation, Vec<u8>, Vec<u8>)> {
+    let mut hash = [9; 32];
+    (0..11u64)
+        .map(|index| {
+            let parent_slot = 100 + index * 3;
+            let slot = parent_slot + 3;
+            let parent_hash = hash;
+            let mut entries = 6u64.to_le_bytes().to_vec();
+            for _ in 0..6 {
+                for _ in 0..3 {
+                    hash = Sha256::digest(hash).into();
+                }
+                entries.extend_from_slice(&3u64.to_le_bytes());
+                entries.extend_from_slice(&hash);
+                entries.extend_from_slice(&0u64.to_le_bytes());
+            }
+            let meta = bincode::serialize(&(
+                slot,
+                1u64,
+                1u64,
+                123u64,
+                0u64,
+                parent_slot,
+                Vec::<u64>::new(),
+                true,
+                vec![0u32],
+            ))
+            .unwrap();
+            let mut shred = vec![0; 1228];
+            shred[64] = 0xa5;
+            shred[65..73].copy_from_slice(&slot.to_le_bytes());
+            shred[77..79].copy_from_slice(&1234u16.to_le_bytes());
+            shred[83..85].copy_from_slice(&3u16.to_le_bytes());
+            shred[85] = 0xc0;
+            shred[86..88].copy_from_slice(&((88 + entries.len()) as u16).to_le_bytes());
+            shred[88..88 + entries.len()].copy_from_slice(&entries);
+            (
+                PohExpectation {
+                    parent_slot,
+                    slot,
+                    parent_hash,
+                    final_hash: hash,
+                    ticks_per_slot: 2,
+                    hashes_per_tick: 3,
+                },
+                meta,
+                shred,
+            )
+        })
+        .collect()
+}
 use rocksdb::{ColumnFamilyDescriptor, DB, DBCompressionType, Options};
 use sha2::{Digest, Sha256};
 use std::{
@@ -41,6 +99,19 @@ fn native_readonly_wal_fixture_child() {
     database.delete_cf(cf, key(1)).unwrap();
     database.put_cf(cf, key(2), b"new-wal-value").unwrap();
     database.put_cf(cf, key(3), b"wal-only-value").unwrap();
+    let meta_cf = database.cf_handle("meta").unwrap();
+    for (scope, meta, shred) in legacy_gap_fixture() {
+        database
+            .put_cf(meta_cf, scope.slot.to_be_bytes(), meta)
+            .unwrap();
+        database
+            .put_cf(
+                cf,
+                [scope.slot.to_be_bytes(), 0u64.to_be_bytes()].concat(),
+                shred,
+            )
+            .unwrap();
+    }
     database.flush_wal(true).unwrap();
     // Do not run DB's Drop/close: that could flush the memtable and invalidate
     // the deliberately crash-shaped, generation-stable backup fixture.
@@ -290,6 +361,61 @@ fn native_readonly_resolves_manifest_and_wal() {
     assert_eq!(
         result.candidates[3].value.as_deref(),
         Some(b"wal-only-value".as_slice())
+    );
+    // Bind the complete two-stage logical query set through all eleven
+    // synthetic chains, with full census rehashing around each native read.
+    use jetstreamer_utils::horizon_ledger_native::{
+        NativeQuery, NativeResolution, resolve_native_candidates,
+    };
+    let scopes: Vec<_> = legacy_gap_fixture()
+        .into_iter()
+        .map(|(scope, _, _)| scope)
+        .collect();
+    let metadata_queries: Vec<_> = scopes
+        .iter()
+        .map(|scope| NativeQuery {
+            family: "meta".into(),
+            key: scope.slot.to_be_bytes().to_vec(),
+        })
+        .collect();
+    let resolve = |queries: &[NativeQuery], name: &str| {
+        let logs = root.path().join(name);
+        fs::create_dir(&logs).unwrap();
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
+        resolve_native_candidates(&collected, &census, &logs, &families, queries, || Ok(()))
+            .unwrap()
+    };
+    fn records(result: &NativeResolution) -> Vec<ResolvedLegacyRecord<'_>> {
+        result
+            .candidates
+            .iter()
+            .map(|r| ResolvedLegacyRecord {
+                family: &r.family,
+                key: &r.key,
+                value: r.value.as_deref(),
+            })
+            .collect()
+    }
+    let first = resolve(&metadata_queries, "gap-metadata-logs");
+    let first_records = records(&first);
+    let query_plan = plan_v1_4_25_shred_queries(&first_records, &scopes).unwrap();
+    let full_queries: Vec<_> = query_plan
+        .iter()
+        .map(|q| NativeQuery {
+            family: q.family.into(),
+            key: q.key.clone(),
+        })
+        .collect();
+    let complete = resolve(&full_queries, "gap-complete-logs");
+    let chains =
+        recover_v1_4_25_records(&first_records, &records(&complete), &scopes, 198, || Ok(()))
+            .unwrap();
+    assert_eq!(chains.len(), 11);
+    assert_eq!(chains.iter().map(|c| c.boundaries.len()).sum::<usize>(), 33);
+    assert!(
+        chains
+            .iter()
+            .all(|c| !c.source_completeness_proven && !c.publication_authorized)
     );
     let rejected_logs = root.path().join("rejected-resolution-logs");
     fs::create_dir(&rejected_logs).unwrap();
