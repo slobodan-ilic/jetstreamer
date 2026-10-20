@@ -28,10 +28,26 @@ const MIN_SNAPSHOT_SLOT: u64 = 86_831_488;
 const MAX_SLOT_EXCLUSIVE: u64 = 92_448_000;
 
 fn worker_member(plan: &Plan) -> &'static str {
-    if plan.epoch == 224 {
+    if matches!(plan.epoch, 224 | 225) {
         "jetstreamer-historical-worker-v1-6-25"
     } else {
         "jetstreamer-historical-worker-v1-6-16-store8"
+    }
+}
+
+fn probe_paths(plan: &Plan) -> (PathBuf, PathBuf) {
+    if plan.epoch == 225 {
+        (
+            plan.probe_root.join("ledger"),
+            plan.probe_root.join("output/epoch-225.jet"),
+        )
+    } else {
+        let destination = plan.probe_root.join("dest");
+        let archive = destination.join(format!(
+            "epoch-{}-through-{}.jet",
+            plan.epoch, plan.terminal_slot
+        ));
+        (destination, archive)
     }
 }
 
@@ -494,7 +510,7 @@ fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<String> {
 
 fn expected_log_markers(plan: &Plan, missing_snapshot: &Path) -> [String; 4] {
     let output_slot_start = plan.epoch * EPOCH_SLOTS;
-    let (runtime, era) = if plan.epoch == 224 {
+    let (runtime, era) = if matches!(plan.epoch, 224 | 225) {
         (
             "solana-v1.6.25",
             "solana-v1.6.20-epochs-216-232-checkpoint-candidate",
@@ -707,13 +723,15 @@ fn process_references(probe_root: &Path, worker: &Path) -> Result<Vec<String>> {
 fn validate_plan(plan: &Plan) -> Result<()> {
     ensure!(plan.schema == PLAN_SCHEMA, "plan schema mismatch");
     ensure!(
-        (203..=212).contains(&plan.epoch) || plan.epoch == 224,
+        (203..=212).contains(&plan.epoch) || matches!(plan.epoch, 224 | 225),
         "epoch outside focused capability range"
     );
     ensure!(
         plan.terminal_slot > (plan.epoch + 1) * EPOCH_SLOTS - 1
             && (if plan.epoch == 224 {
                 plan.terminal_slot == 97_631_459
+            } else if plan.epoch == 225 {
+                plan.terminal_slot == 98_063_464
             } else {
                 plan.terminal_slot < MAX_SLOT_EXCLUSIVE
             }),
@@ -733,6 +751,22 @@ fn validate_plan(plan: &Plan) -> Result<()> {
             "epoch 224 exact runtime or checkpoint binding mismatch"
         );
     }
+    if plan.epoch == 225 {
+        ensure!(
+            plan.bootstrap_slot == 97_199_617
+                && plan.snapshot_name
+                    == "snapshot-97199617-HE57JmgvEeZjBKN8cfTLrmyCbUnptJ9PWjUdTzgxSSdi.tar.zst"
+                && plan.snapshot_sha256
+                    == "094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d"
+                && plan.checkpoint_sha256
+                    == "1dd033b1df75c58abe07098c48be763ee10ad5d4b4c749efa6c0240a13e7f403"
+                && plan.node_sha256
+                    == "945f36fe11824263258ad561dba106e377148b702f2c615522b171c4ba97ed3b"
+                && plan.worker_sha256
+                    == "7cd48efc8719109a69fafcb3209a821ea9f07113e3fb0bfab49db23a6e77a146",
+            "epoch 225 exact complete-span runtime or checkpoint binding mismatch"
+        );
+    }
     ensure!(
         (MIN_SNAPSHOT_SLOT..plan.epoch * EPOCH_SLOTS).contains(&plan.bootstrap_slot),
         "bootstrap does not precede epoch output"
@@ -746,6 +780,8 @@ fn validate_plan(plan: &Plan) -> Result<()> {
     );
     let expected_package = if plan.epoch == 224 {
         "/var/lib/jetstreamer/horizon-focused-224-complete-span-v1-6-25-01879c4-v1".to_string()
+    } else if plan.epoch == 225 {
+        "/var/lib/jetstreamer/horizon-focused-225-complete-span-v1-6-25-63a2717-v1".to_string()
     } else {
         format!(
             "/var/lib/jetstreamer/horizon-focused-{}-complete-span-store8-ca2e38b-v1",
@@ -760,6 +796,8 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         &plan.package_receipt,
         &if plan.epoch == 224 {
             "epoch224-complete-span-v1-6-25-immutable-package-01879c4-".to_string()
+        } else if plan.epoch == 225 {
+            "epoch225-complete-span-v1-6-25-immutable-package-63a2717-".to_string()
         } else {
             format!(
                 "epoch{}-complete-span-store8-immutable-package-ca2e38b-",
@@ -771,6 +809,11 @@ fn validate_plan(plan: &Plan) -> Result<()> {
     let expected_probe_root = if plan.epoch == 224 {
         format!(
             "/home/ubuntu/.jetstreamer-private/qualification-224/package-capability-probe-rust-01879c4-v{}",
+            plan.probe_attempt
+        )
+    } else if plan.epoch == 225 {
+        format!(
+            "/home/ubuntu/.jetstreamer-private/qualification-225-v1625-package-capability-63a2717-v{}",
             plan.probe_attempt
         )
     } else {
@@ -787,6 +830,8 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         &plan.receipt,
         &if plan.epoch == 224 {
             "epoch224-complete-span-package-capability-01879c4-rust-".to_string()
+        } else if plan.epoch == 225 {
+            "epoch225-complete-span-package-capability-63a2717-rust-".to_string()
         } else {
             format!(
                 "epoch{}-complete-span-package-capability-ca2e38b-rust-",
@@ -923,11 +968,14 @@ fn run() -> Result<()> {
         "probe parent is not owner-only"
     );
     mkdir_owned(&plan.probe_root, plan.run_uid, plan.run_gid)?;
-    let destination = plan.probe_root.join("dest");
+    let (destination, archive) = probe_paths(&plan);
     let private_root = plan.probe_root.join("run-state");
     let scratch = plan.probe_root.join("scratch");
     for directory in [&destination, &private_root, &scratch] {
         mkdir_owned(directory, plan.run_uid, plan.run_gid)?;
+    }
+    if plan.epoch == 225 {
+        mkdir_owned(&plan.probe_root.join("output"), plan.run_uid, plan.run_gid)?;
     }
     fsync_directory(&plan.probe_root)?;
 
@@ -936,10 +984,6 @@ fn run() -> Result<()> {
         !missing_snapshot.exists(),
         "deliberately absent snapshot exists"
     );
-    let archive = destination.join(format!(
-        "epoch-{}-through-{}.jet",
-        plan.epoch, plan.terminal_slot
-    ));
     let mut command = Command::new(&node.path);
     command
         .arg(plan.epoch.to_string())
@@ -952,7 +996,7 @@ fn run() -> Result<()> {
         .arg(format!("--replay-scratch={}", scratch.display()))
         .env("JETSTREAMER_ALLOW_CANDIDATE_RUNTIME", "1")
         .env(
-            if plan.epoch == 224 {
+            if matches!(plan.epoch, 224 | 225) {
                 "JETSTREAMER_HISTORICAL_WORKER_V1_6_25"
             } else {
                 "JETSTREAMER_HISTORICAL_WORKER_V1_6_16"
@@ -1184,6 +1228,55 @@ mod tests {
         let missing = plan.probe_root.join("missing").join(&plan.snapshot_name);
         let text = expected_log_markers(&plan, &missing).join("\n");
         validate_output(&plan, &missing, &output(&text, 1)).unwrap();
+    }
+
+    #[test]
+    fn epoch225_probe_uses_exact_complete_span_and_required_private_layout() {
+        let mut current = plan();
+        current.epoch = 225;
+        current.bootstrap_slot = 97_199_617;
+        current.terminal_slot = 98_063_464;
+        current.package =
+            "/var/lib/jetstreamer/horizon-focused-225-complete-span-v1-6-25-63a2717-v1".into();
+        current.package_receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch225-complete-span-v1-6-25-immutable-package-63a2717-test.json".into();
+        current.node_sha256 =
+            "945f36fe11824263258ad561dba106e377148b702f2c615522b171c4ba97ed3b".into();
+        current.worker_sha256 =
+            "7cd48efc8719109a69fafcb3209a821ea9f07113e3fb0bfab49db23a6e77a146".into();
+        current.snapshot_name =
+            "snapshot-97199617-HE57JmgvEeZjBKN8cfTLrmyCbUnptJ9PWjUdTzgxSSdi.tar.zst".into();
+        current.snapshot_sha256 =
+            "094d3b28c39403580fbac083cdad67cc008b255dd375d611217103750d0f412d".into();
+        current.checkpoint_name = "epoch-hashes-225-complete-span.txt".into();
+        current.checkpoint_sha256 =
+            "1dd033b1df75c58abe07098c48be763ee10ad5d4b4c749efa6c0240a13e7f403".into();
+        current.probe_root = format!("/home/ubuntu/.jetstreamer-private/qualification-225-v1625-package-capability-63a2717-v{}", current.probe_attempt).into();
+        current.receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch225-complete-span-package-capability-63a2717-rust-test.json".into();
+        validate_plan(&current).unwrap();
+        let (ledger, archive) = probe_paths(&current);
+        assert_eq!(ledger, current.probe_root.join("ledger"));
+        assert_eq!(archive, current.probe_root.join("output/epoch-225.jet"));
+        assert_eq!(
+            worker_member(&current),
+            "jetstreamer-historical-worker-v1-6-25"
+        );
+        let missing = current
+            .probe_root
+            .join("missing")
+            .join(&current.snapshot_name);
+        let markers = expected_log_markers(&current, &missing).join("\n");
+        assert!(markers.contains("solana-v1.6.25 (Candidate) from slots 97200000..98063465"));
+        validate_output(&current, &missing, &output(&markers, 1)).unwrap();
+        current.terminal_slot = 97_631_459;
+        assert!(validate_plan(&current).is_err());
+        current.terminal_slot = 98_063_464;
+        current.node_sha256 =
+            "3915f57819e5822e7112ee1932dc47caf5e9812605ad56cc309976e4f681f242".into();
+        assert!(validate_plan(&current).is_err());
+        current.node_sha256 =
+            "945f36fe11824263258ad561dba106e377148b702f2c615522b171c4ba97ed3b".into();
+        current.probe_root = "/home/ubuntu/horizon".into();
+        assert!(validate_plan(&current).is_err());
     }
 
     #[test]
