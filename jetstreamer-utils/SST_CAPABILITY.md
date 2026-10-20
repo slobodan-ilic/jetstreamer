@@ -75,6 +75,25 @@ point deletions plus WAL-only updates, and rehashes every collected input after
 native resolution. This is disposable-fixture qualification only, never evidence
 for epoch141 or any real ledger generation.
 
+`horizon_ledger_bzip::collect_bound_bzip2` adds a diagnostic local-input binding
+layer. It accepts only a canonical absolute, singly linked, non-writable regular
+file owned by root or the effective user, with independently supplied compressed
+length and lowercase SHA-256. It hashes the entire bounded compressed input before
+collection and again while decoding every bzip2 stream, then rechecks both the
+descriptor and named path identity including ctime. The decompressed tar collector
+still enforces every file, aggregate and trailer limit. Tests cover multistream
+input, wrong digest/length/budget, unsafe inputs, truncation, corrupt checksums,
+compressed garbage, concatenated tars, expansion bounds and preserved partial
+diagnostics. The input is never modified.
+
+This remains a library with no production caller. The expected digest is not its
+own cloud-authentication evidence: a generation-bound download/verification
+receipt, fresh resource admission, persistent guarded execution and durable
+result receipt must still be supplied by a reviewed caller. Neither a successful
+compressed binding nor a complete tar census proves original-backup completeness,
+native live state, correct PoH boundaries or publication eligibility. No actual
+epoch141 source has been collected by these fixture tests.
+
 `horizon_legacy_shred::assemble_v1_4_25_padded_batches` provides bounded,
 diagnostic-only data-shred assembly for revision
 `893cc7647248a3536fb6e6d0b5e51c71446b862d`. It requires a complete contiguous
