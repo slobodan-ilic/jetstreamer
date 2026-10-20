@@ -89,6 +89,10 @@ name = "jetstreamer-epoch140-checkpoint-journal"
 path = "src/epoch140_checkpoint_journal_bin.rs"
 
 [[bin]]
+name = "jetstreamer-epoch140-native-launch-capture"
+path = "src/epoch140_native_launch_capture_bin.rs"
+
+[[bin]]
 name = "jetstreamer-epoch140-snapshot-download"
 path = "src/epoch140_snapshot_download_bin.rs"
 

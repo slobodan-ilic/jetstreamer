@@ -690,6 +690,16 @@ contract binds that slot, worker, snapshot, journal, clock, private run root and
 Its same-sample admission event requires the pinned host guard and one readable real worker;
 generic bootstrap/drainage allowance is not first-fire proof. Deploy the qualified fleet reader
 separately without replacing any live controller, guard or uploader.
+The separate Rust `jetstreamer-epoch140-native-launch-capture` writes that launch evidence
+only after observing the exact live probe and one readable worker in a fresh, clean first-fire
+guard sample. Its root-owned immutable `jetstreamer-epoch140-native-launch-capture-plan-v1`
+binds `unit`, `invocation_id`, `private_run_root`, `guard_unit`, `output`, and `{path, sha256}` objects for
+`probe`, `restore_plan`, `guard_sample` and `guard_plan`. Invoke the sealed capture tool as
+root with `PLAN --plan-sha256 HEX --self-sha256 HEX`; it rechecks the exact service command,
+running executable, zero-restart policy and guard identities before a no-clobber private receipt.
+The completed guard service must match the sample's actual systemd invocation and exact command,
+strict/read-only filesystem sandbox, private network, no-new-privileges and DAC/ptrace-only capabilities.
+It never starts or stops the probe and cannot replace fresh resource admission or native results.
 Success is only a native consensus comparison, not independent prefix validation, a segment
 manifest, proof of the original executed worker ELF, suffix execution, provenance/import promotion,
 publication, retirement or R2 authority. An eventual suffix worker must repeat this native check
