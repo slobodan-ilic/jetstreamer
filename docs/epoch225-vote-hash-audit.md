@@ -26,6 +26,18 @@ Do not attribute this failure to the earlier skipped-slot gap merely from its
 presence. The next source investigation is the execution and freeze of
 97,199,877. Do not repeat the unchanged canary or force either Bank hash.
 
+An optional, jointly bound `parent_request` / `parent_response` pair accepts the
+finalized raw-JSON block at 97,199,877. The checker audits wire-header writability,
+instruction program/account indexes, canonical status and balances, and requires
+the one observed candidate: transaction 224, signature
+`4tURm7ubHwvAth4yE8T87NRXh84akr9AhbDYWckdMsgoQVn4TQiBkkLvjBfcM78PVWzn7R4cboadPBgBduENRY7d`,
+marks SPL Token at key 6 writable while invoking and passing it; its canonical
+lamports remain 1,089,991,680. Upstream v1.6.25's `Message::is_writable` demotes
+called program keys, whereas v1.6.20's implementation does not. This is a concrete
+source-shape lead, not proof that it causes the actual Bank hash divergence.
+Keep `underlying_cause_proven: false` until differential execution/checkpoint
+evidence establishes it. Neither optional input grants runtime promotion.
+
 ## Invocation
 
 ```text
