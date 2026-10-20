@@ -292,6 +292,49 @@ fn require_absent(path: &Path, label: &str) -> Result<(), String> {
     }
 }
 
+fn root_prefix_203(arguments: &Arguments) -> bool {
+    arguments.archive.file_name().and_then(|name| name.to_str()) == Some("epoch-203-prefix.jet")
+        && arguments.expected_epoch == 203
+        && arguments.expected_output_start_slot == 87_696_000
+        && arguments.expected_bootstrap_slot == 87_695_515
+        && arguments.expected_terminal_slot == 88_127_580
+        && arguments.expected_runtime_profile == "solana-v1.6.16"
+        && arguments.expected_worker_sha256
+            == "3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a"
+}
+
+fn validate_archive_name(arguments: &Arguments, archive: &Path) -> Result<(), String> {
+    let expected_name = format!(
+        "epoch-{}-through-{}.jet",
+        arguments.expected_epoch, arguments.expected_terminal_slot
+    );
+    if archive.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
+        && !(archive == arguments.archive && root_prefix_203(arguments))
+    {
+        return Err(format!(
+            "qualification archive filename must be {expected_name}: {}",
+            archive.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prefix_root_identity(
+    arguments: &Arguments,
+    accounts_hash: &str,
+    revision: &str,
+) -> Result<(), String> {
+    if root_prefix_203(arguments)
+        && (accounts_hash != "4SeHmKHQrHot4gwifo1bnvDKXZwGELk2vSenotTx9oqf"
+            || revision != "86c26f843276581509c3434acc2efbf4202c44e0")
+    {
+        return Err(
+            "epoch203 prefix does not bind its exact canonical root and runtime revision".into(),
+        );
+    }
+    Ok(())
+}
+
 fn verify(arguments: &Arguments) -> Result<serde_json::Value, String> {
     require_private_root(&arguments.private_root)?;
     let private_root = fs::canonicalize(&arguments.private_root).map_err(|error| {
@@ -326,16 +369,7 @@ fn verify(arguments: &Arguments) -> Result<serde_json::Value, String> {
         ));
     }
 
-    let expected_name = format!(
-        "epoch-{}-through-{}.jet",
-        arguments.expected_epoch, arguments.expected_terminal_slot
-    );
-    if archive.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
-        return Err(format!(
-            "qualification archive filename must be {expected_name}: {}",
-            archive.display()
-        ));
-    }
+    validate_archive_name(arguments, &archive)?;
 
     let manifest_path = segment_manifest_path(&archive)
         .map_err(|error| format!("failed to resolve segment manifest path: {error}"))?;
@@ -367,6 +401,11 @@ fn verify(arguments: &Arguments) -> Result<serde_json::Value, String> {
                 .to_string(),
         );
     }
+    validate_prefix_root_identity(
+        arguments,
+        &manifest.terminal.accounts_hash,
+        &manifest.runtime.runtime_revision,
+    )?;
 
     let conflict_write_gate = if let Some(expected) = &arguments.expected_conflict {
         let output_end = manifest
@@ -543,6 +582,59 @@ mod tests {
         assert!(validate_sha256(&"A".repeat(64)).is_err());
         assert!(validate_sha256(&"a".repeat(63)).is_err());
         assert!(validate_sha256(&format!("{}g", "a".repeat(63))).is_err());
+    }
+
+    #[test]
+    fn root_prefix_filename_is_only_the_exact_private_203_checkpoint_scope() {
+        let mut raw = valid_arguments();
+        raw[0] = "/private/epoch-203-prefix.jet".into();
+        for (key, value) in [
+            ("epoch", "203"),
+            ("output-start-slot", "87696000"),
+            ("bootstrap-slot", "87695515"),
+            ("terminal-slot", "88127580"),
+            (
+                "worker-sha256",
+                "3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a",
+            ),
+        ] {
+            *raw.iter_mut()
+                .find(|s| s.starts_with(&format!("--expected-{key}=")))
+                .unwrap() = format!("--expected-{key}={value}");
+        }
+        let args = parse_arguments(raw.clone()).unwrap();
+        assert!(root_prefix_203(&args));
+        validate_archive_name(&args, &args.archive).unwrap();
+        assert!(validate_archive_name(&args, Path::new("/private/epoch-204-prefix.jet")).is_err());
+        let hash = "4SeHmKHQrHot4gwifo1bnvDKXZwGELk2vSenotTx9oqf";
+        let revision = "86c26f843276581509c3434acc2efbf4202c44e0";
+        validate_prefix_root_identity(&args, hash, revision).unwrap();
+        assert!(validate_prefix_root_identity(&args, "wrong-root", revision).is_err());
+        assert!(validate_prefix_root_identity(&args, hash, "wrong-revision").is_err());
+        for (key, value) in [
+            ("epoch", "204"),
+            ("output-start-slot", "87695516"),
+            ("bootstrap-slot", "87695514"),
+            ("terminal-slot", "88127999"),
+            ("runtime-profile", "solana-v1.6.25"),
+            ("worker-sha256", &"a".repeat(64)),
+        ] {
+            let mut changed = raw.clone();
+            *changed
+                .iter_mut()
+                .find(|s| s.starts_with(&format!("--expected-{key}=")))
+                .unwrap() = format!("--expected-{key}={value}");
+            let args = parse_arguments(changed).unwrap();
+            assert!(!root_prefix_203(&args), "{key}");
+            assert!(
+                validate_archive_name(&args, &args.archive).is_err(),
+                "{key}"
+            );
+        }
+        let mut changed = raw;
+        changed[0] = "/private/epoch-204-prefix.jet".into();
+        let args = parse_arguments(changed).unwrap();
+        assert!(validate_archive_name(&args, &args.archive).is_err());
     }
 
     #[test]

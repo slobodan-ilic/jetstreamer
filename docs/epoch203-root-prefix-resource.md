@@ -67,3 +67,11 @@ restart tuple, 419-slot suffix and V4 assembly path described in the checkpoint
 continuation runbook. The epoch213 continuation runner is not reusable authority.
 All full/plugin, provenance, publication, authenticated upload/readback and
 sidecar gates remain independent. Epoch301 remains private.
+
+The independent `jetstreamer-qualification-verify` must support the runner's
+literal `epoch-203-prefix.jet` name. Its explicit filename exception is restricted
+to the exact bootstrap, output start, canonical root, v1.6.16 revision and unchanged
+worker digest above. It still deeply rereads the complete archive and segment,
+checks the canonical root accounts hash and rejects any canonical sidecar. Do not
+rename the retained archive or relax another epoch's naming gate to fit an older
+validator. Prefix validation is not full-epoch or publication qualification.
