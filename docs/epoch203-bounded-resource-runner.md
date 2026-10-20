@@ -77,11 +77,17 @@ execute or publish an epoch203 continuation.
 
 `jetstreamer-epoch203-resource-compare` provides a read-only, exact-attempt
 comparison after the single-thread run's successful `receipts/resource.json`
-exists. Seal it and a `jetstreamer-private-epoch203-resource-comparison-plan-v1`
-plan with `baseline_path`, `baseline_sha256` and `candidate_path`. Invoke the
+exists. Seal it and a `jetstreamer-private-epoch203-resource-comparison-plan-v2`
+plan with `baseline_path`, `baseline_sha256`, `candidate_path`,
+`target_stop_sha256` and `target_capture_sha256`. Invoke the
 binary as root with `PLAN --plan-sha256 HEX --self-sha256 HEX
 --candidate-sha256 HEX`. The baseline digest and both attempt identities are
-build-bound; the candidate path is restricted to the current r1 run. A missing
+build-bound. The producer writes immutable UID-1000 receipts; preserve those
+originals and use the Rust sealer with independently supplied digests to retain
+root-owned `resource.json`, `target-stop.json` and `target-capture.json` under
+`/var/lib/jetstreamer/horizon-203-r1-bounded-outcome-20261020-v1` before comparison.
+The comparator pins those exact copy paths and cross-checks the target, child,
+invocation, canonical capture hash and complete capture object. A missing
 candidate receipt is a closed gate, not permission to substitute a live sample
 or a failure receipt.
 

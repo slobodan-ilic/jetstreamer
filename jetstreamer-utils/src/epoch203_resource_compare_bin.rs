@@ -24,7 +24,11 @@ const BASELINE_INVOCATION: &str = "efbb040eaba2492f8cfd8976c00b37d5";
 const CANDIDATE_INVOCATION: &str = "10a5df6a121f45f4be1874e9c696a603";
 const TARGET: u64 = 87_720_000;
 const CANDIDATE_PATH: &str =
-    "/home/ubuntu/.jetstreamer-private/bounded-resource-203-r1-d10f455-v1/receipts/resource.json";
+    "/var/lib/jetstreamer/horizon-203-r1-bounded-outcome-20261020-v1/resource.json";
+const STOP_PATH: &str =
+    "/var/lib/jetstreamer/horizon-203-r1-bounded-outcome-20261020-v1/target-stop.json";
+const CAPTURE_PATH: &str =
+    "/var/lib/jetstreamer/horizon-203-r1-bounded-outcome-20261020-v1/target-capture.json";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +37,8 @@ struct Plan {
     baseline_path: PathBuf,
     baseline_sha256: String,
     candidate_path: PathBuf,
+    target_stop_sha256: String,
+    target_capture_sha256: String,
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -273,6 +279,26 @@ fn compare(b: &Metrics, c: &Metrics) -> Value {
             "retirement_authorized":false,"remote_mutations":false,"r2_mutations":false}})
 }
 
+fn validate_capture(result: &Value, stop: &Value, capture: &Value) -> Result<()> {
+    ensure!(
+        stop["schema"] == "jetstreamer-private-epoch203-canary-target-stop-v1"
+            && stop["invocation_id"] == CANDIDATE_INVOCATION
+            && stop["target_slot"] == TARGET
+            && stop["observed_slot"] == result["observed_slot"]
+            && stop["child_pid"] == result["child_pid"]
+            && stop["child_pid"].as_u64().is_some_and(|pid| pid > 1)
+            && stop["written_unix_seconds"].as_u64().is_some_and(|t| t > 0)
+            && stop["scratch_snapshot_captured"] == true
+            && stop["external_signal"] == 0
+            && stop["capture_path"]
+                == "/home/ubuntu/.jetstreamer-private/bounded-resource-203-r1-d10f455-v1/receipts/target-capture.json"
+            && stop["capture_canonical_json_sha256"] == digest(&serde_json::to_vec(capture)?)
+            && result["capture"] == *capture,
+        "target-stop/capture/result binding differs"
+    );
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let a: Vec<String> = env::args().collect();
     ensure!(
@@ -289,7 +315,7 @@ fn run() -> Result<()> {
     );
     let p: Plan = serde_json::from_slice(&read_bound(Path::new(&a[1]), &a[3])?)?;
     ensure!(
-        p.schema == "jetstreamer-private-epoch203-resource-comparison-plan-v1"
+        p.schema == "jetstreamer-private-epoch203-resource-comparison-plan-v2"
             && p.baseline_sha256 == BASELINE_SHA
             && p.candidate_path == Path::new(CANDIDATE_PATH),
         "plan differs from exact comparison"
@@ -301,17 +327,23 @@ fn run() -> Result<()> {
         false,
     )
     .context("baseline metrics")?;
-    let c = metrics(
-        &serde_json::from_slice(
-            &read_bound(&p.candidate_path, &a[7]).context("candidate result binding")?,
-        )?,
-        true,
-    )
-    .context("candidate metrics")?;
+    let candidate: Value = serde_json::from_slice(
+        &read_bound(&p.candidate_path, &a[7]).context("candidate result binding")?,
+    )?;
+    let stop: Value =
+        serde_json::from_slice(&read_bound(Path::new(STOP_PATH), &p.target_stop_sha256)?)?;
+    let capture: Value = serde_json::from_slice(&read_bound(
+        Path::new(CAPTURE_PATH),
+        &p.target_capture_sha256,
+    )?)?;
+    validate_capture(&candidate, &stop, &capture)?;
+    let c = metrics(&candidate, true).context("candidate metrics")?;
     let mut result = compare(&b, &c);
     result["evidence"] = json!({"plan":a[1],"plan_sha256":a[3],"comparator_sha256":a[5],
         "baseline_path":p.baseline_path,"baseline_sha256":p.baseline_sha256,
-        "candidate_path":p.candidate_path,"candidate_sha256":a[7]});
+        "candidate_path":p.candidate_path,"candidate_sha256":a[7],
+        "target_stop_path":STOP_PATH,"target_stop_sha256":p.target_stop_sha256,
+        "target_capture_path":CAPTURE_PATH,"target_capture_sha256":p.target_capture_sha256});
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -460,5 +492,56 @@ mod tests {
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(read_bound(&link, &digest(b"{}")).is_err());
         assert!(read_bound(&path, BASELINE_SHA).is_err());
+    }
+
+    fn capture_fixture() -> (Value, Value, Value) {
+        let mut r = fixture(true);
+        r["child_pid"] = json!(123);
+        let capture = r["capture"].clone();
+        let stop = json!({"schema":"jetstreamer-private-epoch203-canary-target-stop-v1",
+            "invocation_id":CANDIDATE_INVOCATION,"target_slot":TARGET,"observed_slot":TARGET,
+            "child_pid":123,"written_unix_seconds":1792484241u64,
+            "scratch_snapshot_captured":true,"external_signal":0,
+            "capture_path":"/home/ubuntu/.jetstreamer-private/bounded-resource-203-r1-d10f455-v1/receipts/target-capture.json",
+            "capture_canonical_json_sha256":digest(&serde_json::to_vec(&capture).unwrap())});
+        (r, stop, capture)
+    }
+
+    #[test]
+    fn sealed_copies_preserve_the_actual_pre_stop_capture_binding() {
+        let (r, stop, capture) = capture_fixture();
+        validate_capture(&r, &stop, &capture).unwrap();
+    }
+
+    #[test]
+    fn changed_target_owner_child_or_capture_hash_is_rejected() {
+        let (r, stop, capture) = capture_fixture();
+        for (key, v) in [
+            ("invocation_id", json!("replacement")),
+            ("child_pid", json!(124)),
+            ("observed_slot", json!(TARGET + 1)),
+            ("target_slot", json!(TARGET + 1)),
+            ("written_unix_seconds", json!(0)),
+            ("scratch_snapshot_captured", json!(false)),
+            ("external_signal", json!(15)),
+            ("capture_path", json!("/other/capture.json")),
+            ("capture_canonical_json_sha256", json!("a".repeat(64))),
+        ] {
+            let mut bad = stop.clone();
+            bad[key] = v;
+            assert!(
+                validate_capture(&r, &bad, &capture).is_err(),
+                "accepted {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn rehashed_but_different_capture_is_not_the_result_capture() {
+        let (r, mut stop, mut capture) = capture_fixture();
+        capture["scratch"]["physical_bytes"] = json!(1);
+        stop["capture_canonical_json_sha256"] =
+            json!(digest(&serde_json::to_vec(&capture).unwrap()));
+        assert!(validate_capture(&r, &stop, &capture).is_err());
     }
 }
