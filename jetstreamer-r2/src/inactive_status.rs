@@ -313,16 +313,44 @@ fn fresh_census(
     if preserved {
         validate_preserved_failure(&current, terminal_fleet, owners)?;
     }
+    let reserve = reserve_owner_evidence(terminal_fleet, owners)?;
+    if let Some(stop) = &reserve {
+        stop.validate(
+            &current,
+            0,
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        )?;
+    }
     for (name, invocation) in owners {
         let value = current
             .get(name)
             .context("owner omitted from complete census")?;
-        if !preserved {
+        if !preserved && reserve.is_none() {
             validate_terminal_owner(value, &terminal_fleet["unit_census"][name], invocation)?;
         }
         no_pending_owner_trigger(name, value["LoadState"] == "not-found")?;
     }
     Ok(current)
+}
+
+fn reserve_owner_evidence(
+    fleet: &Value,
+    owners: &[(String, String)],
+) -> Result<Option<reserve_stop::Evidence>> {
+    let mut found = None;
+    if let Some(stops) = fleet.get("terminal_replays") {
+        for stop in stops
+            .as_array()
+            .context("terminal replay evidence must be an array")?
+        {
+            let stop: reserve_stop::Evidence = serde_json::from_value(stop.clone())?;
+            if stop.owners() == owners {
+                ensure!(found.is_none(), "duplicate reserve owner evidence");
+                found = Some(stop);
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn same_object(bytes: &[u8], etag: &str, publication: &StatusPublicationReceipt) -> Result<()> {
@@ -480,6 +508,10 @@ pub(super) async fn run() -> Result<()> {
     );
     let owners = owner_units(&publication)?;
     let before = fresh_census(&fleet, &history, &owners)?;
+    if let Some(stop) = reserve_owner_evidence(&history, &owners)? {
+        ensure!(stop.epoch == plan.epoch, "reserve stop epoch differs");
+        stop.validate(&before, publication.verified_unix_seconds, now)?;
+    }
     let s3 = s3_client(&r2);
     status_inactive::no_remote_delivery(&s3, &r2, plan.epoch).await?;
     let key = format!("epoch-{}.epoch-status.json", plan.epoch);
@@ -582,6 +614,36 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reserve_history_selects_only_the_exact_owner_pair_and_rejects_duplicates() {
+        let stop = json!({"epoch":185,"controller_unit":"controller.service",
+            "controller_invocation_id":"a".repeat(32),"producer_unit":"producer.service",
+            "producer_invocation_id":"b".repeat(32),
+            "intent":{"path":"/intent.json","sha256":"c".repeat(64)},
+            "completion":{"path":"/completion.json","sha256":"d".repeat(64)}});
+        let owners = vec![
+            ("controller.service".into(), "a".repeat(32)),
+            ("producer.service".into(), "b".repeat(32)),
+        ];
+        let fleet = json!({"terminal_replays":[stop]});
+        assert_eq!(
+            reserve_owner_evidence(&fleet, &owners)
+                .unwrap()
+                .unwrap()
+                .epoch,
+            185
+        );
+        let mut changed = owners.clone();
+        changed[1].1 = "f".repeat(32);
+        assert!(reserve_owner_evidence(&fleet, &changed).unwrap().is_none());
+        assert!(reserve_owner_evidence(&json!({"terminal_replays":[stop,stop]}), &owners).is_err());
+        assert!(reserve_owner_evidence(&json!({"terminal_replays":{}}), &owners).is_err());
+        assert!(
+            reserve_owner_evidence(&json!({}), &owners)
+                .unwrap()
+                .is_none()
+        );
+    }
     #[test]
     fn queued_jobs_are_a_plain_systemctl_table_not_journal_json() {
         assert!(queued_job_units(b"").unwrap().is_empty());

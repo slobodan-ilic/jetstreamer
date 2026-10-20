@@ -18,6 +18,8 @@ struct Gate {
     state: String,
     next_action: String,
     evidence: Vec<BoundFile>,
+    #[serde(default)]
+    reserve_stop: Option<reserve_stop::Evidence>,
 }
 
 #[derive(Deserialize)]
@@ -1241,6 +1243,11 @@ pub(super) async fn run() -> Result<()> {
         .as_array()
         .context("observer replays missing")?;
     let mut names: BTreeSet<_> = plan.tracked_units.iter().cloned().collect();
+    for gate in plan.gates.values() {
+        if let Some(stop) = &gate.reserve_stop {
+            names.extend(stop.owners().into_iter().map(|(name, _)| name));
+        }
+    }
     for replay in replays {
         for kind in ["controller_after", "producer_after"] {
             names.insert(observer_string(replay, &[kind, "unit"])?.into());
@@ -1305,6 +1312,40 @@ pub(super) async fn run() -> Result<()> {
         );
     }
     let before = census(&names, plan.first_epoch, plan.last_epoch)?;
+    let mut terminal_replays = Vec::new();
+    for (epoch, gate) in &plan.gates {
+        if let Some(stop) = &gate.reserve_stop {
+            ensure!(
+                stop.epoch == *epoch
+                    && matches!(
+                        gate.state.as_str(),
+                        "failed-needs-repair" | "blocked-qualification"
+                    ),
+                "reserve stop requires an exact blocked epoch gate"
+            );
+            let mut minimum_time = 0;
+            for replay in replays {
+                let range = parse_observer_claim_range(observer_string(replay, &["range"])?)?;
+                if range.contains(epoch) {
+                    ensure!(
+                        range.len() == 1
+                            && observer_string(replay, &["controller_after", "unit"])?
+                                == stop.controller_unit
+                            && observer_string(replay, &["controller_after", "invocation_id"])?
+                                == stop.controller_invocation_id
+                            && observer_string(replay, &["producer_after", "unit"])?
+                                == stop.producer_unit
+                            && observer_string(replay, &["producer_after", "invocation_id"])?
+                                == stop.producer_invocation_id,
+                        "reserve stop cannot discard another observer claim"
+                    );
+                    minimum_time = sample_seconds;
+                }
+            }
+            stop.validate(&before, minimum_time, started_seconds)?;
+            terminal_replays.push(serde_json::to_value(stop)?);
+        }
+    }
     let r2 = r2_config_from_env()?;
     let s3 = s3_client(&r2);
     let mut entries = Vec::new();
@@ -1409,6 +1450,9 @@ pub(super) async fn run() -> Result<()> {
             if !range.contains(&epoch) {
                 continue;
             }
+            if gate.reserve_stop.is_some() {
+                continue;
+            }
             ensure!(
                 live.is_none(),
                 "overlapping observer claims for epoch {epoch}"
@@ -1486,6 +1530,7 @@ pub(super) async fn run() -> Result<()> {
     let receipt = json!({"schema":SCHEMA,"first_epoch":plan.first_epoch,"last_epoch":plan.last_epoch,"sampled_at_utc":sample,"observer_receipt":plan.observer.path,"observer_sha256":plan.observer.sha256,"previous_fleet":plan.previous_fleet.as_ref().map(|p|json!({"path":p.path,"sha256":p.sha256})),"plan":plan_bound.path,"plan_sha256":plan_bound.sha256,"admission_transition_guard":plan.admission_transition_guard.as_ref().map(|p|json!({"path":p.path,"sha256":p.sha256})),"inventory":inventory,"unit_census":after,"active":active,"diagnostics":diagnostics,"transitions":changes,"epochs":entries,"recorded_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),"remote_mutations":false,"producer_mutations":false,"publication_authorized":false});
     let mut receipt = receipt;
     receipt["pipelines"] = json!(pipelines);
+    receipt["terminal_replays"] = json!(terminal_replays);
     persist(&plan.output, &receipt)?;
     println!("{}", plan.output.display());
     Ok(())

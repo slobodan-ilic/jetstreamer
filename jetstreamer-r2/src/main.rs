@@ -64,6 +64,7 @@ const STATUS_DELETION_RECEIPT_SCHEMA: &str =
 mod fleet;
 mod inactive_status;
 mod pipeline_status;
+mod reserve_stop;
 mod resource_audit;
 mod resource_verify;
 mod status_inactive;
