@@ -685,6 +685,11 @@ Require the exact bounded environment `SOLANA_RAYON_THREADS=2` and
 admission, a separately proven invocation-bound reserve/VMA guard, and qualified fleet recognition;
 source tests or a sealed binary alone grant no launch authority. Admission must protect all older
 growth claims, the century floor, restore/index/copy peak and output reservation.
+The fleet's separate `jetstreamer-private-epoch140-native-restore-launch-v1` observational
+contract binds that slot, worker, snapshot, journal, clock, private run root and exact live command.
+Its same-sample admission event requires the pinned host guard and one readable real worker;
+generic bootstrap/drainage allowance is not first-fire proof. Deploy the qualified fleet reader
+separately without replacing any live controller, guard or uploader.
 Success is only a native consensus comparison, not independent prefix validation, a segment
 manifest, proof of the original executed worker ELF, suffix execution, provenance/import promotion,
 publication, retirement or R2 authority. An eventual suffix worker must repeat this native check

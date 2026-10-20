@@ -33,6 +33,53 @@ struct DiagnosticClaim {
     launch_receipt: BoundFile,
 }
 
+fn native_restore_140(claim: &DiagnosticClaim) -> bool {
+    claim.epoch == 140
+        && claim
+            .unit
+            .starts_with("horizon-qualify-140-native-restore-")
+        && claim.unit.ends_with(".service")
+}
+
+fn native_restore_140_launch_matches(claim: &DiagnosticClaim, receipt: &Value) -> bool {
+    native_restore_140(claim)
+        && claim.scratch_path.parent() == Some(Path::new("/home/sol/.jetstreamer-private"))
+        && claim
+            .scratch_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with("epoch140-native-restore-"))
+        && receipt["epoch"] == 140
+        && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+        && receipt["snapshot_slot"] == 60_911_751u64
+        && receipt["snapshot_sha256"]
+            == "47d5911465901975e397c570e06ccf72296db7ecd3b3b1beda710cacd3e683a1"
+        && receipt["worker_sha256"]
+            == "abe395d482174e490833928c7343a33d135d8572096faf873ce3103c35fe520d"
+        && receipt["original_journal_sha256"]
+            == "8dfb8d6805d6b4d50ab340899447b90449c66117cc33b1af0ca6537b934a3b13"
+        && receipt["serialized_clock_sha256"]
+            == "f74aacd82655179686a43c6bb137e0c0e7c7bd2955809008a745ef80f16f8be2"
+        && receipt["runtime"] == "solana-v1.4.25"
+        && receipt["solana_rayon_threads"] == 2
+        && canonical_digest(&receipt["probe_sha256"])
+        && canonical_digest(&receipt["plan_sha256"])
+        && receipt["maximum_runtime_seconds"] == 1800
+        && receipt["experimental_envelope_bytes"] == 128u64 << 30
+        && receipt["replay_entries_authorized"] == false
+        && receipt["archive_prefix_verified"] == false
+        && receipt["suffix_execution_authorized"] == false
+        && receipt["runtime_promotion_authorized"] == false
+        && receipt["canonical_sidecar_authorized"] == false
+        && receipt["publication_authorized"] == false
+        && receipt["expected_exec_start"].as_str().is_some_and(|s| {
+            s.starts_with("{ path=/usr/local/lib/jetstreamer/horizon-epoch140-native-restore-tool-")
+                && s.contains("/jetstreamer-epoch140-native-restore-probe ; argv[]=")
+                && s.contains(" --plan-sha256 ")
+                && s.contains(" --self-sha256 ")
+        })
+}
+
 fn shrink_budget_203_namespace(claim: &DiagnosticClaim) -> bool {
     claim.epoch == 203
         && claim
@@ -363,6 +410,11 @@ fn validate_same_sample_admission(
     // Only these separately pinned private measurement contracts may report
     // one same-sample admission; this never grants launch authority.
     let expected_guard = match claim.epoch {
+        140 if native_restore_140(claim) => {
+            // This host's unchanged, sealed generic bootstrap/drainage guard.
+            // Admission still requires its real one-worker sandboxed first fire.
+            "eca429932ffe9afe71aecba815ab301db46bdddbaf24b4c44af8c88bb74a6194"
+        }
         224 if claim
             .unit
             .starts_with("horizon-qualify-224-bounded-resource-") =>
@@ -470,7 +522,14 @@ fn validate_same_sample_admission(
 }
 
 fn diagnostic_guard_profile_matches(claim: &DiagnosticClaim, plan: &Value) -> bool {
-    if shrink_budget_203_namespace(claim) {
+    if native_restore_140(claim) {
+        plan.get("bounded_canary").is_none_or(Value::is_null)
+            && plan.get("bounded_measurement").is_none_or(Value::is_null)
+            && plan["filesystem"] == "/home/sol"
+            && plan["minimum_free_bytes"]
+                .as_u64()
+                .is_some_and(|v| v >= 5_153_080_892_870)
+    } else if shrink_budget_203_namespace(claim) {
         !claim
             .unit
             .starts_with("horizon-qualify-203-bounded-resource-shrink-budget-r1-")
@@ -526,6 +585,8 @@ fn diagnostic_guard_profile_matches(claim: &DiagnosticClaim, plan: &Value) -> bo
 }
 
 fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Result<()> {
+    let native_restore =
+        receipt["schema"] == "jetstreamer-private-epoch140-native-restore-launch-v1";
     let continuation =
         receipt["schema"] == "jetstreamer-private-epoch213-checkpoint-continuation-launch-v1";
     let bootstrap_resource =
@@ -548,7 +609,8 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
     let private_verify_225 =
         receipt["schema"] == "jetstreamer-private-epoch225-verification-launch-v1";
     ensure!(
-        (continuation
+        (native_restore
+            || continuation
             || bootstrap_resource
             || bounded_resource
             || bounded_v1625
@@ -565,7 +627,9 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             && receipt["r2_mutations"] == false,
         "invalid diagnostic launch receipt"
     );
-    let scope_valid = if continuation {
+    let scope_valid = if native_restore {
+        native_restore_140_launch_matches(claim, receipt)
+    } else if continuation {
         claim.epoch == 213
             && claim
                 .unit
@@ -1654,11 +1718,11 @@ pub(super) async fn run() -> Result<()> {
                 current["InvocationID"] == claim.invocation_id && current["NRestarts"] == "0",
                 "diagnostic live invocation changed"
             );
-            if private_225_verification(claim) {
+            if private_225_verification(claim) || native_restore_140(claim) {
                 let launch = bound_json(&claim.launch_receipt)?;
                 ensure!(
                     current["ExecStart"] == launch["expected_exec_start"],
-                    "private225 verifier live command changed"
+                    "private diagnostic live command changed"
                 );
             }
             ensure!(
@@ -1666,7 +1730,9 @@ pub(super) async fn run() -> Result<()> {
                     && claim.scratch_path.is_dir(),
                 "diagnostic scratch must be an exact canonical directory"
             );
-            let phase = if claim
+            let phase = if native_restore_140(claim) {
+                "native-restore-only"
+            } else if claim
                 .unit
                 .starts_with("horizon-qualify-213-private-verification-")
                 || private_225_verification(claim)
@@ -3321,6 +3387,161 @@ mod tests {
         bad["evidence"]["units"][0]["restarts"] = json!(1);
         assert!(validate_diagnostic_launch(&bad, &claim).is_err());
         claim.epoch = 214;
+        assert!(validate_diagnostic_launch(&receipt, &claim).is_err());
+    }
+
+    #[test]
+    fn native_restore_140_admission_requires_pinned_guard_and_one_readable_worker() {
+        let (previous, mut plan, mut guard, mut gp) = admission_fixture();
+        let claim = &mut plan.diagnostics[1];
+        claim.epoch = 140;
+        claim.unit = "horizon-qualify-140-native-restore-test-v1.service".into();
+        claim.scratch_path =
+            "/home/sol/.jetstreamer-private/epoch140-native-restore-test-v1".into();
+        guard["guard_sha256"] =
+            json!("eca429932ffe9afe71aecba815ab301db46bdddbaf24b4c44af8c88bb74a6194");
+        guard["producer"]["cgroup"] = json!(format!("/system.slice/{}", claim.unit));
+        guard["minimum_free_bytes"] = json!(5153080892870u64);
+        guard["available_bytes"] = json!(5153080892871u64);
+        gp["unit"] = json!(claim.unit);
+        gp["worker_root"] = json!(claim.scratch_path);
+        gp["filesystem"] = json!("/home/sol");
+        gp["minimum_free_bytes"] = guard["minimum_free_bytes"].clone();
+        gp["bounded_canary"] = Value::Null;
+        gp["bounded_measurement"] = Value::Null;
+        validate_same_sample_admission(
+            &previous,
+            &plan,
+            "2026-10-20T00:04:42Z",
+            &guard,
+            &gp,
+            1792455200,
+        )
+        .unwrap();
+        for (pointer, value) in [
+            (
+                "/guard_sha256",
+                json!("cc3536dfcc268c913feccf1603a25e3cdbdf2807289c9061e04884027d1b1560"),
+            ),
+            ("/workers", json!([])),
+            ("/workers", json!([[1, 2], [3, 4]])),
+            ("/workers", json!([[1, 3500001]])),
+            ("/worker_observation_error", json!("unreadable maps")),
+            ("/producer/restarts", json!(1)),
+            ("/available_bytes", json!(5153080892869u64)),
+        ] {
+            let mut bad = guard.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                validate_same_sample_admission(
+                    &previous,
+                    &plan,
+                    "2026-10-20T00:04:42Z",
+                    &bad,
+                    &gp,
+                    1792455200
+                )
+                .is_err(),
+                "{pointer}"
+            );
+        }
+        let mut bad = gp.clone();
+        bad["bounded_canary"] = json!({"expected_uid":1001});
+        assert!(
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &bad,
+                1792455200
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_restore_140_is_exact_zero_entry_diagnostic_not_continuation() {
+        let mut claim = DiagnosticClaim {
+            epoch: 140,
+            unit: "horizon-qualify-140-native-restore-test-v1.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/home/sol/.jetstreamer-private/epoch140-native-restore-test-v1".into(),
+            launch_receipt: BoundFile {
+                path: "/private/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let receipt = json!({
+            "schema":"jetstreamer-private-epoch140-native-restore-launch-v1",
+            "launched":true,"epoch":140,"remote_mutations":false,"r2_mutations":false,
+            "private_run_root":claim.scratch_path,"snapshot_slot":60911751u64,
+            "snapshot_sha256":"47d5911465901975e397c570e06ccf72296db7ecd3b3b1beda710cacd3e683a1",
+            "worker_sha256":"abe395d482174e490833928c7343a33d135d8572096faf873ce3103c35fe520d",
+            "original_journal_sha256":"8dfb8d6805d6b4d50ab340899447b90449c66117cc33b1af0ca6537b934a3b13",
+            "serialized_clock_sha256":"f74aacd82655179686a43c6bb137e0c0e7c7bd2955809008a745ef80f16f8be2",
+            "probe_sha256":"c".repeat(64),"plan_sha256":"d".repeat(64),
+            "runtime":"solana-v1.4.25","solana_rayon_threads":2,
+            "maximum_runtime_seconds":1800,"experimental_envelope_bytes":128u64<<30,
+            "replay_entries_authorized":false,"archive_prefix_verified":false,
+            "suffix_execution_authorized":false,"runtime_promotion_authorized":false,
+            "canonical_sidecar_authorized":false,"publication_authorized":false,
+            "expected_exec_start":"{ path=/usr/local/lib/jetstreamer/horizon-epoch140-native-restore-tool-test/jetstreamer-epoch140-native-restore-probe ; argv[]=/usr/local/lib/jetstreamer/horizon-epoch140-native-restore-tool-test/jetstreamer-epoch140-native-restore-probe /private/plan.json --plan-sha256 HEX --self-sha256 HEX ; ignore_errors=no }",
+            "evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,
+                "restarts":0,"load_state":"loaded","result":"success","main_pid":1,
+                "active_state":"active","sub_state":"running"}]}
+        });
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        for (field, value) in [
+            ("epoch", json!(141)),
+            ("snapshot_slot", json!(60911999)),
+            ("private_run_root", json!("/another/root")),
+            ("snapshot_sha256", json!("0".repeat(64))),
+            ("worker_sha256", json!("0".repeat(64))),
+            ("original_journal_sha256", json!("0".repeat(64))),
+            ("serialized_clock_sha256", json!("0".repeat(64))),
+            ("probe_sha256", json!("not-a-digest")),
+            ("plan_sha256", json!(null)),
+            ("runtime", json!("solana-v1.6.16")),
+            ("solana_rayon_threads", json!(8)),
+            ("maximum_runtime_seconds", json!(1801)),
+            ("experimental_envelope_bytes", json!(1)),
+            ("replay_entries_authorized", json!(true)),
+            ("archive_prefix_verified", json!(true)),
+            ("suffix_execution_authorized", json!(true)),
+            ("runtime_promotion_authorized", json!(true)),
+            ("canonical_sidecar_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+            ("remote_mutations", json!(true)),
+            ("r2_mutations", json!(true)),
+            (
+                "expected_exec_start",
+                json!("{ path=/bin/true ; argv[]=/bin/true }"),
+            ),
+        ] {
+            let mut bad = receipt.clone();
+            bad[field] = value;
+            assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{field}");
+        }
+        let guard = json!({"filesystem":"/home/sol","minimum_free_bytes":5153080892870u64});
+        assert!(diagnostic_guard_profile_matches(&claim, &guard));
+        for (field, value) in [
+            ("minimum_free_bytes", json!(5153080892869u64)),
+            ("filesystem", json!("/")),
+            ("bounded_canary", json!({"expected_uid":1001})),
+            ("bounded_measurement", json!({"producer_uid":1001})),
+        ] {
+            let mut bad = guard.clone();
+            bad[field] = value;
+            assert!(!diagnostic_guard_profile_matches(&claim, &bad), "{field}");
+        }
+        claim.epoch = 213;
+        assert!(validate_diagnostic_launch(&receipt, &claim).is_err());
+        claim.epoch = 140;
+        claim.unit = "horizon-qualify-213-checkpoint-continuation-test.service".into();
+        assert!(validate_diagnostic_launch(&receipt, &claim).is_err());
+        claim.unit = "horizon-qualify-140-native-restore-test-v1.service".into();
+        claim.scratch_path = "/home/sol/.jetstreamer-private/unrelated".into();
         assert!(validate_diagnostic_launch(&receipt, &claim).is_err());
     }
 
