@@ -3,8 +3,9 @@
 //!
 //! The archive API surface is intentionally append-only. The sole remote
 //! deletion operation is the fail-closed removal of a mutable
-//! `epoch-N.epoch-status.json` after the canonical archive and sidecar have
-//! durable authenticated completion evidence. A local archive is removed only after its exact
+//! `epoch-N.epoch-status.json` after durable authenticated completion evidence,
+//! or separately proven inactive ownership under the guarded cleanup plan.
+//! A local archive is removed only after its exact
 //! SHA-256 sidecar, length, multipart ETag, and immutable metadata have been
 //! observed in R2 and a private receipt has been fsynced. The sidecar is
 //! published last and serves as the remote completion marker.
@@ -59,6 +60,7 @@ const STATUS_DELETION_RECEIPT_SCHEMA: &str =
     "jetstreamer-horizon-r2-status-authenticated-deletion-receipt-v1";
 
 mod fleet;
+mod inactive_status;
 mod resource_audit;
 mod resource_verify;
 
@@ -1902,13 +1904,7 @@ async fn status_delete(s3: &Client, r2: &R2Config, config: &Config, epoch: u64) 
             current.bytes == epoch_status_bytes(&publication.status)?,
             "current status bytes differ from the bound publication receipt"
         );
-        s3.delete_object()
-            .bucket(&r2.bucket)
-            .key(&key)
-            .if_match(format!("\"{}\"", current.etag))
-            .send()
-            .await
-            .map_err(|error| anyhow!("conditional status deletion failed: {error:?}"))?;
+        conditional_delete_epoch_status(s3, &r2.bucket, epoch, &current.etag).await?;
         true
     } else {
         false
@@ -1940,6 +1936,27 @@ async fn status_delete(s3: &Client, r2: &R2Config, config: &Config, epoch: u64) 
         verified_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     };
     write_status_deletion_receipt(status_receipt_directory, &deletion_receipt)
+}
+
+// The sole remote deletion call site: neither caller can supply an arbitrary key.
+async fn conditional_delete_epoch_status(
+    s3: &Client,
+    bucket: &str,
+    epoch: u64,
+    etag: &str,
+) -> Result<()> {
+    ensure!(
+        !etag.is_empty(),
+        "status deletion requires an observed ETag"
+    );
+    s3.delete_object()
+        .bucket(bucket)
+        .key(format!("epoch-{epoch}.epoch-status.json"))
+        .if_match(format!("\"{etag}\""))
+        .send()
+        .await
+        .map_err(|error| anyhow!("conditional status deletion failed: {error:?}"))?;
+    Ok(())
 }
 
 async fn head_archive(client: &Client, bucket: &str, key: &str) -> Result<Option<RemoteArchive>> {
@@ -3072,6 +3089,9 @@ async fn main() -> Result<()> {
     if env::args().nth(1).as_deref() == Some("fleet-reconcile") {
         return fleet::run().await;
     }
+    if env::args().nth(1).as_deref() == Some("status-retire-inactive") {
+        return inactive_status::run().await;
+    }
     let config = parse_args()?;
     ensure!(
         config.command == Command::Inventory || config.directory.is_dir(),
@@ -3371,7 +3391,7 @@ mod tests {
             .unwrap();
     }
 
-    fn status_publication_receipt(epoch: u64) -> StatusPublicationReceipt {
+    pub(super) fn status_publication_receipt(epoch: u64) -> StatusPublicationReceipt {
         StatusPublicationReceipt {
             schema: STATUS_RECEIPT_SCHEMA.to_owned(),
             bucket: "bucket".to_owned(),
@@ -3972,7 +3992,9 @@ mod tests {
         let ready_pair_before = status_delete
             .find("validate_authenticated_ready_pair(s3, &r2.bucket, &archive_receipt).await?")
             .unwrap();
-        let deletion = status_delete.find(singular).unwrap();
+        let deletion = status_delete
+            .find("conditional_delete_epoch_status(s3,")
+            .unwrap();
         let ready_pair_after = status_delete
             .rfind("validate_authenticated_ready_pair(s3, &r2.bucket, &archive_receipt).await?")
             .unwrap();

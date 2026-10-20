@@ -465,7 +465,7 @@ fn bound_json(bound: &BoundFile) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn utc_seconds(value: &str) -> Result<u64> {
+pub(super) fn utc_seconds(value: &str) -> Result<u64> {
     ensure!(
         is_canonical_utc(value),
         "invalid fleet sample UTC timestamp"
@@ -502,7 +502,7 @@ fn utc_seconds(value: &str) -> Result<u64> {
     Ok(u64::try_from(seconds)?)
 }
 
-fn unit(name: &str) -> Result<Value> {
+pub(super) fn unit(name: &str) -> Result<Value> {
     ensure!(
         name.ends_with(".service")
             && name
@@ -539,7 +539,7 @@ fn unit(name: &str) -> Result<Value> {
     Ok(Value::Object(values))
 }
 
-fn census(
+pub(super) fn census(
     names: &BTreeSet<String>,
     first_epoch: u64,
     last_epoch: u64,
@@ -553,7 +553,7 @@ fn census(
         .args([
             "list-units",
             "--type=service",
-            "--state=running",
+            "--state=running,activating",
             "--output=json",
             "--no-pager",
         ])
@@ -579,6 +579,7 @@ fn census(
                     .is_some_and(|epoch| (first_epoch..=last_epoch).contains(&epoch))
             });
         if name.starts_with("jetstreamer-root-sweep-")
+            || name.starts_with("horizon-controller-")
             || name.starts_with("horizon-qualify-")
             || assigned_diagnostic
             || assigned_pipeline
