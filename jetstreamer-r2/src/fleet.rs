@@ -30,6 +30,60 @@ struct DiagnosticClaim {
     launch_receipt: BoundFile,
 }
 
+// Observational only: these claims never authorize launch, publication or upload.
+// Keep delivery distinct from private diagnostics, which forbid remote mutation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineClaim {
+    epoch: u64,
+    phase: String,
+    unit: String,
+    invocation_id: String,
+    expected_exec_start: String,
+    evidence: Vec<BoundFile>,
+}
+
+fn validate_pipeline_claim(claim: &PipelineClaim, first: u64, last: u64) -> Result<()> {
+    let prefix = match claim.phase.as_str() {
+        "local-publication" => format!("horizon-publish-{}-", claim.epoch),
+        "upload-readback" => format!("horizon-upload-{}-", claim.epoch),
+        _ => anyhow::bail!("invalid pipeline phase"),
+    };
+    ensure!(
+        (first..=last).contains(&claim.epoch)
+            && claim.unit.starts_with(&prefix)
+            && claim.unit.ends_with(".service")
+            && claim.invocation_id.len() == 32
+            && claim
+                .invocation_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && !claim.expected_exec_start.trim().is_empty()
+            && !claim.evidence.is_empty(),
+        "invalid observational pipeline claim"
+    );
+    Ok(())
+}
+
+fn pipeline_live(claim: &PipelineClaim, current: &Value) -> Result<bool> {
+    let live = (current["ActiveState"] == "active" && current["SubState"] == "running")
+        || (current["ActiveState"] == "activating" && current["SubState"] == "start");
+    if live {
+        ensure!(
+            current["InvocationID"] == claim.invocation_id
+                && current["NRestarts"] == "0"
+                && current["ExecStart"] == claim.expected_exec_start
+                && current["LoadState"] == "loaded"
+                && current["MainPID"]
+                    .as_str()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_some_and(|pid| pid > 0),
+            "pipeline live identity or exact command changed"
+        );
+    }
+    Ok(live)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Plan {
@@ -47,6 +101,8 @@ struct Plan {
     // They are active qualification work, not ordinary replay/sidecar claims.
     #[serde(default)]
     diagnostics: Vec<DiagnosticClaim>,
+    #[serde(default)]
+    pipeline_claims: Vec<PipelineClaim>,
     // One event-driven bounded admission may update the active list using the
     // same observer. This is not authority for another resource observation.
     #[serde(default)]
@@ -455,7 +511,7 @@ fn unit(name: &str) -> Result<Value> {
         "invalid fleet unit name"
     );
     let result = ProcessCommand::new("systemctl").args([
-        "show", name, "--no-pager", "--property=Id,LoadState,ActiveState,SubState,InvocationID,NRestarts,Result,ExecMainStatus,ExecStart,ControlGroup",
+        "show", name, "--no-pager", "--property=Id,LoadState,ActiveState,SubState,InvocationID,NRestarts,Result,ExecMainStatus,ExecStart,ControlGroup,MainPID",
     ]).output()?;
     let mut values = serde_json::Map::new();
     for line in std::str::from_utf8(&result.stdout)?.lines() {
@@ -514,9 +570,18 @@ fn census(
                 .and_then(|tail| tail.split('-').next())
                 .and_then(|epoch| epoch.parse::<u64>().ok())
                 .is_some_and(|epoch| (first_epoch..=last_epoch).contains(&epoch));
+        let assigned_pipeline = ["horizon-publish-", "horizon-upload-"]
+            .iter()
+            .any(|prefix| {
+                name.strip_prefix(prefix)
+                    .and_then(|tail| tail.split('-').next())
+                    .and_then(|epoch| epoch.parse::<u64>().ok())
+                    .is_some_and(|epoch| (first_epoch..=last_epoch).contains(&epoch))
+            });
         if name.starts_with("jetstreamer-root-sweep-")
             || name.starts_with("horizon-qualify-")
             || assigned_diagnostic
+            || assigned_pipeline
         {
             ensure!(
                 names.contains(name),
@@ -773,6 +838,22 @@ pub(super) async fn run() -> Result<()> {
         }
         names.insert(claim.unit.clone());
     }
+    let mut pipeline_units = BTreeSet::new();
+    ensure!(
+        plan.admission_transition_guard.is_none() || plan.pipeline_claims.is_empty(),
+        "same-sample diagnostic admission cannot change pipeline claims"
+    );
+    for claim in &plan.pipeline_claims {
+        validate_pipeline_claim(claim, plan.first_epoch, plan.last_epoch)?;
+        ensure!(
+            pipeline_units.insert(claim.unit.clone()) && !diagnostic_units.contains(&claim.unit),
+            "duplicate pipeline unit or diagnostic relabeling"
+        );
+        for evidence in &claim.evidence {
+            bound_json(evidence)?;
+        }
+        names.insert(claim.unit.clone());
+    }
     if plan.admission_transition_guard.is_some() {
         ensure!(
             previous_fleet["unit_census"]
@@ -789,6 +870,43 @@ pub(super) async fn run() -> Result<()> {
     let mut entries = Vec::new();
     let mut active = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut pipelines = Vec::new();
+    let mut live_pipeline_epochs = BTreeSet::new();
+    for claim in &plan.pipeline_claims {
+        let current = &before[&claim.unit];
+        let is_active = pipeline_live(claim, current)?;
+        let entry = json!({"epoch":claim.epoch,"phase":claim.phase,"unit":current,
+            "live":is_active,"expected_invocation_id":claim.invocation_id,
+            "evidence":claim.evidence.iter().map(|e|json!({"path":e.path,"sha256":e.sha256})).collect::<Vec<_>>(),
+            "sampled_at_utc":sample,"ordinary_replay_claim":false,
+            "current_sidecar_eta_valid":false,"grants_launch_or_publication_authority":false});
+        if is_active {
+            ensure!(
+                live_pipeline_epochs.insert(claim.epoch),
+                "overlapping live pipeline claims"
+            );
+            ensure!(
+                plan.gates[&claim.epoch].state == "post-replay-pipeline",
+                "live pipeline requires an independently evidenced post-replay gate"
+            );
+            ensure!(
+                !plan
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.epoch == claim.epoch && before[&d.unit]["ActiveState"] == "active"),
+                "live delivery overlaps private diagnostic work"
+            );
+            for replay in replays {
+                ensure!(
+                    !parse_observer_claim_range(observer_string(replay, &["range"])?)?
+                        .contains(&claim.epoch),
+                    "live pipeline overlaps an ordinary replay claim"
+                );
+            }
+            active.push(entry.clone());
+        }
+        pipelines.push(entry);
+    }
     for claim in &plan.diagnostics {
         let current = &before[&claim.unit];
         let is_active = current["ActiveState"] == "active" && current["SubState"] == "running";
@@ -841,6 +959,12 @@ pub(super) async fn run() -> Result<()> {
             .any(|claim| claim["epoch"] == epoch && claim["live"] == true)
         {
             state = "blocked-qualification";
+        }
+        if pipelines
+            .iter()
+            .any(|claim| claim["epoch"] == epoch && claim["live"] == true)
+        {
+            state = "post-replay-pipeline";
         }
         let mut live = None;
         for replay in replays {
@@ -911,6 +1035,8 @@ pub(super) async fn run() -> Result<()> {
     let inventory = inventory_report(remote_entries);
     let changes = transitions(&previous_fleet, &after, &entries);
     let receipt = json!({"schema":SCHEMA,"first_epoch":plan.first_epoch,"last_epoch":plan.last_epoch,"sampled_at_utc":sample,"observer_receipt":plan.observer.path,"observer_sha256":plan.observer.sha256,"previous_fleet":plan.previous_fleet.as_ref().map(|p|json!({"path":p.path,"sha256":p.sha256})),"plan":plan_bound.path,"plan_sha256":plan_bound.sha256,"admission_transition_guard":plan.admission_transition_guard.as_ref().map(|p|json!({"path":p.path,"sha256":p.sha256})),"inventory":inventory,"unit_census":after,"active":active,"diagnostics":diagnostics,"transitions":changes,"epochs":entries,"recorded_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),"remote_mutations":false,"producer_mutations":false,"publication_authorized":false});
+    let mut receipt = receipt;
+    receipt["pipelines"] = json!(pipelines);
     persist(&plan.output, &receipt)?;
     println!("{}", plan.output.display());
     Ok(())
@@ -918,6 +1044,60 @@ pub(super) async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn pipeline_fixture() -> (PipelineClaim, Value) {
+        let claim = PipelineClaim {
+            epoch: 213,
+            phase: "local-publication".into(),
+            unit: "horizon-publish-213-test.service".into(),
+            invocation_id: "a".repeat(32),
+            expected_exec_start:
+                "{ path=/sealed/publisher ; argv[]=/sealed/publisher /sealed/plan ; }".into(),
+            evidence: vec![BoundFile {
+                path: "/sealed/plan".into(),
+                sha256: "b".repeat(64),
+            }],
+        };
+        let current = json!({"LoadState":"loaded","ActiveState":"activating","SubState":"start",
+            "InvocationID":claim.invocation_id,"NRestarts":"0","ExecStart":claim.expected_exec_start,"MainPID":"123"});
+        (claim, current)
+    }
+
+    #[test]
+    fn pipeline_observation_binds_exact_live_command_and_invocation() {
+        let (claim, current) = pipeline_fixture();
+        validate_pipeline_claim(&claim, 201, 300).unwrap();
+        assert!(pipeline_live(&claim, &current).unwrap());
+        for (field, value) in [
+            ("InvocationID", json!("c".repeat(32))),
+            ("NRestarts", json!("1")),
+            ("ExecStart", json!("/different")),
+            ("MainPID", json!("0")),
+            ("LoadState", json!("not-found")),
+        ] {
+            let mut bad = current.clone();
+            bad[field] = value;
+            assert!(pipeline_live(&claim, &bad).is_err(), "{field}");
+        }
+        let mut terminal = current;
+        terminal["ActiveState"] = json!("inactive");
+        terminal["SubState"] = json!("dead");
+        assert!(!pipeline_live(&claim, &terminal).unwrap());
+    }
+
+    #[test]
+    fn pipeline_claim_is_not_a_diagnostic_or_tail_publication() {
+        let (mut claim, _) = pipeline_fixture();
+        claim.epoch = 301;
+        assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+        claim.epoch = 213;
+        claim.phase = "diagnostic-qualification".into();
+        assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+        claim.phase = "upload-readback".into();
+        claim.unit = "horizon-upload-213-test.service".into();
+        validate_pipeline_claim(&claim, 201, 300).unwrap();
+        claim.evidence.clear();
+        assert!(validate_pipeline_claim(&claim, 201, 300).is_err());
+    }
     use super::*;
     fn admission_fixture() -> (Value, Plan, Value, Value) {
         let prior = json!({"epoch":213,"unit":{"Id":"old.service"},"launch_invocation_id":"a".repeat(32),"launch_receipt":"/old/launch.json","launch_receipt_sha256":"b".repeat(64)});
