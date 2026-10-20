@@ -32,7 +32,7 @@ digest/length are known:
   "initial_anchor": {"path": "/absolute/sealed/rpc-evidence.json", "sha256": "fc635af1c740bd0a1a9a81b141631e49a43d625b0dffffc1d187d3106f2845e8"},
   "archive_sha256": "EXACT_VERIFIED_ARCHIVE_SHA256",
   "archive_bytes": 1,
-  "publication_stage": "/var/lib/jetstreamer/horizon-213-publication-stage-UNIQUE",
+  "publication_stage": "/var/lib/jetstreamer/horizon-213-publication-work-UNIQUE/stage",
   "receipt_directory": "/absolute/root-private/publication",
   "full_receipt_directory": "/absolute/root-private/full/receipts",
   "plugin_receipt_directory": "/absolute/root-private/plugin/receipts",
@@ -47,6 +47,16 @@ Replace `archive_bytes` with the measured exact nonzero length, capped at 128 Gi
 All three receipt directories must already exist as distinct canonical,
 root-owned mode-0700 directories. The publication stage must be absent. A
 nonempty or previous attempt is never overwritten or silently repaired.
+
+For a strict systemd sandbox, pre-create only the dedicated
+`horizon-213-publication-work-UNIQUE` parent as root-owned mode 0755 on the public
+archive's filesystem. Keep its `stage` child absent. Grant `ReadWritePaths=` to
+that dedicated parent, the one verified-copy directory, the named receipt
+directories and the public directory; do not grant the entire `/var/lib/jetstreamer`
+tree. The parent must permit traversal after the permanent UID1000 drop while
+remaining non-writable to that UID; the newly created stage is owner-only. The
+legacy direct-child stage namespace remains supported, but naming an absent
+stage itself as a required writable mount fails before the publisher starts.
 
 The publisher rehashes the bound private verification receipt, its plan, producer
 outcome, independent provenance expectation, pinned verifier/pipeline executables,

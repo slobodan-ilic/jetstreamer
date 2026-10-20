@@ -197,11 +197,25 @@ fn validate_plan(plan: &Plan) -> Result<()> {
             && plan.initial_anchor.sha256 == ANCHOR_EVIDENCE,
         "archive/anchor scope differs"
     );
+    let legacy_stage = plan.publication_stage.parent() == Some(Path::new("/var/lib/jetstreamer"))
+        && plan.publication_stage.file_name().is_some_and(|n| {
+            n.to_string_lossy()
+                .starts_with("horizon-213-publication-stage-")
+        });
+    // A pre-existing, root-owned work parent can be the sole writable sandbox
+    // mount while the actual no-clobber stage remains absent until admission.
+    // Root ownership, non-writability and same-filesystem checks still run
+    // immediately before any stage or sink is created.
+    let bounded_work_stage = plan.publication_stage.file_name() == Some("stage".as_ref())
+        && plan.publication_stage.parent().is_some_and(|parent| {
+            parent.parent() == Some(Path::new("/var/lib/jetstreamer"))
+                && parent.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("horizon-213-publication-work-")
+                })
+        });
     ensure!(
-        plan.publication_stage.parent() == Some(Path::new("/var/lib/jetstreamer"))
-            && plan.publication_stage.file_name().is_some_and(|n| n
-                .to_string_lossy()
-                .starts_with("horizon-213-publication-stage-")),
+        legacy_stage || bounded_work_stage,
         "wrong private handoff namespace"
     );
     ensure!(
@@ -523,6 +537,7 @@ fn run(binding: Evidence, self_sha: &str) -> Result<()> {
     ensure!(
         stage_parent.uid() == 0
             && stage_parent.mode() & 0o022 == 0
+            && stage_parent.mode() & 0o001 != 0
             && stage_parent.dev() == dm.dev(),
         "unsafe/cross-filesystem handoff parent"
     );
@@ -776,6 +791,23 @@ mod tests {
         assert!(digest(&"a".repeat(64)).is_ok());
         for value in ["A".repeat(64), "b".repeat(63), "g".repeat(64)] {
             assert!(digest(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn dedicated_work_parent_keeps_absent_stage_inside_exact_private_namespace() {
+        let mut p = plan();
+        p.publication_stage = "/var/lib/jetstreamer/horizon-213-publication-work-test/stage".into();
+        validate_plan(&p).unwrap();
+        for path in [
+            "/var/lib/jetstreamer/other/stage",
+            "/var/lib/jetstreamer/horizon-214-publication-work-test/stage",
+            "/var/lib/jetstreamer/horizon-213-publication-work-test/other",
+            "/var/lib/jetstreamer/horizon-213-publication-work-test/nested/stage",
+            "/home/ubuntu/horizon-213-publication-work-test/stage",
+        ] {
+            p.publication_stage = path.into();
+            assert!(validate_plan(&p).is_err(), "{path}");
         }
     }
     #[test]
