@@ -255,3 +255,32 @@ wire bytes with that SDK's actual Transaction/Message serialization and MerkleTr
 Run it from `historical-runtime/v1_4_25` with its pinned compiler and bounded build
 jobs. Neither that synthetic fixture nor the modern decoder tests qualify a real
 ledger, the upstream full Entry implementation, or a runtime route.
+
+`horizon_legacy_shred::decode_v1_4_25_complete_slot_meta` bounds and decodes the
+entire pinned fixed-int SlotMeta record, including both vector lengths, the
+boolean, children and every completed-data endpoint. It rejects trailing or
+partial records, unknown terminal indexes, noncontiguous consumed/received
+ranges, oversized vectors and duplicate/invalid endpoints. Its complete-slot
+profile is deliberately stricter than upstream `SlotMeta::is_full`: it also
+rejects received data beyond the terminal range. The assembly wrapper requires
+recorded connectivity and exact agreement between metadata and all assembled
+batch endpoints. This proves parsing/binding only, not metadata provenance.
+
+`horizon_legacy_poh::verify_v1_4_25_poh_chain` verifies each ordered decoded entry
+from an independently supplied parent hash, carrying tick work across batch
+boundaries. It executes the pinned ordinary-SHA/signature-root mixin semantics,
+checks every tick's exact work, extracts every hidden/final slot-ending hash at
+trusted tick ordinals and requires the independently supplied visible final hash.
+It rejects incomplete/extra work, zero-work entries, disabled hashing, wrong
+clock/scope/shape, reordered/corrupt chains and repeated boundary hashes. Hash
+work is bounded before execution; a caller guard also runs within long entries.
+Independent bounded execution and authenticated clock/parent/final inputs remain
+caller obligations. It never infers missing boundaries, uses Bank hashes as PoH
+hashes, or grants source, runtime or publication authority.
+
+Tests cover the complete synthetic metadata→shred→entry→PoH path and a tampered
+entry. The pinned Rust1.46 v1.4.25 SDK `hash`/`hashv` fixture independently supplies
+three golden boundary hashes and a bincode1.3.1 SlotMeta wire digest, asserted by
+the modern decoders. These are synthetic SDK primitive/layout checks, **not** a
+real-ledger run, upstream full Entry-crate qualification, recovered epoch141
+boundaries or canonical checkpoint/plugin/publication evidence.

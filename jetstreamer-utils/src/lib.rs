@@ -13,6 +13,9 @@ pub mod horizon_legacy_shred;
 /// Bounded diagnostic decoding of pinned Solana v1.4.25 entry batches.
 pub mod horizon_legacy_entry;
 
+/// Bounded diagnostic verification of pinned legacy entry/tick/PoH chains.
+pub mod horizon_legacy_poh;
+
 /// Bounded diagnostic collection of a complete flat RocksDB tar file set.
 pub mod horizon_ledger_tar;
 
