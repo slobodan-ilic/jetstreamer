@@ -1,6 +1,7 @@
 //! Derive narrowly scoped recovery evidence from a private Horizon archive.
 //!
-//! This command reads only independently decodable edge buckets. It never
+//! This command decodes only independent edge buckets. An explicit optional
+//! whole-source hash binds the complete bytes without claiming a full decode. It never
 //! mutates the archive, creates a canonical checksum sidecar, or talks to R2.
 //! A recovered segment manifest still has to pass the complete archive reread
 //! performed by `jetstreamer-segment-recover`.
@@ -15,7 +16,8 @@ use {
         transactions::Transaction,
     },
     jetstreamer_node::archive_checksum::{
-        archive_file_identity, open_regular_nofollow, path_matches_archive_identity,
+        ArchiveFileIdentity, archive_file_identity, measure_open_archive, open_regular_nofollow,
+        path_matches_archive_identity,
     },
     serde::Serialize,
     solana_hash::Hash,
@@ -38,6 +40,7 @@ const DECODER_STACK_BYTES: usize = 64 * 1024 * 1024;
 struct Arguments {
     archive: PathBuf,
     output: PathBuf,
+    hash_source: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,6 +209,8 @@ struct EpochEvidence {
     archive: PathBuf,
     archive_bytes: u64,
     source_identity: SourceIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    whole_source_sha256: Option<String>,
     runtime_profile: String,
     parent_recorded_worker_executable_sha256: String,
     output_start_slot: u64,
@@ -301,15 +306,17 @@ struct Evidence {
 }
 
 fn usage(program: &str) -> String {
-    format!("usage: {program} <archive.jet> --output <private-evidence.json>")
+    format!("usage: {program} <archive.jet> --output <private-evidence.json> [--hash-source]")
 }
 
 fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Arguments, String> {
     let mut archive = None;
     let mut output = None;
+    let mut hash_source = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--hash-source" if !hash_source => hash_source = true,
             "--output" if output.is_none() => {
                 output = Some(
                     arguments
@@ -328,7 +335,19 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
     Ok(Arguments {
         archive: archive.ok_or_else(|| "missing archive path".to_string())?,
         output: output.ok_or_else(|| "missing --output path".to_string())?,
+        hash_source,
     })
+}
+
+fn whole_source_hash(file: &File, expected: ArchiveFileIdentity) -> Result<String, String> {
+    let measured = measure_open_archive(file)
+        .map_err(|error| format!("whole-source measurement failed: {error}"))?;
+    if measured.identity != expected {
+        return Err("archive changed before whole-source measurement".to_string());
+    }
+    Ok(jetstreamer_node::segment_manifest::sha256_hex_string(
+        &measured.sha256,
+    ))
 }
 
 fn read_bucket(path: &Path, index: usize) -> Result<EdgeVisitor, String> {
@@ -365,6 +384,11 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
         .metadata()
         .map_err(|error| format!("failed to inspect {}: {error}", archive.display()))?;
     let archive_bytes = metadata.len();
+    let whole_source_sha256 = if arguments.hash_source {
+        Some(whole_source_hash(&file, identity)?)
+    } else {
+        None
+    };
     let reader = ArchiveReader::open(BufReader::with_capacity(16 << 20, file))
         .map_err(|error| format!("failed to open Horizon archive: {error}"))?;
     let header = reader.header().clone();
@@ -452,6 +476,7 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
             archive,
             archive_bytes,
             source_identity: SourceIdentity::from(&metadata),
+            whole_source_sha256,
             runtime_profile,
             parent_recorded_worker_executable_sha256,
             output_start_slot: header.slot_start,
@@ -611,6 +636,7 @@ mod tests {
             Arguments {
                 archive: "/private/epoch-151.jet".into(),
                 output: "/private/edge.json".into(),
+                hash_source: false,
             }
         );
         assert!(parse_arguments(["/private/epoch-151.jet".to_string()]).is_err());
@@ -623,6 +649,44 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn source_hash_is_explicit_and_duplicate_flags_fail_closed() {
+        let args = [
+            "/private/epoch-140.jet",
+            "--output",
+            "/private/hash.json",
+            "--hash-source",
+        ];
+        assert!(
+            parse_arguments(args.map(str::to_owned))
+                .unwrap()
+                .hash_source
+        );
+        let mut repeated = args.map(str::to_owned).to_vec();
+        repeated.push("--hash-source".into());
+        assert!(parse_arguments(repeated).is_err());
+    }
+
+    #[test]
+    fn whole_source_hash_binds_all_bytes_without_changing_cursor_or_contents() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"abc").unwrap();
+        file.as_file_mut().seek(SeekFrom::Start(1)).unwrap();
+        let identity = archive_file_identity(file.as_file()).unwrap();
+        assert_eq!(
+            whole_source_hash(file.as_file(), identity).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(file.as_file_mut().stream_position().unwrap(), 1);
+        file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"abc");
+        file.as_file().set_len(4).unwrap();
+        assert!(whole_source_hash(file.as_file(), identity).is_err());
     }
 
     #[test]
