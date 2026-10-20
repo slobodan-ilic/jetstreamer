@@ -54,6 +54,10 @@ name = "jetstreamer-epoch141-ledger-metadata"
 path = "src/epoch141_ledger_metadata_bin.rs"
 
 [[bin]]
+name = "jetstreamer-epoch141-ledger-download"
+path = "src/epoch141_ledger_download_bin.rs"
+
+[[bin]]
 name = "jetstreamer-horizon-boundary-bridge"
 path = "src/horizon_boundary_bridge_bin.rs"
 
@@ -113,6 +117,9 @@ bs58 = { workspace = true, features = ["alloc"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 sha2.workspace = true
+md-5.workspace = true
+base64.workspace = true
+crc.workspace = true
 anyhow.workspace = true
 tar.workspace = true
 bzip2 = "=0.4.4"
