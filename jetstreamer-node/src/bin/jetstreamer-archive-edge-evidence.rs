@@ -24,7 +24,7 @@ use {
         env,
         fs::{self, File, OpenOptions},
         io::{BufReader, Write},
-        os::unix::fs::OpenOptionsExt as _,
+        os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
         path::{Path, PathBuf},
         process,
     },
@@ -205,7 +205,9 @@ impl SlotVisitor for EdgeVisitor {
 struct EpochEvidence {
     archive: PathBuf,
     archive_bytes: u64,
+    source_identity: SourceIdentity,
     runtime_profile: String,
+    parent_recorded_worker_executable_sha256: String,
     output_start_slot: u64,
     observed_first_write_version: u64,
     terminal_slot: u64,
@@ -215,6 +217,46 @@ struct EpochEvidence {
     derived_terminal_checkpoint_write_count: u64,
     checkpoint_write_derivation: &'static str,
     observed_terminal_blockhash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceIdentity {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    uid: u32,
+    gid: u32,
+    mode: String,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl From<&fs::Metadata> for SourceIdentity {
+    fn from(m: &fs::Metadata) -> Self {
+        Self {
+            device: m.dev(),
+            inode: m.ino(),
+            bytes: m.len(),
+            uid: m.uid(),
+            gid: m.gid(),
+            mode: format!("{:04o}", m.mode() & 0o7777),
+            modified_seconds: m.mtime(),
+            modified_nanoseconds: m.mtime_nsec(),
+            changed_seconds: m.ctime(),
+            changed_nanoseconds: m.ctime_nsec(),
+        }
+    }
+}
+
+fn recorded_worker_digest(digest: &[u8; 32]) -> Result<String, String> {
+    if *digest == [0; 32] {
+        return Err("single-runtime V2 worker digest must not be zero".to_string());
+    }
+    Ok(jetstreamer_node::segment_manifest::sha256_hex_string(
+        digest,
+    ))
 }
 
 fn terminal_checkpoint_write_count(
@@ -319,10 +361,10 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
         .map_err(|error| format!("failed to open {}: {error}", archive.display()))?;
     let identity = archive_file_identity(&file)
         .map_err(|error| format!("failed to identify {}: {error}", archive.display()))?;
-    let archive_bytes = file
+    let metadata = file
         .metadata()
-        .map_err(|error| format!("failed to inspect {}: {error}", archive.display()))?
-        .len();
+        .map_err(|error| format!("failed to inspect {}: {error}", archive.display()))?;
+    let archive_bytes = metadata.len();
     let reader = ArchiveReader::open(BufReader::with_capacity(16 << 20, file))
         .map_err(|error| format!("failed to open Horizon archive: {error}"))?;
     let header = reader.header().clone();
@@ -334,6 +376,8 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
         return Err("archive edge recovery requires single-runtime V2 provenance".to_string());
     };
     let runtime_profile = provenance.base.runtime_profile.clone();
+    let parent_recorded_worker_executable_sha256 =
+        recorded_worker_digest(&provenance.worker_executable_sha256)?;
     let bucket_count = reader.bucket_count();
     if bucket_count == 0 {
         return Err("archive has no buckets".to_string());
@@ -407,7 +451,9 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
         EpochEvidence {
             archive,
             archive_bytes,
+            source_identity: SourceIdentity::from(&metadata),
             runtime_profile,
+            parent_recorded_worker_executable_sha256,
             output_start_slot: header.slot_start,
             observed_first_write_version: first_write,
             terminal_slot: terminal.slot,
@@ -508,6 +554,50 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_worker_digest_preserves_all_bytes_and_rejects_zero() {
+        let digest = std::array::from_fn(|i| i as u8);
+        assert_eq!(
+            recorded_worker_digest(&digest).unwrap(),
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        );
+        assert!(recorded_worker_digest(&[0; 32]).is_err());
+        let mut sparse = [0; 32];
+        sparse[31] = 1;
+        assert_eq!(
+            recorded_worker_digest(&sparse).unwrap(),
+            format!("{}01", "00".repeat(31))
+        );
+    }
+
+    #[test]
+    fn source_identity_retains_exact_inode_metadata_in_json() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(123).unwrap();
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o440))
+            .unwrap();
+        let metadata = file.as_file().metadata().unwrap();
+        let value = serde_json::to_value(SourceIdentity::from(&metadata)).unwrap();
+        assert_eq!(value["device"].as_u64(), Some(metadata.dev()));
+        assert_eq!(value["inode"].as_u64(), Some(metadata.ino()));
+        assert_eq!(value["bytes"].as_u64(), Some(123));
+        assert_eq!(value["uid"].as_u64(), Some(u64::from(metadata.uid())));
+        assert_eq!(value["gid"].as_u64(), Some(u64::from(metadata.gid())));
+        assert_eq!(value["mode"], "0440");
+        assert_eq!(value["modified_seconds"].as_i64(), Some(metadata.mtime()));
+        assert_eq!(
+            value["modified_nanoseconds"].as_i64(),
+            Some(metadata.mtime_nsec())
+        );
+        assert_eq!(value["changed_seconds"].as_i64(), Some(metadata.ctime()));
+        assert_eq!(
+            value["changed_nanoseconds"].as_i64(),
+            Some(metadata.ctime_nsec())
+        );
+    }
 
     #[test]
     fn arguments_require_one_archive_and_output() {
