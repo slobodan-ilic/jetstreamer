@@ -52,6 +52,7 @@ struct Plan {
     tools: Tools,
     expected_epochs: Vec<u64>,
     cycle_directory: PathBuf,
+    cycle_unit: String,
     estimate_output: PathBuf,
     fleet_output: PathBuf,
     #[serde(default)]
@@ -308,6 +309,14 @@ fn validate_templates(
         p.schema == PLAN_SCHEMA && p.bucket == BUCKET && is_sha(&p.endpoint_sha256),
         "invalid cycle scope"
     );
+    ensure!(
+        p.cycle_unit
+            == format!(
+                "horizon-routine-cycle-{}-v1.service",
+                stamp(&p.sample_target_utc)
+            ),
+        "routine unit name mismatch"
+    );
     let target = utc_seconds(&p.sample_target_utc)?;
     let old_time = old_observer["recorded_at_utc"]
         .as_str()
@@ -563,6 +572,73 @@ fn child(tool: &Bound, args: &[String], credentials: bool) -> Result<()> {
     Ok(())
 }
 
+fn validate_service(
+    properties: &BTreeMap<String, String>,
+    unit: &str,
+    invocation: &str,
+    pid: u32,
+) -> Result<()> {
+    ensure!(
+        invocation.len() == 32
+            && invocation
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid invocation ID"
+    );
+    for (key, value) in [
+        ("Id", unit),
+        ("InvocationID", invocation),
+        ("NRestarts", "0"),
+        ("Restart", "no"),
+        ("KillMode", "control-group"),
+        ("Delegate", "no"),
+        ("Type", "oneshot"),
+        ("TimeoutStartUSec", "10min"),
+    ] {
+        ensure!(
+            properties.get(key).is_some_and(|v| v == value),
+            "routine service property {key} differs"
+        );
+    }
+    ensure!(
+        properties.get("MainPID") == Some(&pid.to_string())
+            && properties
+                .get("ActiveState")
+                .is_some_and(|v| v == "activating" || v == "active"),
+        "not the exact active routine service"
+    );
+    Ok(())
+}
+
+fn authenticate_service(p: &Plan) -> Result<String> {
+    ensure!(
+        p.cycle_unit
+            == format!(
+                "horizon-routine-cycle-{}-v1.service",
+                stamp(&p.sample_target_utc)
+            ),
+        "routine unit name mismatch"
+    );
+    let invocation = env::var("INVOCATION_ID")
+        .context("actual cycle requires its bounded persistent oneshot")?;
+    let output=Command::new("/usr/bin/systemctl").args(["show",&p.cycle_unit,"--no-pager","--no-ask-password",
+        "--property=Id,InvocationID,MainPID,NRestarts,Restart,KillMode,Delegate,ActiveState,Type,TimeoutStartUSec"]).output()?;
+    ensure!(
+        output.status.success() && output.stdout.len() < 16384,
+        "cannot authenticate routine service"
+    );
+    let mut fields = BTreeMap::new();
+    for line in std::str::from_utf8(&output.stdout)?.lines() {
+        let (key, value) = line.split_once('=').context("malformed service property")?;
+        ensure!(
+            fields.insert(key.into(), value.into()).is_none(),
+            "duplicate service property"
+        );
+    }
+    validate_service(&fields, &p.cycle_unit, &invocation, std::process::id())?;
+    Ok(invocation)
+}
+
 fn verify_estimates(
     p: &Plan,
     model: &Value,
@@ -662,6 +738,7 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
         println!("routine cycle preflight passed; no sampling, remote access or mutation");
         return Ok(());
     }
+    let invocation = authenticate_service(p)?;
     let bytes = read_checked(&p.observer, LIMIT, 0, false)?;
     let observer = Bound {
         path: p.observer.clone(),
@@ -680,7 +757,7 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
     write_new(
         &p.cycle_directory.join("intent.json"),
         &json!({"schema":"jetstreamer-horizon-routine-cycle-intent-v1",
-        "plan":plan_bound,"self_sha256":self_sha,"observer":observer,"sampled_at_utc":p.sample_target_utc,
+        "plan":plan_bound,"self_sha256":self_sha,"observer":observer,"sampled_at_utc":p.sample_target_utc,"invocation_id":invocation,
         "replay_launch_authorized":false,"archive_mutations":false}),
     )?;
     let result = (|| -> Result<Value> {
@@ -852,7 +929,7 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
         );
         Ok(
             json!({"schema":"jetstreamer-horizon-routine-cycle-completion-v1","plan":plan_bound,"self_sha256":self_sha,
-            "sampled_at_utc":p.sample_target_utc,"observer":observer,"model":model_bound,"estimates":estimate_bound,
+            "sampled_at_utc":p.sample_target_utc,"observer":observer,"model":model_bound,"estimates":estimate_bound,"invocation_id":invocation,
             "fleet_plan":fleet_bound,"fleet":{"path":p.fleet_output,"sha256":sha(&bytes)},"status_publications":receipts,
             "inventory":ledger["inventory"],"replay_launch_authorized":false,"archive_mutations":false,
             "sidecar_mutations":false,"deletions":false,"new_resource_samples":0}),
@@ -918,6 +995,7 @@ mod tests {
             "model_template":b("model"),"fleet_template":b("fleet-plan"),"previous_estimates":b("estimates"),
             "previous_fleet":b("fleet"),"tools":{"sealer":b("sealer"),"estimator":b("estimator"),"r2":b("r2")},
             "expected_epochs":[206],"cycle_directory":"/var/lib/jetstreamer/horizon-routine-cycles-v1/20261020T103442Z-v1",
+            "cycle_unit":"horizon-routine-cycle-20261020T103442Z-v1.service",
             "estimate_output":"/private/estimates/horizon-r2-status-estimates-20261020T103442Z-cohort-gated-v5.json",
             "fleet_output":"/var/lib/jetstreamer/horizon-campaign-fleet/20261020T103442Z-rust-v1/fleet-ledger.json"})).unwrap();
         let range = json!({"range":"206-206","epochs":[206],"archive_directory":"/private/archives",
@@ -1179,12 +1257,47 @@ mod tests {
     fn source_executes_only_fixed_metadata_subcommands_not_replay_or_delete() {
         let source = include_str!("routine_cycle.rs");
         let implementation = source.split("#[cfg(test)]").next().unwrap();
-        assert!(!implementation.contains("Command::new(\"systemctl\")"));
+        assert!(!implementation.contains("\"start\".into()"));
         assert!(!implementation.contains("\"sync\".into()"));
         assert!(!implementation.contains("\"status-delete\""));
         assert!(!implementation.contains("remove_file("));
         assert!(!implementation.contains("remove_dir("));
         assert!(implementation.contains("\"status-publish\".into()"));
         assert!(implementation.contains("\"fleet-reconcile\".into()"));
+    }
+
+    #[test]
+    fn real_cycle_requires_exact_nonrestarting_bounded_oneshot_identity() {
+        let id = "a".repeat(32);
+        let unit = "horizon-routine-cycle-20261020T103442Z-v1.service";
+        let fields = BTreeMap::from([
+            ("Id".into(), unit.into()),
+            ("InvocationID".into(), id.clone()),
+            ("MainPID".into(), "123".into()),
+            ("NRestarts".into(), "0".into()),
+            ("Restart".into(), "no".into()),
+            ("KillMode".into(), "control-group".into()),
+            ("Delegate".into(), "no".into()),
+            ("Type".into(), "oneshot".into()),
+            ("TimeoutStartUSec".into(), "10min".into()),
+            ("ActiveState".into(), "activating".into()),
+        ]);
+        validate_service(&fields, unit, &id, 123).unwrap();
+        for (key, value) in [
+            ("Id", "wrong.service"),
+            ("InvocationID", "different"),
+            ("MainPID", "124"),
+            ("NRestarts", "1"),
+            ("Restart", "always"),
+            ("KillMode", "process"),
+            ("Delegate", "yes"),
+            ("Type", "simple"),
+            ("TimeoutStartUSec", "infinity"),
+            ("ActiveState", "inactive"),
+        ] {
+            let mut bad = fields.clone();
+            bad.insert(key.into(), value.into());
+            assert!(validate_service(&bad, unit, &id, 123).is_err(), "{key}");
+        }
     }
 }
