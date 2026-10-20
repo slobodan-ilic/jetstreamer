@@ -36,7 +36,12 @@ fn worker_member(plan: &Plan) -> &'static str {
 }
 
 fn probe_paths(plan: &Plan) -> (PathBuf, PathBuf) {
-    if plan.epoch == 225 {
+    if plan.epoch224_bounded_measurement {
+        (
+            plan.probe_root.join("ledger"),
+            plan.probe_root.join("output/epoch-224-canary.jet"),
+        )
+    } else if plan.epoch == 225 {
         (
             plan.probe_root.join("ledger"),
             plan.probe_root.join("output/epoch-225.jet"),
@@ -55,6 +60,8 @@ fn probe_paths(plan: &Plan) -> (PathBuf, PathBuf) {
 #[serde(deny_unknown_fields)]
 struct Plan {
     schema: String,
+    #[serde(default)]
+    epoch224_bounded_measurement: bool,
     epoch: u64,
     bootstrap_slot: u64,
     terminal_slot: u64,
@@ -113,6 +120,7 @@ struct ProbeReceipt {
 
 #[derive(Debug, Serialize)]
 struct PlanReceipt {
+    epoch224_bounded_measurement: bool,
     bootstrap_slot: u64,
     output_slot_start: u64,
     epoch_end_slot: u64,
@@ -723,6 +731,13 @@ fn process_references(probe_root: &Path, worker: &Path) -> Result<Vec<String>> {
 fn validate_plan(plan: &Plan) -> Result<()> {
     ensure!(plan.schema == PLAN_SCHEMA, "plan schema mismatch");
     ensure!(
+        !plan.epoch224_bounded_measurement
+            || (plan.epoch == 224
+                && plan.node_sha256
+                    == "bcb76f90515465ee3b19486a18da907d15d4a3fbe310d66e0c3912a5daa4e257"),
+        "bounded measurement layout requires the exact epoch224 parent"
+    );
+    ensure!(
         (203..=212).contains(&plan.epoch) || matches!(plan.epoch, 224 | 225),
         "epoch outside focused capability range"
     );
@@ -974,7 +989,7 @@ fn run() -> Result<()> {
     for directory in [&destination, &private_root, &scratch] {
         mkdir_owned(directory, plan.run_uid, plan.run_gid)?;
     }
-    if plan.epoch == 225 {
+    if plan.epoch == 225 || plan.epoch224_bounded_measurement {
         mkdir_owned(&plan.probe_root.join("output"), plan.run_uid, plan.run_gid)?;
     }
     fsync_directory(&plan.probe_root)?;
@@ -1052,6 +1067,7 @@ fn run() -> Result<()> {
         probe_sha256,
         epoch: plan.epoch,
         plan: PlanReceipt {
+            epoch224_bounded_measurement: plan.epoch224_bounded_measurement,
             bootstrap_slot: plan.bootstrap_slot,
             output_slot_start: plan.epoch * EPOCH_SLOTS,
             epoch_end_slot: epoch_end,
@@ -1144,6 +1160,7 @@ mod tests {
 
     fn plan() -> Plan {
         Plan {
+            epoch224_bounded_measurement: false,
             schema: PLAN_SCHEMA.to_string(),
             epoch: 209,
             bootstrap_slot: 90_287_519,
@@ -1195,6 +1212,23 @@ mod tests {
         current.probe_root = "/home/ubuntu/.jetstreamer-private/qualification-224/package-capability-probe-rust-01879c4-v4".into();
         current.receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch224-complete-span-package-capability-01879c4-rust-test.json".into();
         validate_plan(&current).unwrap();
+        let (legacy_destination, legacy_archive) = probe_paths(&current);
+        assert_eq!(legacy_destination, current.probe_root.join("dest"));
+        assert_eq!(
+            legacy_archive,
+            legacy_destination.join("epoch-224-through-97631459.jet")
+        );
+        current.epoch224_bounded_measurement = true;
+        assert!(validate_plan(&current).is_err());
+        current.node_sha256 =
+            "bcb76f90515465ee3b19486a18da907d15d4a3fbe310d66e0c3912a5daa4e257".into();
+        validate_plan(&current).unwrap();
+        let (ledger, archive) = probe_paths(&current);
+        assert_eq!(ledger, current.probe_root.join("ledger"));
+        assert_eq!(
+            archive,
+            current.probe_root.join("output/epoch-224-canary.jet")
+        );
         assert_eq!(
             worker_member(&current),
             "jetstreamer-historical-worker-v1-6-25"
@@ -1228,6 +1262,15 @@ mod tests {
         let missing = plan.probe_root.join("missing").join(&plan.snapshot_name);
         let text = expected_log_markers(&plan, &missing).join("\n");
         validate_output(&plan, &missing, &output(&text, 1)).unwrap();
+    }
+
+    #[test]
+    fn bounded_measurement_layout_cannot_be_transferred_to_other_epochs() {
+        let mut plan = plan();
+        plan.epoch224_bounded_measurement = true;
+        assert!(validate_plan(&plan).is_err());
+        plan.epoch = 225;
+        assert!(validate_plan(&plan).is_err());
     }
 
     #[test]

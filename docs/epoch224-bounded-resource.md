@@ -34,6 +34,15 @@ Immediately bind its actual invocation to the reviewed standalone reserve/VMA
 guard, including the copied worker path and target-drainage handoff, and require
 the first real sandboxed guard fire to succeed before leaving it unattended.
 
+For the exact private command probe, the reviewed
+`jetstreamer-focused-capability-probe` plan accepts
+`"epoch224_bounded_measurement": true` only for this epoch and parent digest.
+It uses the runner's `ledger` and `output/epoch-224-canary.jet` layout while
+retaining the complete-span route, three checkpoints, deliberately absent
+snapshot, full package hashing, no-artifact checks, and process-reference scan.
+Older plans omit the field and retain their original layout. This capability
+receipt does not test snapshot restoration or authorize replay.
+
 The shared runner freezes its child group to preserve live AccountsDb resource
 measurements before controlled shutdown. Its no-clobber receipts distinguish a
 target stop from pre-target failure, timeout, or external stop. Neither a target
