@@ -241,7 +241,7 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("horizon-213-private-scan-"))
             && receipt["verifier_sha256"]
-                == "d1395fc0a002c2c7253811b2002186dff8839bab4eb070f32328413a3212bd38"
+                == "8e5eaec04296ecdba0f6a284eaef5a0ee761ce5b30690ba13e97b9956eb86ba7"
             && receipt["producer_invocation_id"] == "1dfd29e7ced140b3ba407359cbdc0ee1"
             && receipt["provenance_expectation_sha256"]
                 == "f7bb330186a8fbcc438b0fa49e903af5be5a1c30092f7cd434a86f6b2916bea5"
@@ -1109,7 +1109,7 @@ mod tests {
                 sha256: "b".repeat(64),
             },
         };
-        let receipt = json!({"schema":"jetstreamer-private-epoch213-verification-launch-v1","launched":true,"epoch":213,"private_run_root":claim.scratch_path,"verifier_sha256":"d1395fc0a002c2c7253811b2002186dff8839bab4eb070f32328413a3212bd38","producer_invocation_id":"1dfd29e7ced140b3ba407359cbdc0ee1","provenance_expectation_sha256":"f7bb330186a8fbcc438b0fa49e903af5be5a1c30092f7cd434a86f6b2916bea5","plan_sha256":"c".repeat(64),"replay_entries_authorized":false,"canonical_sidecar_authorized":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false,"evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,"restarts":0,"load_state":"loaded","active_state":"active","sub_state":"running","main_pid":123,"result":"success"}]}});
+        let receipt = json!({"schema":"jetstreamer-private-epoch213-verification-launch-v1","launched":true,"epoch":213,"private_run_root":claim.scratch_path,"verifier_sha256":"8e5eaec04296ecdba0f6a284eaef5a0ee761ce5b30690ba13e97b9956eb86ba7","producer_invocation_id":"1dfd29e7ced140b3ba407359cbdc0ee1","provenance_expectation_sha256":"f7bb330186a8fbcc438b0fa49e903af5be5a1c30092f7cd434a86f6b2916bea5","plan_sha256":"c".repeat(64),"replay_entries_authorized":false,"canonical_sidecar_authorized":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false,"evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,"restarts":0,"load_state":"loaded","active_state":"active","sub_state":"running","main_pid":123,"result":"success"}]}});
         validate_diagnostic_launch(&receipt, &claim).unwrap();
         for (key, value) in [
             ("verifier_sha256", json!("0".repeat(64))),
