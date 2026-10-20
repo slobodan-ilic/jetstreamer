@@ -5,6 +5,8 @@
 #[allow(dead_code)]
 #[path = "epoch141_ledger_common.rs"]
 mod epoch141_ledger_common;
+#[path = "epoch141_protection_transition.rs"]
+mod epoch141_protection_transition;
 
 use {
     anyhow::{Context, Result, ensure},
@@ -53,6 +55,8 @@ struct Plan {
     maximum_total_bytes: u64,
     maximum_trailer_bytes: u64,
     retention: Option<Retention>,
+    #[serde(default)]
+    protection_transition: Option<Bound>,
 }
 
 #[derive(Deserialize)]
@@ -194,7 +198,11 @@ fn validate_bounds(plan: &Plan, retain: bool) -> Result<()> {
         "wrong fixed executable profile or plan schema"
     );
     ensure!(
-        plan.minimum_free_bytes >= 5_153_013_784_006
+        (plan.minimum_free_bytes >= 5_153_013_784_006
+            || (retain
+                && plan.retention.is_some()
+                && plan.protection_transition.is_some()
+                && plan.minimum_free_bytes >= 205_211_459_014))
             && (60..=43200).contains(&plan.maximum_runtime_seconds)
             && (1..=100_000).contains(&plan.maximum_files)
             && (1..=512 * 1024 * 1024 * 1024).contains(&plan.maximum_file_bytes)
@@ -376,10 +384,13 @@ pub(crate) fn run(retain: bool) -> Result<()> {
         false,
     )?)?;
     validate_source(&source)?;
+    // Source integrity is permanent; its old scheduling reservations are not.
+    // A complete-retention transition must independently prove the new envelope.
+    let source_floor = source["minimum_free_bytes"]
+        .as_u64()
+        .context("missing source protected floor")?;
     ensure!(
-        source["minimum_free_bytes"]
-            .as_u64()
-            .is_some_and(|n| plan.minimum_free_bytes >= n),
+        plan.minimum_free_bytes >= source_floor || (retain && plan.protection_transition.is_some()),
         "weakened source protected floor"
     );
     let input = Path::new(INPUT);
@@ -422,6 +433,20 @@ pub(crate) fn run(retain: bool) -> Result<()> {
         &executable,
         &values["--self-sha256"],
     )?;
+    if let Some(transition) = &plan.protection_transition {
+        ensure!(retain, "protection transition is retention-only");
+        let retained = plan.retention.as_ref().context("missing retention")?;
+        epoch141_protection_transition::validate(
+            &transition.path,
+            &transition.sha256,
+            &plan.source_verification.sha256,
+            &retained.complete_census.sha256,
+            source_floor,
+            plan.minimum_free_bytes,
+            &manifest,
+            now()?,
+        )?;
+    }
     let m = fs::symlink_metadata(&plan.admission_receipt)?;
     let age = now()?
         .checked_sub(u64::try_from(m.mtime())?)
@@ -445,6 +470,7 @@ pub(crate) fn run(retain: bool) -> Result<()> {
                 else {"jetstreamer-epoch141-ledger-census-initial-guard-v1"}, "epoch":141,
             "invocation_id":invocation,"plan_sha256":values["--plan-sha256"],
             "self_sha256":values["--self-sha256"],"admission_receipt_sha256":values["--admission-sha256"],
+            "protection_transition_sha256":plan.protection_transition.as_ref().map(|p| &p.sha256),
             "available_bytes":free_before,"minimum_free_bytes":plan.minimum_free_bytes,
             "trip":false,"files_retained":false,"retention_planned":retain,"publication_authorized":false,
             "remote_mutations":false,"r2_mutations":false
@@ -525,6 +551,7 @@ pub(crate) fn run(retain: bool) -> Result<()> {
             "recorded_unix_seconds":now()?, "invocation_id":invocation,
             "self_sha256":values["--self-sha256"], "plan_sha256":values["--plan-sha256"],
             "source_verification_sha256":plan.source_verification.sha256,
+            "protection_transition_sha256":plan.protection_transition.as_ref().map(|p| &p.sha256),
             "admission_manifest_sha256":plan.admission_manifest.sha256,
             "admission_receipt_sha256":values["--admission-sha256"], "input":INPUT,
             "uri":URI, "generation":GENERATION, "census":census,
@@ -569,6 +596,7 @@ mod tests {
             maximum_total_bytes: 4096,
             maximum_trailer_bytes: 4096,
             retention: None,
+            protection_transition: None,
         }
     }
 
@@ -785,6 +813,45 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("runtime")
+        );
+    }
+
+    #[test]
+    fn lower_protection_requires_explicit_retention_transition_not_census() {
+        let mut p = plan();
+        p.minimum_free_bytes = 4_740_696_923_590;
+        p.protection_transition = Some(Bound {
+            path: "/proof/transition.json".into(),
+            sha256: "5".repeat(64),
+        });
+        assert!(
+            validate_bounds(&p, false)
+                .unwrap_err()
+                .to_string()
+                .contains("bounds")
+        );
+        p.schema = "jetstreamer-epoch141-ledger-collection-plan-v1".into();
+        p.retention = Some(Retention {
+            complete_census: Bound {
+                path: "/proof/census.json".into(),
+                sha256: "4".repeat(64),
+            },
+            destination: "/private/retained".into(),
+            incremental_peak_bytes: 8192,
+        });
+        // Resource shape passes, but the synthetic output parent is absent.
+        assert!(
+            !validate_bounds(&p, true)
+                .unwrap_err()
+                .to_string()
+                .contains("bounds")
+        );
+        p.protection_transition = None;
+        assert!(
+            validate_bounds(&p, true)
+                .unwrap_err()
+                .to_string()
+                .contains("bounds")
         );
     }
 }
