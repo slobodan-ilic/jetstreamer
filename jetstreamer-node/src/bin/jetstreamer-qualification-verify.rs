@@ -14,9 +14,9 @@ use {
     solana_signature::Signature,
     std::{
         env, fs,
-        fs::File,
-        io::BufReader,
-        os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+        fs::{File, OpenOptions},
+        io::{BufReader, Write as _},
+        os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
         path::{Path, PathBuf},
         process,
         str::FromStr,
@@ -34,6 +34,7 @@ struct ConflictExpectation {
 struct Arguments {
     archive: PathBuf,
     private_root: PathBuf,
+    receipt: Option<PathBuf>,
     expected_epoch: u64,
     expected_output_start_slot: u64,
     expected_bootstrap_slot: u64,
@@ -53,6 +54,7 @@ fn usage(program: &str) -> String {
   --expected-terminal-slot=SLOT \
   --expected-runtime-profile=NAME \
   --expected-worker-sha256=HEX \
+  [--receipt=/PRIVATE/epoch-N.validation.json] \
   [--expected-conflict-slot=SLOT \
    --expected-conflict-account=ADDRESS \
    --expected-conflict-first=INDEX,SIGNATURE,LAMPORTS \
@@ -123,6 +125,7 @@ where
     let mut archive = None;
     let mut private_root = None;
     let mut expected_epoch = None;
+    let mut receipt = None;
     let mut expected_output_start_slot = None;
     let mut expected_bootstrap_slot = None;
     let mut expected_terminal_slot = None;
@@ -139,6 +142,11 @@ where
                 return Err("--private-root must not be empty".to_string());
             }
             take_once(&mut private_root, PathBuf::from(value), "private-root")?;
+        } else if let Some(value) = argument.strip_prefix("--receipt=") {
+            if value.is_empty() {
+                return Err("--receipt must not be empty".into());
+            }
+            take_once(&mut receipt, PathBuf::from(value), "receipt")?;
         } else if let Some(value) = argument.strip_prefix("--expected-epoch=") {
             let value = parse_u64(value, "expected-epoch")?;
             take_once(&mut expected_epoch, value, "expected-epoch")?;
@@ -232,6 +240,7 @@ where
     Ok(Arguments {
         archive: archive.ok_or_else(|| "missing ARCHIVE".to_string())?,
         private_root: private_root.ok_or_else(|| "missing --private-root".to_string())?,
+        receipt,
         expected_epoch: expected_epoch.ok_or_else(|| "missing --expected-epoch".to_string())?,
         expected_output_start_slot: expected_output_start_slot
             .ok_or_else(|| "missing --expected-output-start-slot".to_string())?,
@@ -492,6 +501,93 @@ fn verify(arguments: &Arguments) -> Result<serde_json::Value, String> {
     }))
 }
 
+fn prepare_receipt_destination(path: &Path) -> Result<File, String> {
+    let parent = path.parent().ok_or("receipt needs a parent")?;
+    if !path.is_absolute()
+        || !path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.ends_with(".validation.json"))
+        || fs::canonicalize(parent).map_err(|e| e.to_string())? != parent
+    {
+        return Err(
+            "receipt requires an absolute canonical private parent and .validation.json filename"
+                .into(),
+        );
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(parent)
+        .map_err(|e| e.to_string())?;
+    let meta = directory.metadata().map_err(|e| e.to_string())?;
+    if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o6077 != 0 {
+        return Err(
+            "receipt parent must be owned by this reader, owner-only and without set-ID bits"
+                .into(),
+        );
+    }
+    require_absent(path, "validation receipt")?;
+    Ok(directory)
+}
+
+fn verify_and_record(arguments: &Arguments) -> Result<serde_json::Value, String> {
+    // Reject an unsafe/occupied destination before spending an archive reread.
+    let directory = arguments
+        .receipt
+        .as_deref()
+        .map(prepare_receipt_destination)
+        .transpose()?;
+    let receipt = verify(arguments)?;
+    if let (Some(path), Some(directory)) = (&arguments.receipt, directory) {
+        let current = prepare_receipt_destination(path)?;
+        let before = directory.metadata().map_err(|e| e.to_string())?;
+        let after = current.metadata().map_err(|e| e.to_string())?;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err("receipt parent changed during independent validation".into());
+        }
+        let mut bytes = serde_json::to_vec_pretty(&receipt).map_err(|e| e.to_string())?;
+        bytes.push(b'\n');
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        output
+            .write_all(&bytes)
+            .and_then(|_| output.sync_all())
+            .map_err(|e| e.to_string())?;
+        let named = fs::symlink_metadata(path.parent().ok_or("receipt parent missing")?)
+            .map_err(|e| e.to_string())?;
+        if !named.is_dir()
+            || named.dev() != before.dev()
+            || named.ino() != before.ino()
+            || named.uid() != before.uid()
+            || named.mode() & 0o6077 != 0
+        {
+            return Err("receipt parent changed during durable publication".into());
+        }
+        let written = output.metadata().map_err(|e| e.to_string())?;
+        let named = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !named.is_file()
+            || named.dev() != written.dev()
+            || named.ino() != written.ino()
+            || named.nlink() != 1
+            || named.len() != bytes.len() as u64
+            || named.uid() != unsafe { libc::geteuid() }
+            || named.mode() & 0o7777 != 0o400
+        {
+            return Err(
+                "validation receipt identity or permissions changed during publication".into(),
+            );
+        }
+        directory.sync_all().map_err(|e| e.to_string())?;
+    }
+    Ok(receipt)
+}
+
 fn main() {
     let mut arguments = env::args();
     let program = arguments
@@ -506,7 +602,7 @@ fn main() {
         eprintln!("error: {error}\n{}", usage(&program));
         process::exit(2);
     });
-    match verify(&arguments) {
+    match verify_and_record(&arguments) {
         Ok(receipt) => println!(
             "{}",
             serde_json::to_string_pretty(&receipt).expect("validation receipt is serializable")
@@ -582,6 +678,42 @@ mod tests {
         assert!(validate_sha256(&"A".repeat(64)).is_err());
         assert!(validate_sha256(&"a".repeat(63)).is_err());
         assert!(validate_sha256(&format!("{}g", "a".repeat(63))).is_err());
+    }
+
+    #[test]
+    fn optional_receipt_is_explicit_private_and_no_clobber() {
+        let mut raw = valid_arguments();
+        raw.push("--receipt=/private/epoch-202.validation.json".into());
+        assert_eq!(
+            parse_arguments(raw.clone()).unwrap().receipt,
+            Some(PathBuf::from("/private/epoch-202.validation.json"))
+        );
+        raw.push("--receipt=/private/other.validation.json".into());
+        assert!(
+            parse_arguments(raw)
+                .unwrap_err()
+                .contains("duplicate --receipt")
+        );
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let destination = root.path().join("epoch-1.validation.json");
+        prepare_receipt_destination(&destination).unwrap();
+        assert!(prepare_receipt_destination(&root.path().join("epoch-1.jet.sha256")).is_err());
+        assert!(prepare_receipt_destination(Path::new("relative.validation.json")).is_err());
+        fs::write(&destination, b"preserve existing receipt").unwrap();
+        assert!(prepare_receipt_destination(&destination).is_err());
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"preserve existing receipt"
+        );
+        let target = root.path().join("target");
+        fs::write(&target, b"preserve symlink target").unwrap();
+        let link = root.path().join("linked.validation.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(prepare_receipt_destination(&link).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"preserve symlink target");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(prepare_receipt_destination(&root.path().join("new.validation.json")).is_err());
     }
 
     #[test]
@@ -769,6 +901,7 @@ mod tests {
         let mut arguments = Arguments {
             archive: archive.clone(),
             private_root: directory.path().to_path_buf(),
+            receipt: None,
             expected_epoch: TEST_EPOCH,
             expected_output_start_slot: TEST_OUTPUT_START,
             expected_bootstrap_slot: TEST_BOOTSTRAP,
@@ -781,6 +914,20 @@ mod tests {
         assert_eq!(receipt["validation"], "pass");
         assert_eq!(receipt["canonical_checksum_sidecar_absent"], true);
         assert!(receipt["conflict_write_gate"].is_null());
+        let archive_bytes = fs::read(&archive).unwrap();
+        let destination = directory.path().join("epoch-1.validation.json");
+        arguments.receipt = Some(destination.clone());
+        let stored = verify_and_record(&arguments).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&destination).unwrap()).unwrap(),
+            stored
+        );
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert!(verify_and_record(&arguments).is_err());
+        assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
 
         arguments.expected_conflict = Some(ConflictExpectation {
             slot: TEST_OUTPUT_START,
@@ -809,5 +956,9 @@ mod tests {
                 .unwrap_err()
                 .contains("canonical checksum sidecar must be absent")
         );
+        let absent = directory.path().join("failed.validation.json");
+        arguments.receipt = Some(absent.clone());
+        assert!(verify_and_record(&arguments).is_err());
+        assert!(!absent.exists());
     }
 }

@@ -75,3 +75,11 @@ worker digest above. It still deeply rereads the complete archive and segment,
 checks the canonical root accounts hash and rejects any canonical sidecar. Do not
 rename the retained archive or relax another epoch's naming gate to fit an older
 validator. Prefix validation is not full-epoch or publication qualification.
+
+Use the validator's optional `--receipt=/PRIVATE/epoch-203-prefix.validation.json`
+to persist the independent result natively. The existing receipt parent must be
+canonical, owned by the reader and owner-only. The destination is checked before
+the scan, created without clobbering, written mode0400, and fsynced together with
+the bound parent directory. Failed validation writes no receipt; retain any
+interrupted write for explicit diagnosis rather than overwriting it. Without
+this option, the existing stdout-only interface is unchanged.
