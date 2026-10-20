@@ -45,6 +45,17 @@ const DIAGNOSTIC_MAX_ENTRY_SLOT_EXCLUSIVE: u64 = 96_767_527;
 const EPOCH224_V1_6_25_DIAGNOSTIC_SNAPSHOT_SLOT: u64 = 96_767_522;
 const EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT: u64 = 97_199_617;
 const EPOCH225_DIAGNOSTIC_END_EXCLUSIVE: u64 = 97_202_600;
+const EPOCH225_QUALIFICATION_END_EXCLUSIVE: u64 = 98_063_465;
+#[cfg(all(
+    feature = "epoch225-v1-6-25-qualification",
+    any(
+        feature = "epoch225-v1-6-25-diagnostic",
+        feature = "epoch224-v1-6-25-diagnostic",
+        feature = "epoch224-v1-6-25-qualification",
+        feature = "diagnostic-singleton"
+    )
+))]
+compile_error!("epoch225 full-span qualification cannot combine other diagnostic modes");
 #[cfg(all(
     feature = "epoch225-v1-6-25-diagnostic",
     any(
@@ -829,7 +840,11 @@ impl RuntimeState {
 }
 
 fn validate_candidate_snapshot_slot(slot: u64) -> Result<(), String> {
-    if cfg!(feature = "epoch225-v1-6-25-diagnostic") && slot != EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT {
+    if cfg!(any(
+        feature = "epoch225-v1-6-25-diagnostic",
+        feature = "epoch225-v1-6-25-qualification"
+    )) && slot != EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT
+    {
         return Err(format!(
             "epoch225 diagnostic requires exact snapshot {}",
             EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT
@@ -867,7 +882,10 @@ fn validate_candidate_entry_slot(slot: u64) -> Result<(), String> {
 }
 
 fn effective_min_supported_entry_slot() -> u64 {
-    if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
+    if cfg!(any(
+        feature = "epoch225-v1-6-25-diagnostic",
+        feature = "epoch225-v1-6-25-qualification"
+    )) {
         EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT + 1
     } else if cfg!(feature = "epoch224-v1-6-25-qualification") {
         EPOCH224_V1_6_25_DIAGNOSTIC_SNAPSHOT_SLOT + 1
@@ -877,7 +895,9 @@ fn effective_min_supported_entry_slot() -> u64 {
 }
 
 fn effective_max_supported_entry_slot_exclusive() -> u64 {
-    if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
+    if cfg!(feature = "epoch225-v1-6-25-qualification") {
+        EPOCH225_QUALIFICATION_END_EXCLUSIVE
+    } else if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
         EPOCH225_DIAGNOSTIC_END_EXCLUSIVE
     } else if cfg!(feature = "epoch224-v1-6-25-qualification") {
         EPOCH224_V1_6_25_QUALIFICATION_END_EXCLUSIVE
@@ -1568,7 +1588,10 @@ mod tests {
 
     #[test]
     fn candidate_range_is_closed_at_both_ends() {
-        if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
+        if cfg!(any(
+            feature = "epoch225-v1-6-25-diagnostic",
+            feature = "epoch225-v1-6-25-qualification"
+        )) {
             assert!(validate_candidate_snapshot_slot(EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT).is_ok());
             assert!(
                 validate_candidate_snapshot_slot(EPOCH225_DIAGNOSTIC_SNAPSHOT_SLOT - 1).is_err()
@@ -1606,7 +1629,9 @@ mod tests {
         assert!(validate_candidate_entry_slot(entry_end).is_err());
         assert_eq!(
             entry_end,
-            if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
+            if cfg!(feature = "epoch225-v1-6-25-qualification") {
+                EPOCH225_QUALIFICATION_END_EXCLUSIVE
+            } else if cfg!(feature = "epoch225-v1-6-25-diagnostic") {
                 EPOCH225_DIAGNOSTIC_END_EXCLUSIVE
             } else if cfg!(feature = "epoch224-v1-6-25-qualification") {
                 EPOCH224_V1_6_25_QUALIFICATION_END_EXCLUSIVE

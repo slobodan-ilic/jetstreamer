@@ -1,6 +1,19 @@
 mod checkpoint_continuation;
 mod epoch224_qualification;
 mod epoch225_diagnostic;
+mod epoch225_qualification;
+
+#[cfg(all(
+    feature = "epoch225-v1-6-25-qualification",
+    any(
+        feature = "epoch225-v1-6-25-diagnostic",
+        feature = "epoch224-v1-6-25-diagnostic",
+        feature = "epoch224-v1-6-25-qualification",
+        feature = "epoch224-account-delta-diagnostic",
+        feature = "epoch213-checkpoint-continuation-diagnostic"
+    )
+))]
+compile_error!("epoch225 full-span qualification cannot combine other diagnostic modes");
 
 #[cfg(all(
     feature = "epoch225-v1-6-25-diagnostic",
@@ -19068,7 +19081,11 @@ async fn main() {
             || cfg!(feature = "epoch224-v1-6-25-qualification")
             || cfg!(feature = "epoch224-v1-6-25-diagnostic")
             || cfg!(feature = "epoch224-account-delta-diagnostic");
-        let forbidden = forbidden || cfg!(feature = "epoch225-v1-6-25-diagnostic");
+        let forbidden = forbidden
+            || cfg!(any(
+                feature = "epoch225-v1-6-25-diagnostic",
+                feature = "epoch225-v1-6-25-qualification"
+            ));
         if let Err(error) = checkpoint_continuation::validate_cli(
             cfg!(feature = "epoch213-checkpoint-continuation-diagnostic"),
             (start_epoch, end_epoch),
@@ -19263,6 +19280,26 @@ async fn main() {
                 .zip(replay_scratch.as_deref())
                 .map(|(output, scratch)| (dest_dir.as_path(), output, scratch)),
         )
+    {
+        eprintln!("error: {error}");
+        exit(2);
+    }
+    if cfg!(feature = "epoch225-v1-6-25-qualification")
+        && let Err(error) = epoch225_qualification::validate_launch(
+            start_epoch,
+            end_epoch,
+            qualification.map(|plan| (plan.bootstrap_slot, plan.end_inclusive)),
+            root_checkpoint_cohort,
+            recover_staged_only
+                || recover_staged_cohort_only
+                || recover_unreceipted_root_cohort_only
+                || inherited_epoch_lease,
+            horizon_output
+                .as_deref()
+                .zip(replay_scratch.as_deref())
+                .map(|(output, scratch)| (dest_dir.as_path(), output, scratch)),
+        )
+        .and_then(|_| epoch225_qualification::validate_filesystem(dest_dir.as_path()))
     {
         eprintln!("error: {error}");
         exit(2);
@@ -23690,6 +23727,42 @@ mod early_snapshot_tests {
         )
         .unwrap_err();
         assert!(error.contains("immediate verification tail"), "{error}");
+    }
+
+    #[test]
+    fn epoch225_complete_span_plans_the_exact_output_and_private_successor_tail() {
+        let snapshot =
+            Path::new("snapshot-97199617-HE57JmgvEeZjBKN8cfTLrmyCbUnptJ9PWjUdTzgxSSdi.tar.zst");
+        let plan = qualification_plan(
+            225,
+            225,
+            Some(epoch225_qualification::OUTPUT_END_SLOT),
+            Some(true),
+            Some(snapshot),
+            Some(Path::new("epoch-hashes-225.txt")),
+            Some(Path::new("epoch-225.jet")),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.bootstrap_slot, epoch225_qualification::BOOTSTRAP_SLOT);
+        assert_eq!(plan.replay_start, 97_199_618);
+        assert_eq!(plan.output_slot_start, 97_200_000);
+        assert_eq!(plan.end_inclusive, 98_063_464);
+        let range = runtime_slot_range(225, Some(plan));
+        assert_eq!(range, 97_200_000..98_063_465);
+        let spans = plan_runtime_spans_for_invocation(range.clone(), true, true).unwrap();
+        assert_eq!(spans.len(), 1);
+        let selection = select_runtime_with_snapshot_warmup_for_invocation(
+            plan.replay_start,
+            range,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            selection.backend,
+            compatibility::RuntimeBackend::SolanaV1_6_20
+        );
     }
 
     #[test]

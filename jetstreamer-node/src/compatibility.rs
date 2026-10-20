@@ -1244,7 +1244,8 @@ pub static SOLANA_V1_6_20_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
         name: if cfg!(any(
             feature = "epoch224-v1-6-25-diagnostic",
             feature = "epoch224-v1-6-25-qualification",
-            feature = "epoch225-v1-6-25-diagnostic"
+            feature = "epoch225-v1-6-25-diagnostic",
+            feature = "epoch225-v1-6-25-qualification"
         )) {
             "solana-v1.6.25"
         } else {
@@ -1253,7 +1254,8 @@ pub static SOLANA_V1_6_20_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
         revision: if cfg!(any(
             feature = "epoch224-v1-6-25-diagnostic",
             feature = "epoch224-v1-6-25-qualification",
-            feature = "epoch225-v1-6-25-diagnostic"
+            feature = "epoch225-v1-6-25-diagnostic",
+            feature = "epoch225-v1-6-25-qualification"
         )) {
             SOLANA_V1_6_25_REVISION
         } else {
@@ -1273,7 +1275,8 @@ pub static SOLANA_V1_6_20_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
         identity: if cfg!(any(
             feature = "epoch224-v1-6-25-diagnostic",
             feature = "epoch224-v1-6-25-qualification",
-            feature = "epoch225-v1-6-25-diagnostic"
+            feature = "epoch225-v1-6-25-diagnostic",
+            feature = "epoch225-v1-6-25-qualification"
         )) {
             "jetstreamer-historical-worker-v1-6-25"
         } else {
@@ -1282,7 +1285,8 @@ pub static SOLANA_V1_6_20_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
         environment_override: if cfg!(any(
             feature = "epoch224-v1-6-25-diagnostic",
             feature = "epoch224-v1-6-25-qualification",
-            feature = "epoch225-v1-6-25-diagnostic"
+            feature = "epoch225-v1-6-25-diagnostic",
+            feature = "epoch225-v1-6-25-qualification"
         )) {
             "JETSTREAMER_HISTORICAL_WORKER_V1_6_25"
         } else {
@@ -1291,7 +1295,8 @@ pub static SOLANA_V1_6_20_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
         default_manifest_relative_path: if cfg!(any(
             feature = "epoch224-v1-6-25-diagnostic",
             feature = "epoch224-v1-6-25-qualification",
-            feature = "epoch225-v1-6-25-diagnostic"
+            feature = "epoch225-v1-6-25-diagnostic",
+            feature = "epoch225-v1-6-25-qualification"
         )) {
             "../historical-runtime/v1_6_25/target/release/jetstreamer-historical-worker-v1-6-25"
         } else {
@@ -2884,7 +2889,8 @@ mod tests {
                 if cfg!(any(
                     feature = "epoch224-v1-6-25-diagnostic",
                     feature = "epoch224-v1-6-25-qualification",
-                    feature = "epoch225-v1-6-25-diagnostic"
+                    feature = "epoch225-v1-6-25-diagnostic",
+                    feature = "epoch225-v1-6-25-qualification"
                 )) {
                     SOLANA_V1_6_25_REVISION
                 } else {
@@ -2893,7 +2899,8 @@ mod tests {
                 if cfg!(any(
                     feature = "epoch224-v1-6-25-diagnostic",
                     feature = "epoch224-v1-6-25-qualification",
-                    feature = "epoch225-v1-6-25-diagnostic"
+                    feature = "epoch225-v1-6-25-diagnostic",
+                    feature = "epoch225-v1-6-25-qualification"
                 )) {
                     "JETSTREAMER_HISTORICAL_WORKER_V1_6_25"
                 } else {
@@ -2902,7 +2909,8 @@ mod tests {
                 if cfg!(any(
                     feature = "epoch224-v1-6-25-diagnostic",
                     feature = "epoch224-v1-6-25-qualification",
-                    feature = "epoch225-v1-6-25-diagnostic"
+                    feature = "epoch225-v1-6-25-diagnostic",
+                    feature = "epoch225-v1-6-25-qualification"
                 )) {
                     "../historical-runtime/v1_6_25/target/release/jetstreamer-historical-worker-v1-6-25"
                 } else {
