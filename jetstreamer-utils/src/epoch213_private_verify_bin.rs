@@ -254,7 +254,6 @@ fn validate_terminal(text: &str) -> Result<()> {
         ("Restart", "no"),
         ("Result", "success"),
         ("ExecMainStatus", "0"),
-        ("ExecMainCode", "1"),
     ] {
         ensure!(
             fields.get(key) == Some(&expected),
@@ -264,6 +263,17 @@ fn validate_terminal(text: &str) -> Result<()> {
     ensure!(
         matches!(fields.get("InvocationID"), Some(&"") | Some(&INVOCATION)),
         "foreign producer invocation"
+    );
+    // Stopping a successful RemainAfterExit unit can clear both fields.
+    // terminal() still requires the exact producer completion and subsequent
+    // clean manager-deactivation journal; zero is never a standalone proof.
+    ensure!(
+        fields.get("ExecMainCode") == Some(&"1")
+            || (fields.get("ExecMainCode") == Some(&"0")
+                && fields.get("InvocationID") == Some(&"")
+                && fields.get("ActiveState") == Some(&"inactive")
+                && fields.get("SubState") == Some(&"dead")),
+        "producer not clean terminal: ExecMainCode"
     );
     ensure!(
         matches!(
@@ -634,6 +644,19 @@ mod tests {
             "InvocationID={INVOCATION}\nMainPID=0\nNRestarts=0\nRestart=no\nResult=success\nExecMainStatus=0\nExecMainCode=1\nActiveState=inactive\nSubState=dead\n"
         );
         validate_terminal(&good).unwrap();
+        let cleared = good
+            .replace(INVOCATION, "")
+            .replace("ExecMainCode=1", "ExecMainCode=0");
+        validate_terminal(&cleared).unwrap();
+        let original_invocation = format!("InvocationID={INVOCATION}");
+        for (old, new) in [
+            ("InvocationID=", original_invocation.as_str()),
+            ("ActiveState=inactive", "ActiveState=active"),
+            ("SubState=dead", "SubState=exited"),
+            ("Result=success", "Result=exit-code"),
+        ] {
+            assert!(validate_terminal(&cleared.replace(old, new)).is_err());
+        }
         for (old, new) in [
             (INVOCATION, "different"),
             ("MainPID=0", "MainPID=42"),
