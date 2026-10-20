@@ -1,8 +1,17 @@
 //! Proves why point-prefix scans cannot by themselves establish RocksDB live state.
-use jetstreamer_utils::horizon_ledger_tar::{CollectionLimits, collect_rocksdb_tar};
+use jetstreamer_utils::{
+    horizon_ledger_bzip::collect_bound_bzip2,
+    horizon_ledger_tar::{CollectionLimits, collect_rocksdb_tar},
+};
 use rocksdb::{ColumnFamilyDescriptor, DB, DBCompressionType, Options};
 use sha2::{Digest, Sha256};
-use std::{env, fs, io::Cursor, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    env, fs,
+    io::{Cursor, Write},
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::Command,
+};
 
 // A separate process exits without dropping DB, leaving acknowledged, synced
 // writes in the WAL rather than turning the fixture into an SST-only test.
@@ -142,7 +151,7 @@ fn native_readonly_resolves_manifest_and_wal() {
     fs::create_dir(&collected).unwrap();
     fs::set_permissions(&collected, fs::Permissions::from_mode(0o700)).unwrap();
     let census = collect_rocksdb_tar(
-        Cursor::new(bytes),
+        Cursor::new(&bytes),
         Path::new("rocksdb"),
         &collected,
         CollectionLimits {
@@ -153,6 +162,47 @@ fn native_readonly_resolves_manifest_and_wal() {
         },
     )
     .unwrap();
+    // Bind the same complete crash-shaped database through compressed input as
+    // well, including a bzip2 member boundary inside the tar. Native resolution
+    // below consumes this second, independently collected private generation.
+    let mut compressed = Vec::new();
+    for chunk in [&bytes[..777], &bytes[777..]] {
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        encoder.write_all(chunk).unwrap();
+        compressed.extend(encoder.finish().unwrap());
+    }
+    let compressed_path = root.path().join("complete-db.tar.bz2");
+    fs::write(&compressed_path, &compressed).unwrap();
+    fs::set_permissions(&compressed_path, fs::Permissions::from_mode(0o444)).unwrap();
+    let compressed_sha256 = format!("{:x}", Sha256::digest(&compressed));
+    let direct_census = census;
+    let collected = root.path().join("collected-bzip-db");
+    fs::create_dir(&collected).unwrap();
+    fs::set_permissions(&collected, fs::Permissions::from_mode(0o700)).unwrap();
+    let bound = collect_bound_bzip2(
+        &compressed_path,
+        compressed.len() as u64,
+        &compressed_sha256,
+        64 * 1024 * 1024,
+        Path::new("rocksdb"),
+        &collected,
+        CollectionLimits {
+            maximum_files: 128,
+            maximum_file_bytes: 16 * 1024 * 1024,
+            maximum_total_bytes: 64 * 1024 * 1024,
+            maximum_trailer_bytes: 1024 * 1024,
+        },
+    )
+    .unwrap();
+    assert!(!bound.cloud_generation_authenticated && !bound.resource_admission_proven);
+    assert!(!bound.publication_authorized);
+    assert_eq!(bound.compressed_sha256, compressed_sha256);
+    let census = bound.collection;
+    assert_eq!(
+        serde_json::to_value(direct_census).unwrap(),
+        serde_json::to_value(&census).unwrap()
+    );
+    assert_eq!(fs::read(&compressed_path).unwrap(), compressed);
     assert_eq!(census.files.len(), source_files.len());
     assert!(!census.wal_files.is_empty());
     assert!(!census.source_completeness_proven && !census.live_state_resolved);
