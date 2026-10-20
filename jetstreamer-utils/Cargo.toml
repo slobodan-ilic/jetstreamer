@@ -17,6 +17,8 @@ epoch225-v1-6-25-diagnostic = []
 epoch203-single-thread-resource = []
 # Private, resource-limited canonical-root prefix qualification, not publication.
 epoch203-root-prefix-resource = []
+# Private fixed-span epoch224 measurement against its pinned v1.6.25 package.
+epoch224-bounded-resource = []
 
 [lib]
 name = "jetstreamer_utils"
@@ -92,6 +94,11 @@ path = "src/horizon_standalone_guard_bin.rs"
 [[bin]]
 name = "jetstreamer-epoch225-bounded-resource"
 path = "src/epoch225_bounded_resource_bin.rs"
+
+[[bin]]
+name = "jetstreamer-epoch224-bounded-resource"
+path = "src/epoch224_bounded_resource_bin.rs"
+required-features = ["epoch224-bounded-resource"]
 
 [[bin]]
 name = "jetstreamer-epoch203-bounded-resource"

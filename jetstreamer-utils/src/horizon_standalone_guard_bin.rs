@@ -104,6 +104,11 @@ fn canary_scope(unit: &str) -> Result<(&'static str, u64)> {
             "jetstreamer-private-epoch225-canary-target-stop-v1",
             97_202_500,
         ))
+    } else if unit.starts_with("horizon-qualify-224-bounded-resource-") {
+        Ok((
+            "jetstreamer-private-epoch224-canary-target-stop-v1",
+            96_800_000,
+        ))
     } else if unit.starts_with("horizon-qualify-203-bounded-resource-") {
         Ok((
             "jetstreamer-private-epoch203-canary-target-stop-v1",
@@ -1140,6 +1145,39 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn epoch224_target_handoff_is_separate_bounded_and_cannot_be_renewed() {
+        let root = Path::new("/private/canary");
+        let (mut intent, capture) = target_fixture(root);
+        let unit = "horizon-qualify-224-bounded-resource-test.service";
+        assert!(
+            validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1100, 180)
+                .is_err()
+        );
+        intent["schema"] = json!("jetstreamer-private-epoch224-canary-target-stop-v1");
+        intent["target_slot"] = json!(96_800_000);
+        intent["observed_slot"] = json!(96_800_005);
+        validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1100, 180).unwrap();
+        for other in [
+            "horizon-qualify-203-bounded-resource-test.service",
+            "horizon-qualify-225-bounded-resource-test.service",
+        ] {
+            assert!(
+                validate_canary_target(other, &intent, &capture, &"a".repeat(32), root, 1100, 180)
+                    .is_err()
+            );
+        }
+        assert!(
+            validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1181, 180)
+                .is_err()
+        );
+        intent["observed_slot"] = json!(96_801_001);
+        assert!(
+            validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1100, 180)
+                .is_err()
+        );
+    }
+
     #[test]
     fn epoch203_target_cannot_borrow_epoch225_handoff_or_renew_it() {
         let root = Path::new("/private/canary");

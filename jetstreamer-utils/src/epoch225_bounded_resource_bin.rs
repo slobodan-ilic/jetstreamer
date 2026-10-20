@@ -21,6 +21,7 @@ mod profile {
         "snapshot-97199617-HE57JmgvEeZjBKN8cfTLrmyCbUnptJ9PWjUdTzgxSSdi.tar.zst";
     pub const TERMINAL_NAME: &str =
         "snapshot-97631459-EXCmpk8xjtzsow8EH56CQJzQncMgiF6D1s9DJ3pw9q8d.tar.zst";
+    pub const CHECKPOINT_NAMES: &[&str] = &[SNAPSHOT_NAME, TERMINAL_NAME];
     #[cfg(not(feature = "epoch225-v1-6-25-diagnostic"))]
     pub const WORKER: &str = "f39140b9a9659e7c6e8207076a2d0c560a6b69df42cc92e19a421cf46c2b761c";
     #[cfg(feature = "epoch225-v1-6-25-diagnostic")]

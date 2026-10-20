@@ -365,7 +365,20 @@ fn validate_same_sample_admission(
 }
 
 fn diagnostic_guard_profile_matches(claim: &DiagnosticClaim, plan: &Value) -> bool {
-    if claim.epoch == 203
+    if claim.epoch == 224
+        && claim
+            .unit
+            .starts_with("horizon-qualify-224-bounded-resource-")
+    {
+        plan.get("bounded_measurement").is_none_or(Value::is_null)
+            && plan["bounded_canary"]["expected_uid"] == 1000
+            && plan["bounded_canary"]["maximum_drainage_seconds"] == 180
+            && plan["bounded_canary"]["target_stop_intent"].as_str()
+                == claim
+                    .scratch_path
+                    .join("receipts/target-stop.json")
+                    .to_str()
+    } else if claim.epoch == 203
         && claim
             .unit
             .starts_with("horizon-qualify-203-root-prefix-resource-")
@@ -392,6 +405,8 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
     let bounded_v1625 = receipt["schema"] == "jetstreamer-private-epoch225-v1625-bounded-launch-v1";
     let bounded_203 =
         receipt["schema"] == "jetstreamer-private-epoch203-bounded-resource-launch-v1";
+    let bounded_224 =
+        receipt["schema"] == "jetstreamer-private-epoch224-bounded-resource-launch-v1";
     let root_prefix_203 =
         receipt["schema"] == "jetstreamer-private-epoch203-root-prefix-resource-launch-v1";
     let private_verify_213 =
@@ -402,6 +417,7 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             || bounded_resource
             || bounded_v1625
             || bounded_203
+            || bounded_224
             || root_prefix_203
             || private_verify_213
             || receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1")
@@ -502,6 +518,43 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             && receipt["canonical_prefix_independently_qualified"] == false
             && receipt["full_cold_epoch_peak_qualified"] == false
             && receipt["ordinary_replay_authorized"] == false
+            && receipt["runtime_promotion_authorized"] == false
+            && receipt["canonical_sidecar_authorized"] == false
+            && receipt["publication_authorized"] == false
+    } else if bounded_224 {
+        claim.epoch == 224
+            && claim
+                .unit
+                .starts_with("horizon-qualify-224-bounded-resource-")
+            && claim.unit.ends_with(".service")
+            && claim.scratch_path.parent() == Some(Path::new("/home/ubuntu/.jetstreamer-private"))
+            && claim
+                .scratch_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with("bounded-resource-224-"))
+            && receipt["epoch"] == 224
+            && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+            && receipt["snapshot_slot"] == 96_767_522u64
+            && receipt["snapshot_sha256"]
+                == "dc7f2ac03813bc609629885af82222ac5af070cc6187b7bce08e10944fd214e1"
+            && receipt["worker_sha256"]
+                == "f26fb8598aef4091356be31a0ee322c2e428609f201390cce26ec60df9c62c45"
+            && receipt["node_sha256"]
+                == "bcb76f90515465ee3b19486a18da907d15d4a3fbe310d66e0c3912a5daa4e257"
+            && receipt["runner_sha256"]
+                == "eb2399944540f0a0cd7aadffe350047ab75dd946bc963370fa5c486689a6e381"
+            && receipt["runtime"] == "solana-v1.6.25"
+            && receipt["runtime_semantics_changed"] == true
+            && receipt["solana_rayon_threads"] == 16
+            && receipt["target_slot"] == 96_800_000u64
+            && receipt["terminal_root_slot"] == 97_631_459u64
+            && receipt["maximum_terminal_scratch_bytes"] == 448u64 << 30
+            && receipt["maximum_runtime_seconds"] == 259200u64
+            && receipt["bounded_replay_authorized"] == true
+            && receipt["ordinary_replay_authorized"] == false
+            && receipt["full_cold_epoch_peak_qualified"] == false
+            && receipt["canonical_prefix_qualified"] == false
             && receipt["runtime_promotion_authorized"] == false
             && receipt["canonical_sidecar_authorized"] == false
             && receipt["publication_authorized"] == false
@@ -2187,6 +2240,85 @@ mod tests {
         );
         assert!(validate_previous_fleet(&previous, 201, 300, "2026-10-20T00:04:42Z").is_err());
     }
+    #[test]
+    fn bounded_224_repair_is_exact_private_and_does_not_promote_its_target() {
+        let claim = DiagnosticClaim {
+            epoch: 224,
+            unit: "horizon-qualify-224-bounded-resource-test.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/home/ubuntu/.jetstreamer-private/bounded-resource-224-test".into(),
+            launch_receipt: BoundFile {
+                path: "/private/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let receipt = json!({
+            "schema":"jetstreamer-private-epoch224-bounded-resource-launch-v1",
+            "launched":true,"epoch":224,"private_run_root":claim.scratch_path,
+            "snapshot_slot":96767522,
+            "snapshot_sha256":"dc7f2ac03813bc609629885af82222ac5af070cc6187b7bce08e10944fd214e1",
+            "worker_sha256":"f26fb8598aef4091356be31a0ee322c2e428609f201390cce26ec60df9c62c45",
+            "node_sha256":"bcb76f90515465ee3b19486a18da907d15d4a3fbe310d66e0c3912a5daa4e257",
+            "runner_sha256":"eb2399944540f0a0cd7aadffe350047ab75dd946bc963370fa5c486689a6e381",
+            "runtime":"solana-v1.6.25","runtime_semantics_changed":true,
+            "solana_rayon_threads":16,"target_slot":96800000,"terminal_root_slot":97631459,
+            "maximum_terminal_scratch_bytes":448u64<<30,"maximum_runtime_seconds":259200,
+            "bounded_replay_authorized":true,"ordinary_replay_authorized":false,
+            "full_cold_epoch_peak_qualified":false,"canonical_prefix_qualified":false,
+            "runtime_promotion_authorized":false,"canonical_sidecar_authorized":false,
+            "publication_authorized":false,"remote_mutations":false,"r2_mutations":false,
+            "evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,
+                "restarts":0,"load_state":"loaded","active_state":"active","sub_state":"running",
+                "main_pid":123,"result":"success"}]}
+        });
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        for (key, value) in [
+            ("epoch", json!(225)),
+            ("target_slot", json!(97199999)),
+            ("terminal_root_slot", json!(97199617)),
+            ("snapshot_slot", json!(96767523)),
+            ("worker_sha256", json!("0".repeat(64))),
+            ("node_sha256", json!("0".repeat(64))),
+            ("runner_sha256", json!("0".repeat(64))),
+            ("solana_rayon_threads", json!(1)),
+            ("maximum_terminal_scratch_bytes", json!(449u64 << 30)),
+            ("maximum_runtime_seconds", json!(259201)),
+            ("runtime_semantics_changed", json!(false)),
+            ("ordinary_replay_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+            ("full_cold_epoch_peak_qualified", json!(true)),
+            ("canonical_prefix_qualified", json!(true)),
+            ("runtime_promotion_authorized", json!(true)),
+            ("canonical_sidecar_authorized", json!(true)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[key] = value;
+            assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{key}");
+        }
+        let wrong = DiagnosticClaim {
+            epoch: claim.epoch,
+            unit: claim.unit.clone(),
+            invocation_id: claim.invocation_id.clone(),
+            scratch_path: "/home/ubuntu/horizon".into(),
+            launch_receipt: BoundFile {
+                path: claim.launch_receipt.path.clone(),
+                sha256: claim.launch_receipt.sha256.clone(),
+            },
+        };
+        let mut bad = receipt.clone();
+        bad["private_run_root"] = json!(wrong.scratch_path);
+        assert!(validate_diagnostic_launch(&bad, &wrong).is_err());
+        let guard = json!({"bounded_canary":{"expected_uid":1000,"maximum_drainage_seconds":180,
+            "target_stop_intent":claim.scratch_path.join("receipts/target-stop.json")}});
+        assert!(diagnostic_guard_profile_matches(&claim, &guard));
+        let mut bad = guard.clone();
+        bad["bounded_canary"]["maximum_drainage_seconds"] = json!(181);
+        assert!(!diagnostic_guard_profile_matches(&claim, &bad));
+        let mut bad = guard;
+        bad["bounded_canary"]["target_stop_intent"] = json!("/other/receipts/target-stop.json");
+        assert!(!diagnostic_guard_profile_matches(&claim, &bad));
+    }
+
     #[test]
     fn bounded_225_replay_is_diagnostic_only_and_cannot_expand_its_target() {
         let claim = DiagnosticClaim {

@@ -182,8 +182,8 @@ fn validate_plan(p: &Plan) -> Result<()> {
         "invalid input digest"
     );
     ensure!(
-        !NATURAL_ROOT_FINISH || p.node.sha256 == PARENT_SHA,
-        "root-prefix parent differs from the exact capability-bound build"
+        PARENT_SHA.is_empty() || p.node.sha256 == PARENT_SHA,
+        "parent differs from the exact capability-bound build"
     );
     Ok(())
 }
@@ -291,7 +291,7 @@ fn scratch(root: &Path) -> Result<Value> {
             .checked_add(m.blocks().checked_mul(512).context("block overflow")?)
             .context("size overflow")?;
         apparent = apparent.checked_add(m.len()).context("apparent overflow")?;
-        ensure!(physical <= MAX_SCRATCH, "scratch exceeds256GiB");
+        ensure!(physical <= MAX_SCRATCH, "scratch exceeds sealed profile limit of {MAX_SCRATCH} bytes");
         if m.is_dir() {
             dirs += 1;
             if path.file_name().is_some_and(|n| n == "accounts-state") {
@@ -465,7 +465,7 @@ fn validate_checkpoint_names(hashes: &str) -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
     ensure!(
-        names == [SNAPSHOT_NAME, TERMINAL_NAME],
+        names == CHECKPOINT_NAMES,
         "wrong canonical checkpoint set"
     );
     Ok(())
@@ -1203,7 +1203,7 @@ mod tests {
         serde_json::from_value(json!({
             "schema":PLAN_SCHEMA,
             "unit":format!("{UNIT_PREFIX}test.service"),
-            "node":{"path":"/sealed/node","sha256":"a".repeat(64)},
+            "node":{"path":"/sealed/node","sha256":if PARENT_SHA.is_empty() {"a".repeat(64)} else {PARENT_SHA.to_owned()}},
             "worker":"/sealed/worker",
             "snapshot":format!("/sealed/{SNAPSHOT_NAME}"),
             "ledger_directory":"/sealed","epoch_hashes":{"path":"/sealed/hashes","sha256":"b".repeat(64)},
@@ -1214,6 +1214,11 @@ mod tests {
     #[test]
     fn plan_cannot_expand_epoch_target_runtime_or_resource_scope() {
         validate_plan(&fixture_plan()).unwrap();
+        if !PARENT_SHA.is_empty() {
+            let mut p = fixture_plan();
+            p.node.sha256 = "0".repeat(64);
+            assert!(validate_plan(&p).is_err());
+        }
         let mut p = fixture_plan();
         p.target_slot += 1;
         assert!(validate_plan(&p).is_err());
@@ -1293,8 +1298,17 @@ mod tests {
     }
     #[test]
     fn checkpoints_are_exact_not_an_arbitrary_same_epoch_file() {
-        let exact = format!("{SNAPSHOT_NAME}\n{TERMINAL_NAME}\n");
+        let exact = format!("{}\n", CHECKPOINT_NAMES.join("\n"));
         validate_checkpoint_names(&exact).unwrap();
+        for omitted in 0..CHECKPOINT_NAMES.len() {
+            let reduced = CHECKPOINT_NAMES.iter().enumerate()
+                .filter_map(|(index, name)| (index != omitted).then_some(*name))
+                .collect::<Vec<_>>().join("\n");
+            assert!(validate_checkpoint_names(&reduced).is_err());
+        }
+        let mut reversed = CHECKPOINT_NAMES.to_vec();
+        reversed.reverse();
+        assert!(validate_checkpoint_names(&reversed.join("\n")).is_err());
         assert!(
             validate_checkpoint_names(
                 &exact.replace(&TERMINAL.to_string(), &(TERMINAL - 1).to_string())
