@@ -641,6 +641,14 @@ passed the first v1.6.20 execution divergence before stopping at slot 96,767,527
 that comparison alone does not promote either epoch. The default registry and the
 four-slot diagnostic feature are unchanged. See
 [`epoch224-complete-span-qualification.json`](historical-runtime/v1_6_25/epoch224-complete-span-qualification.json).
+The separate `epoch225-v1-6-25-qualification` build is also private and unqualified.
+It requires snapshot 97,199,617 and canonical roots 97,631,459 and 98,063,464,
+covering every epoch-225 slot plus a bounded private epoch-226 verification suffix.
+The earlier bounded epoch-225 comparison stops at 97,202,600 and cannot substitute
+for this full-span/root check. The full-span build rejects ordinary replay, root
+cohorts, inherited leases, recovery and public/mixed output paths; it writes no
+canonical sidecar and does not promote epoch 226 or alter the default runtime.
+See [`epoch225-complete-span-qualification.json`](historical-runtime/v1_6_25/epoch225-complete-span-qualification.json).
 Exact v1.7.13 remains an unassigned fallback comparison candidate. The primary
 v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers the complete
 epoch-266-301 execution envelope, with publication ending at epoch 300 and epoch 301 retained as

@@ -338,7 +338,7 @@ pub fn read_and_validate_segment_manifest_from(
 ) -> Result<HistoricalSegmentManifest, SegmentManifestError> {
     let archive_path = archive_path.as_ref();
     let sidecar_path = manifest_path.as_ref();
-    let bytes = read_bounded_manifest(&sidecar_path)?;
+    let bytes = read_bounded_manifest(sidecar_path)?;
     let manifest: HistoricalSegmentManifest =
         serde_json::from_slice(&bytes).map_err(SegmentManifestError::JsonDecode)?;
     manifest.validate()?;
