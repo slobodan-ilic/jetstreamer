@@ -218,6 +218,22 @@ fn owner_units(publication: &StatusPublicationReceipt) -> Result<Vec<(String, St
     ])
 }
 
+fn queued_job_units(bytes: &[u8]) -> Result<Vec<&str>> {
+    let mut names = Vec::new();
+    for line in std::str::from_utf8(bytes)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let columns: Vec<_> = line.split_whitespace().collect();
+        ensure!(
+            columns.len() == 4 && columns[0].parse::<u64>().is_ok_and(|id| id > 0),
+            "unrecognized systemctl job table row"
+        );
+        names.push(columns[1]);
+    }
+    Ok(names)
+}
+
 fn no_pending_owner_trigger(name: &str, collected: bool) -> Result<()> {
     if !collected {
         let output = ProcessCommand::new("systemctl")
@@ -239,13 +255,19 @@ fn no_pending_owner_trigger(name: &str, collected: bool) -> Result<()> {
         }
     }
     let jobs = ProcessCommand::new("systemctl")
-        .args(["list-jobs", "--output=json", "--no-pager"])
+        .args([
+            "list-jobs",
+            "--no-legend",
+            "--no-pager",
+            "--plain",
+            "--full",
+        ])
         .output()?;
     ensure!(jobs.status.success(), "cannot inspect queued owner jobs");
-    let jobs: Vec<Value> = serde_json::from_slice(&jobs.stdout)?;
+    let jobs = queued_job_units(&jobs.stdout)?;
     ensure!(
-        !jobs.iter().any(|job| job["unit"] == name
-            || job["unit"].as_str().is_some_and(|unit| [
+        !jobs.iter().any(|unit| *unit == name
+            || [
                 "horizon-controller-",
                 "jetstreamer-root-sweep-",
                 "horizon-qualify-",
@@ -256,7 +278,7 @@ fn no_pending_owner_trigger(name: &str, collected: bool) -> Result<()> {
                 "horizon-recover-"
             ]
             .iter()
-            .any(|prefix| unit.starts_with(prefix)))),
+            .any(|prefix| unit.starts_with(prefix))),
         "owner has a queued systemd job"
     );
     Ok(())
@@ -517,6 +539,14 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queued_jobs_are_a_plain_systemctl_table_not_journal_json() {
+        assert!(queued_job_units(b"").unwrap().is_empty());
+        assert_eq!(queued_job_units(b"3285782 horizon-inactive-status-224.service start running\n3285783 horizon-controller-224.service start waiting\n").unwrap(),
+            vec!["horizon-inactive-status-224.service","horizon-controller-224.service"]);
+        assert!(queued_job_units(b"JOB UNIT TYPE STATE\n").is_err());
+        assert!(queued_job_units(b"3285782 missing-columns\n").is_err());
+    }
     #[test]
     fn terminal_owner_requires_positive_history_and_rejects_replacements() {
         let old = json!({"LoadState":"loaded","InvocationID":"abc","ActiveState":"failed","SubState":"failed","Result":"exit-code","ExecMainStatus":"1"});
