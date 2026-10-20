@@ -59,8 +59,12 @@ with the original input; `ProtectHome=yes` is not. Grant writes only to the new
 private scan directory. Preserve the producer's terminal identity until the
 runner's second check. A cleared inactive `InvocationID` is accepted only with
 the exact original producer's assembly-completion journal and subsequent clean
-manager deactivation, alongside unchanged terminal service properties. Foreign
-invocations, missing/ambiguous journal evidence, and collected units fail closed.
+manager deactivation, alongside unchanged terminal service properties. If systemd
+collects that completed transient unit, only `not-found/inactive/dead` with empty
+invocation and cleared zero exit fields is accepted, still requiring the original
+root-sealed outcome and exact completion/deactivation journal. Never recreate or
+restart the producer to synthesize terminal state. Foreign invocations and
+missing/ambiguous journal evidence fail closed.
 Invoke:
 
 ```text

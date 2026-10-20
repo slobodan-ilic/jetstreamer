@@ -199,12 +199,15 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
     let bounded_v1625 = receipt["schema"] == "jetstreamer-private-epoch225-v1625-bounded-launch-v1";
     let bounded_203 =
         receipt["schema"] == "jetstreamer-private-epoch203-bounded-resource-launch-v1";
+    let private_verify_213 =
+        receipt["schema"] == "jetstreamer-private-epoch213-verification-launch-v1";
     ensure!(
         (continuation
             || bootstrap_resource
             || bounded_resource
             || bounded_v1625
             || bounded_203
+            || private_verify_213
             || receipt["schema"] == "jetstreamer-historical-performance-launch-receipt-v1")
             && receipt["launched"] == true
             && receipt["remote_mutations"] == false
@@ -221,6 +224,33 @@ fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Resul
             && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
             && receipt["replay_slot_start"] == 92_447_543u64
             && receipt["replay_slot_end_inclusive"] == 92_447_999u64
+            && receipt["canonical_sidecar_authorized"] == false
+            && receipt["publication_authorized"] == false
+    } else if private_verify_213 {
+        claim.epoch == 213
+            && claim
+                .unit
+                .starts_with("horizon-qualify-213-private-verification-")
+            && claim.unit.ends_with(".service")
+            && receipt["epoch"] == 213
+            && receipt["private_run_root"].as_str() == claim.scratch_path.to_str()
+            && claim.scratch_path.parent() == Some(Path::new("/var/lib/jetstreamer"))
+            && claim
+                .scratch_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("horizon-213-private-scan-"))
+            && receipt["verifier_sha256"]
+                == "8d9bd29c60c8ea5870e2169255acaae8d2f7436c4ec130dc8154d28cc4628130"
+            && receipt["producer_invocation_id"] == "1dfd29e7ced140b3ba407359cbdc0ee1"
+            && receipt["provenance_expectation_sha256"]
+                == "f7bb330186a8fbcc438b0fa49e903af5be5a1c30092f7cd434a86f6b2916bea5"
+            && receipt["plan_sha256"].as_str().is_some_and(|s| {
+                s.len() == 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            && receipt["replay_entries_authorized"] == false
             && receipt["canonical_sidecar_authorized"] == false
             && receipt["publication_authorized"] == false
     } else if bootstrap_resource {
@@ -772,7 +802,15 @@ pub(super) async fn run() -> Result<()> {
                     && claim.scratch_path.is_dir(),
                 "diagnostic scratch must be an exact canonical directory"
             );
-            active.push(json!({"epoch":claim.epoch,"phase":"diagnostic-qualification","producer":current,
+            let phase = if claim
+                .unit
+                .starts_with("horizon-qualify-213-private-verification-")
+            {
+                "private-verification"
+            } else {
+                "diagnostic-qualification"
+            };
+            active.push(json!({"epoch":claim.epoch,"phase":phase,"producer":current,
                 "scratch_path":claim.scratch_path,"launch_receipt":claim.launch_receipt.path,
                 "launch_receipt_sha256":claim.launch_receipt.sha256,"sampled_at_utc":sample,
                 "resource_basis":"hash-bound private diagnostic launch and invocation identity; consult bound admission, guard and terminal evidence",
@@ -1058,6 +1096,39 @@ mod tests {
                 .is_err()
             );
         }
+    }
+    #[test]
+    fn private_213_verification_is_identity_bound_and_not_publication() {
+        let claim = DiagnosticClaim {
+            epoch: 213,
+            unit: "horizon-qualify-213-private-verification-ccbe0f1-v1.service".into(),
+            invocation_id: "a".repeat(32),
+            scratch_path: "/var/lib/jetstreamer/horizon-213-private-scan-test".into(),
+            launch_receipt: BoundFile {
+                path: "/sealed/launch.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let receipt = json!({"schema":"jetstreamer-private-epoch213-verification-launch-v1","launched":true,"epoch":213,"private_run_root":claim.scratch_path,"verifier_sha256":"8d9bd29c60c8ea5870e2169255acaae8d2f7436c4ec130dc8154d28cc4628130","producer_invocation_id":"1dfd29e7ced140b3ba407359cbdc0ee1","provenance_expectation_sha256":"f7bb330186a8fbcc438b0fa49e903af5be5a1c30092f7cd434a86f6b2916bea5","plan_sha256":"c".repeat(64),"replay_entries_authorized":false,"canonical_sidecar_authorized":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false,"evidence":{"units":[{"unit":claim.unit,"invocation_id":claim.invocation_id,"restarts":0,"load_state":"loaded","active_state":"active","sub_state":"running","main_pid":123,"result":"success"}]}});
+        validate_diagnostic_launch(&receipt, &claim).unwrap();
+        for (key, value) in [
+            ("verifier_sha256", json!("0".repeat(64))),
+            ("producer_invocation_id", json!("0".repeat(32))),
+            ("plan_sha256", json!("c".repeat(63))),
+            ("provenance_expectation_sha256", json!("0".repeat(64))),
+            ("replay_entries_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+            ("canonical_sidecar_authorized", json!(true)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[key] = value;
+            assert!(validate_diagnostic_launch(&bad, &claim).is_err(), "{key}");
+        }
+        let mut wrong = claim;
+        wrong.scratch_path = "/home/ubuntu/horizon".into();
+        let mut substituted = receipt;
+        substituted["private_run_root"] = json!(wrong.scratch_path);
+        assert!(validate_diagnostic_launch(&substituted, &wrong).is_err());
     }
     #[test]
     fn bounded_203_has_an_exact_nonpromoting_launch_schema() {
