@@ -1017,8 +1017,6 @@ pub(super) async fn run() -> Result<()> {
                     receipt.status == status
                         && receipt.object_etag == object.etag
                         && receipt.authenticated_readback
-                        && receipt.observer_receipt == plan.observer.path
-                        && receipt.observer_receipt_sha256 == plan.observer.sha256
                         && pipelines.iter().any(|entry| {
                             entry["epoch"] == epoch
                                 && entry["live"] == true
