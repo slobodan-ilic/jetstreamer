@@ -32,6 +32,11 @@ authenticated handoff. Do not execute it when such a handoff exists.
 The plan must set `exclusive_local_epoch_ownership: true` and explicitly supply
 `authenticated_other_host_handoffs: []`; both fleet sample and receipt expire
 after 30 minutes.
+When systemd has cleared a loaded, successfully stopped controller's invocation
+ID, the narrow profile additionally requires the root manager journal's latest
+lifecycle to name the exact original invocation and contain its completed stop
+after its last start. That journal proof is retained in the census receipt;
+empty identity alone never establishes ownership or terminal success.
 
 `--check-only` authenticates remote status bytes/ETag, checks current archive
 inventory and multipart transfers, and performs the local census without writing

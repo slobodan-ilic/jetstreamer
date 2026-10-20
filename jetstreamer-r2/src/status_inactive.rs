@@ -181,6 +181,60 @@ fn terminal(value: &Value) -> bool {
         && value["MainPID"] == "0"
 }
 
+fn journal_proves_terminal(records: &[Value], name: &str, invocation: &str) -> Result<()> {
+    let records: Vec<_> = records
+        .iter()
+        .filter(|r| {
+            r["UNIT"] == name
+                && r["_PID"] == "1"
+                && r["_UID"] == "0"
+                && r["INVOCATION_ID"].as_str().is_some_and(|s| !s.is_empty())
+        })
+        .collect();
+    ensure!(
+        records
+            .last()
+            .is_some_and(|r| r["INVOCATION_ID"] == invocation),
+        "latest manager lifecycle is not the old owner"
+    );
+    let last_start = records.iter().rposition(|r| {
+        r["MESSAGE"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("Starting "))
+    });
+    let stopped = records.iter().rposition(|r| {
+        r["INVOCATION_ID"] == invocation
+            && r["JOB_RESULT"] == "done"
+            && r["MESSAGE"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("Stopped "))
+    });
+    ensure!(
+        stopped.is_some()
+            && last_start.is_none_or(|start| stopped.is_some_and(|stop| stop > start)),
+        "no exact terminal stop after latest manager start"
+    );
+    Ok(())
+}
+
+fn cleared_controller_proof(name: &str, invocation: &str) -> Result<Vec<Value>> {
+    let output = Command::new("journalctl")
+        .args(["-u", name, "--no-pager", "-n", "128", "-o", "json"])
+        .output()?;
+    ensure!(
+        output.status.success() && output.stdout.len() <= 16 * 1024 * 1024,
+        "terminal journal probe failed"
+    );
+    let records = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter::<Value>()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    journal_proves_terminal(&records, name, invocation)?;
+    Ok(records
+        .into_iter()
+        .filter(|r| r["UNIT"] == name && r["INVOCATION_ID"] == invocation)
+        .collect())
+}
+
 fn unit(name: &str) -> Result<Value> {
     ensure!(
         name.ends_with(".service")
@@ -308,10 +362,19 @@ fn live_census(plan: &Plan, fleet: &Value) -> Result<Value> {
     }
     let controller = unit(&plan.controller)?;
     let producer = unit(&plan.producer)?;
+    let mut controller_terminal_journal = Vec::new();
     for (v, id) in [(&controller, CONTROLLER_ID), (&producer, PRODUCER_ID)] {
         ensure!(terminal(v), "previous owner not terminal");
+        let controller_cleared = std::ptr::eq(v, &controller)
+            && v["LoadState"] == "loaded"
+            && v["InvocationID"] == ""
+            && v["Result"] == "success"
+            && v["NRestarts"] == "0";
+        if controller_cleared {
+            controller_terminal_journal = cleared_controller_proof(&plan.controller, id)?;
+        }
         ensure!(
-            v["LoadState"] == "not-found" || v["InvocationID"] == id,
+            v["LoadState"] == "not-found" || v["InvocationID"] == id || controller_cleared,
             "owner unit now has a different invocation"
         );
         ensure!(
@@ -415,7 +478,7 @@ fn live_census(plan: &Plan, fleet: &Value) -> Result<Value> {
     }
     scan_processes(Path::new("/proc"), plan.epoch)?;
     Ok(
-        json!({"controller":controller,"producer":producer,"epoch_units":claims,
+        json!({"controller":controller,"controller_terminal_journal":controller_terminal_journal,"producer":producer,"epoch_units":claims,
         "queued_jobs":queued,"process_reference_scan":"command/maps/cwd/root/exe/fd complete",
         "canonical_local_pair_absent":true}),
     )
@@ -770,6 +833,28 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleared_controller_id_requires_exact_last_manager_lifecycle_and_stop() {
+        let event = |message: &str, id: &str| {
+            json!({"UNIT":"controller.service","_PID":"1","_UID":"0",
+            "INVOCATION_ID":id,"MESSAGE":message,"JOB_RESULT":"done"})
+        };
+        let records = vec![
+            event("Starting controller.service", CONTROLLER_ID),
+            event("Stopped controller.service", CONTROLLER_ID),
+        ];
+        journal_proves_terminal(&records, "controller.service", CONTROLLER_ID).unwrap();
+        assert!(
+            journal_proves_terminal(&records[..1], "controller.service", CONTROLLER_ID).is_err()
+        );
+        let mut changed = records.clone();
+        changed.push(event("Starting controller.service", "new-owner"));
+        assert!(journal_proves_terminal(&changed, "controller.service", CONTROLLER_ID).is_err());
+        let mut spoofed = records;
+        spoofed[1]["_PID"] = json!("123");
+        assert!(journal_proves_terminal(&spoofed, "controller.service", CONTROLLER_ID).is_err());
+    }
 
     fn publication() -> StatusPublicationReceipt {
         StatusPublicationReceipt {
