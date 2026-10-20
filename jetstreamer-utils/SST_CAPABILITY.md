@@ -100,6 +100,24 @@ read-only resolution against the compressed collection. It checks live-file
 references, range/point deletions and WAL-only values without modifying either
 the retained compressed input or the collected member census.
 
+`jetstreamer-epoch141-ledger-metadata` is a separate, read-only exact-generation
+gate for `60911751/rocksdb.tar.bz2#1634789748052739` in the regional ledger
+bucket. Its immutable plan and running executable require separate SHA-256
+arguments. It pins the system GCloud script digest, clears supplementary groups
+and drops to the configured operator UID/GID before an exact generation-bound
+metadata lookup through the operator's login configuration. The 60-second child
+and bounded stdout/stderr readers cannot turn into a bulk transfer. Normalized
+and raw metadata must agree with the fixed object, generation, 189,943,475,031-byte
+length, CRC32C, MD5 and versioned identity. Conflicting aliases fail closed.
+
+Its root-private, fsynced, no-clobber receipt records the systemd invocation and
+raw-response digest. It does not authenticate downloaded compressed bytes,
+establish original-backup completeness or grant resource admission, collection,
+replay, publication or R2 authority. Use a persistent non-restarting oneshot with
+the operator configuration writable for token refresh, a 90-second start timeout
+and only the UID/GID-drop capabilities. Do not apply the older metadata observer's
+epoch203–212 capability assumptions to epoch141.
+
 `horizon_legacy_shred::assemble_v1_4_25_padded_batches` provides bounded,
 diagnostic-only data-shred assembly for revision
 `893cc7647248a3536fb6e6d0b5e51c71446b862d`. It requires a complete contiguous
