@@ -6,6 +6,9 @@
 //! then uses the existing recoverable absence-only transaction. Original
 //! assembly/prefix/suffix and all verification logs remain untouched.
 
+#[path = "epoch213_publish/write_scope.rs"]
+mod write_scope;
+
 use anyhow::{Context, Result, ensure};
 use jetstreamer_horizon::archive::{ArchiveProvenance, ArchiveReader, encode_archive_provenance};
 use jetstreamer_node::{
@@ -197,11 +200,6 @@ fn validate_plan(plan: &Plan) -> Result<()> {
             && plan.initial_anchor.sha256 == ANCHOR_EVIDENCE,
         "archive/anchor scope differs"
     );
-    let legacy_stage = plan.publication_stage.parent() == Some(Path::new("/var/lib/jetstreamer"))
-        && plan.publication_stage.file_name().is_some_and(|n| {
-            n.to_string_lossy()
-                .starts_with("horizon-213-publication-stage-")
-        });
     // A pre-existing, root-owned work parent can be the sole writable sandbox
     // mount while the actual no-clobber stage remains absent until admission.
     // Root ownership, non-writability and same-filesystem checks still run
@@ -214,10 +212,7 @@ fn validate_plan(plan: &Plan) -> Result<()> {
                         .starts_with("horizon-213-publication-work-")
                 })
         });
-    ensure!(
-        legacy_stage || bounded_work_stage,
-        "wrong private handoff namespace"
-    );
+    ensure!(bounded_work_stage, "wrong private handoff namespace");
     ensure!(
         plan.receipt_directory != plan.full_receipt_directory
             && plan.receipt_directory != plan.plugin_receipt_directory
@@ -549,13 +544,27 @@ fn run(binding: Evidence, self_sha: &str) -> Result<()> {
         "verified private copy identity changed"
     );
     validate_archive(&file)?;
+    // Reject split writable bind mounts before sinks, chown or movement.
+    let rename_mount_id = write_scope::same_mount(&[
+        private_dir,
+        plan.publication_stage.parent().unwrap(),
+        destination,
+    ])?;
+    let write_scope = write_scope::confine(&[
+        private_dir,
+        plan.publication_stage.parent().unwrap(),
+        &plan.receipt_directory,
+        &plan.full_receipt_directory,
+        &plan.plugin_receipt_directory,
+        destination,
+    ])?;
     // Open root-only durable sinks before permanently dropping privileges.
     // No later pathname access can grant the archive user these permissions.
     let mut intent = Sink::create(&plan.receipt_directory, "intent.json")?;
     let mut receipt = Sink::create(&plan.receipt_directory, "publication.json")?;
     let mut full_gate = Sink::create(&plan.full_receipt_directory, "epoch-213.full.ok")?;
     let mut plugin_gate = Sink::create(&plan.plugin_receipt_directory, "epoch-213.plugin.ok")?;
-    let context = json!({"schema":"jetstreamer-exact-epoch213-v4-publication-context-v1","epoch":213,"plan":binding,"publisher_sha256":self_sha,"verification":plan.verification,"initial_anchor":plan.initial_anchor,"archive_sha256":plan.archive_sha256,"archive_bytes":plan.archive_bytes,"expected_provenance_sha256":PROVENANCE,"private_runner_sha256":RUNNER,"runtime_registry_promotion_authorized":false,"remote_mutations":false,"r2_mutations":false});
+    let context = json!({"schema":"jetstreamer-exact-epoch213-v4-publication-context-v1","epoch":213,"plan":binding,"publisher_sha256":self_sha,"verification":plan.verification,"initial_anchor":plan.initial_anchor,"archive_sha256":plan.archive_sha256,"archive_bytes":plan.archive_bytes,"expected_provenance_sha256":PROVENANCE,"private_runner_sha256":RUNNER,"rename_mount_id":rename_mount_id,"write_scope":write_scope,"runtime_registry_promotion_authorized":false,"remote_mutations":false,"r2_mutations":false});
     intent.json(&context)?;
     fs::DirBuilder::new()
         .mode(0o700)
@@ -691,6 +700,12 @@ fn capability_probe(root: &Path, self_sha: &str) -> Result<()> {
     let evidence = measure_open_archive(&file)?;
     fs::set_permissions(root, fs::Permissions::from_mode(0o755))?;
     File::open(root)?.sync_all()?;
+    let rename_mount_id = write_scope::same_mount(&[&stage, &destination])?;
+    let write_scope = write_scope::confine(&[&stage, &destination, &receipts])?;
+    ensure!(
+        fs::write(root.join("forbidden-write"), b"must not exist").is_err(),
+        "write scope did not deny an out-of-scope write"
+    );
     drop_to_archive_owner()?;
     preflight_archive_publication(&stage, &destination)?;
     let context = b"epoch213 private filesystem capability only; no archive admission";
@@ -706,7 +721,7 @@ fn capability_probe(root: &Path, self_sha: &str) -> Result<()> {
         context,
         Duration::from_secs(5),
     )?;
-    sink.json(&json!({"schema":"jetstreamer-private-epoch213-publication-capability-v1","publisher_sha256":self_sha,"diagnostic_fixture":true,"filesystem_transaction_passed":true,"root_receipt_fd_survives_permanent_privilege_drop":true,"effective_uid":unsafe{libc::geteuid()},"archive_sha256":sha256_hex_string(&evidence.sha256),"transaction_id":sha256_hex_string(&publication.transaction_id),"archive_publication_authorized":false,"runtime_registry_promotion_authorized":false,"r2_mutations":false}))?;
+    sink.json(&json!({"schema":"jetstreamer-private-epoch213-publication-capability-v1","publisher_sha256":self_sha,"diagnostic_fixture":true,"rename_mount_id":rename_mount_id,"write_scope":write_scope,"outside_write_denied":true,"filesystem_transaction_passed":true,"root_receipt_fd_survives_permanent_privilege_drop":true,"effective_uid":unsafe{libc::geteuid()},"archive_sha256":sha256_hex_string(&evidence.sha256),"transaction_id":sha256_hex_string(&publication.transaction_id),"archive_publication_authorized":false,"runtime_registry_promotion_authorized":false,"r2_mutations":false}))?;
     acknowledge_archive_publication_batch(&destination, publication.transaction_id)?;
     println!("private publication filesystem capability passed; no campaign archive touched");
     Ok(())
@@ -736,7 +751,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     fn plan() -> Plan {
-        serde_json::from_value(json!({"schema":"jetstreamer-private-epoch213-v4-publication-plan-v1","verification":{"path":"/var/lib/private/verification.json","sha256":"a".repeat(64)},"initial_anchor":{"path":"/var/lib/private/anchor.json","sha256":ANCHOR_EVIDENCE},"archive_sha256":"b".repeat(64),"archive_bytes":100,"publication_stage":"/var/lib/jetstreamer/horizon-213-publication-stage-test","receipt_directory":"/var/lib/private/publication","full_receipt_directory":"/var/lib/private/full","plugin_receipt_directory":"/var/lib/private/plugin","artifact_publication_authorized":true,"runtime_registry_promotion_authorized":false,"remote_mutations":false,"r2_mutations":false})).unwrap()
+        serde_json::from_value(json!({"schema":"jetstreamer-private-epoch213-v4-publication-plan-v1","verification":{"path":"/var/lib/private/verification.json","sha256":"a".repeat(64)},"initial_anchor":{"path":"/var/lib/private/anchor.json","sha256":ANCHOR_EVIDENCE},"archive_sha256":"b".repeat(64),"archive_bytes":100,"publication_stage":"/var/lib/jetstreamer/horizon-213-publication-work-test/stage","receipt_directory":"/var/lib/private/publication","full_receipt_directory":"/var/lib/private/full","plugin_receipt_directory":"/var/lib/private/plugin","artifact_publication_authorized":true,"runtime_registry_promotion_authorized":false,"remote_mutations":false,"r2_mutations":false})).unwrap()
     }
     fn verification() -> Value {
         let path = "/var/lib/jetstreamer/horizon-213-private-scan-test/epoch-213.jet";
