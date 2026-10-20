@@ -11,6 +11,7 @@ use {
         io::{Read, Write},
         os::unix::fs::{MetadataExt, OpenOptionsExt},
         path::{Path, PathBuf},
+        process::Command,
     },
 };
 
@@ -18,11 +19,13 @@ const MODEL_SCHEMA_V1: &str = "jetstreamer-horizon-r2-status-eta-model-v1";
 const MODEL_SCHEMA_V2: &str = "jetstreamer-horizon-r2-status-eta-model-v2";
 const MODEL_SCHEMA_V3: &str = "jetstreamer-horizon-r2-status-eta-model-v3";
 const MODEL_SCHEMA_V4: &str = "jetstreamer-horizon-r2-status-eta-model-v4";
+const MODEL_SCHEMA_V5: &str = "jetstreamer-horizon-r2-status-eta-model-v5";
 const OBSERVER_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-v2";
 const OUTPUT_SCHEMA_V1: &str = "jetstreamer-horizon-r2-status-estimates-v1";
 const OUTPUT_SCHEMA_V2: &str = "jetstreamer-horizon-r2-status-estimates-v2";
 const OUTPUT_SCHEMA_V3: &str = "jetstreamer-horizon-r2-status-estimates-v3";
 const OUTPUT_SCHEMA_V4: &str = "jetstreamer-horizon-r2-status-estimates-v4";
+const OUTPUT_SCHEMA_V5: &str = "jetstreamer-horizon-r2-status-estimates-v5";
 const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -67,7 +70,8 @@ struct RangeModel {
     expected_producer_invocation_id: String,
     archive_directory: PathBuf,
     epochs: Vec<u64>,
-    elapsed_execution_millis: u64,
+    #[serde(default)]
+    elapsed_execution_millis: Option<u64>,
     terminal_slot: u64,
     #[serde(default)]
     current_completion_overhead_seconds: Option<u64>,
@@ -126,6 +130,8 @@ struct Replay {
 
 #[derive(Debug, Deserialize)]
 struct Unit {
+    #[serde(default)]
+    unit: String,
     invocation_id: String,
     restarts: u64,
     active_state: String,
@@ -158,6 +164,8 @@ struct Output {
     status_receipt_directory: String,
     ranges: Vec<RangeOutput>,
     estimates: Vec<EpochEstimate>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    producer_start_proofs: Vec<ProducerStartProof>,
     mutations: Mutations,
 }
 
@@ -185,6 +193,220 @@ struct Mutations {
     replay_state_changed: bool,
     remote_mutations: bool,
     r2_mutations: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ProducerStartProof {
+    range: String,
+    unit: String,
+    before: BTreeMap<String, String>,
+    after: BTreeMap<String, String>,
+    object_path: String,
+    exec_main_start_timestamp_unix_micros: u64,
+    sampled_at_unix_micros: u64,
+    elapsed_execution_millis: u64,
+}
+
+fn command_output(program: &str, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{program} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        output.stdout.len() <= MAX_INPUT_BYTES as usize,
+        "oversized command output"
+    );
+    Ok(output.stdout)
+}
+
+fn live_properties(name: &str) -> Result<BTreeMap<String, String>> {
+    let bytes = command_output(
+        "/usr/bin/systemctl",
+        &[
+            "show",
+            name,
+            "--no-pager",
+            "--no-ask-password",
+            "--property=Id,LoadState,InvocationID,ActiveState,SubState,NRestarts,MainPID",
+        ],
+    )?;
+    let mut result = BTreeMap::new();
+    for line in std::str::from_utf8(&bytes)?.lines() {
+        let (key, value) = line.split_once('=').context("invalid systemd property")?;
+        ensure!(
+            result.insert(key.to_string(), value.to_string()).is_none(),
+            "duplicate systemd property"
+        );
+    }
+    Ok(result)
+}
+
+fn validate_owner(properties: &BTreeMap<String, String>, unit: &Unit) -> Result<()> {
+    for (key, expected) in [
+        ("Id", unit.unit.as_str()),
+        ("LoadState", "loaded"),
+        ("InvocationID", unit.invocation_id.as_str()),
+        ("ActiveState", "active"),
+        ("SubState", "running"),
+        ("NRestarts", "0"),
+    ] {
+        ensure!(
+            properties.get(key).map(String::as_str) == Some(expected),
+            "producer property {key} mismatch"
+        );
+    }
+    ensure!(
+        properties
+            .get("MainPID")
+            .context("missing producer PID")?
+            .parse::<u32>()?
+            > 0,
+        "producer has no PID"
+    );
+    Ok(())
+}
+
+fn sample_unix_micros(value: &str) -> Result<u64> {
+    ensure!(value.len() == 20 && value.is_ascii(), "invalid sample UTC");
+    ensure!(
+        &value[4..5] == "-"
+            && &value[7..8] == "-"
+            && &value[10..11] == "T"
+            && &value[13..14] == ":"
+            && &value[16..17] == ":"
+            && &value[19..20] == "Z",
+        "noncanonical sample UTC"
+    );
+    let number = |start, end| value[start..end].parse::<i32>();
+    ensure!(
+        value
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| matches!(i, 4 | 7 | 10 | 13 | 16 | 19) || b.is_ascii_digit()),
+        "noncanonical UTC digits"
+    );
+    let mut time: libc::tm = unsafe { std::mem::zeroed() };
+    time.tm_year = number(0, 4)? - 1900;
+    time.tm_mon = number(5, 7)? - 1;
+    time.tm_mday = number(8, 10)?;
+    time.tm_hour = number(11, 13)?;
+    time.tm_min = number(14, 16)?;
+    time.tm_sec = number(17, 19)?;
+    let fields = (
+        time.tm_year,
+        time.tm_mon,
+        time.tm_mday,
+        time.tm_hour,
+        time.tm_min,
+        time.tm_sec,
+    );
+    let seconds = unsafe { libc::timegm(&mut time) };
+    ensure!(
+        fields
+            == (
+                time.tm_year,
+                time.tm_mon,
+                time.tm_mday,
+                time.tm_hour,
+                time.tm_min,
+                time.tm_sec
+            ),
+        "nonexistent sample UTC"
+    );
+    u64::try_from(seconds)?
+        .checked_mul(1_000_000)
+        .context("sample time overflow")
+}
+
+fn elapsed_millis(sample: u64, start: u64) -> Result<u64> {
+    ensure!(start > 0, "zero producer start");
+    Ok(sample
+        .checked_sub(start)
+        .context("producer started after sample")?
+        / 1000)
+}
+
+fn parse_start(bytes: &[u8]) -> Result<u64> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    ensure!(value["type"] == "t", "start timestamp DBus type mismatch");
+    let start = value["data"]
+        .as_u64()
+        .context("invalid start timestamp DBus value")?;
+    ensure!(start > 0, "zero producer start");
+    Ok(start)
+}
+
+fn producer_start_proof(range: &str, unit: &Unit, sample: &str) -> Result<ProducerStartProof> {
+    ensure!(
+        unit.unit.ends_with(".service")
+            && unit
+                .unit
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.@".contains(&b)),
+        "invalid producer unit name"
+    );
+    let before = live_properties(&unit.unit)?;
+    validate_owner(&before, unit)?;
+    let object_bytes = command_output(
+        "/usr/bin/busctl",
+        &[
+            "--system",
+            "--json=short",
+            "--timeout=10s",
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "GetUnit",
+            "s",
+            &unit.unit,
+        ],
+    )?;
+    let object: serde_json::Value = serde_json::from_slice(&object_bytes)?;
+    ensure!(
+        object["type"] == "o" && object["data"].as_array().is_some_and(|a| a.len() == 1),
+        "invalid DBus unit object"
+    );
+    let object_path = object["data"][0]
+        .as_str()
+        .context("missing DBus unit path")?
+        .to_string();
+    ensure!(
+        object_path.starts_with("/org/freedesktop/systemd1/unit/"),
+        "unexpected DBus unit path"
+    );
+    let start = parse_start(&command_output(
+        "/usr/bin/busctl",
+        &[
+            "--system",
+            "--json=short",
+            "--timeout=10s",
+            "get-property",
+            "org.freedesktop.systemd1",
+            &object_path,
+            "org.freedesktop.systemd1.Service",
+            "ExecMainStartTimestamp",
+        ],
+    )?)?;
+    let after = live_properties(&unit.unit)?;
+    validate_owner(&after, unit)?;
+    ensure!(before == after, "producer changed during start proof");
+    let sampled_at_unix_micros = sample_unix_micros(sample)?;
+    Ok(ProducerStartProof {
+        range: range.to_string(),
+        unit: unit.unit.clone(),
+        before,
+        after,
+        object_path,
+        exec_main_start_timestamp_unix_micros: start,
+        sampled_at_unix_micros,
+        elapsed_execution_millis: elapsed_millis(sampled_at_unix_micros, start)?,
+    })
 }
 
 fn usage(program: &str) -> String {
@@ -316,7 +538,7 @@ fn validate_model(model: &Model) -> Result<()> {
     ensure!(
         matches!(
             model.schema.as_str(),
-            MODEL_SCHEMA_V1 | MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4
+            MODEL_SCHEMA_V1 | MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4 | MODEL_SCHEMA_V5
         ),
         "model schema mismatch"
     );
@@ -350,7 +572,7 @@ fn validate_model(model: &Model) -> Result<()> {
     ensure!(
         if matches!(model.schema.as_str(), MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3) {
             model.validation.prior_status_receipts_reproduced
-        } else if model.schema == MODEL_SCHEMA_V4 {
+        } else if matches!(model.schema.as_str(), MODEL_SCHEMA_V4 | MODEL_SCHEMA_V5) {
             model.validation.cohort_gate_evidence_validated
                 && model.validation.prior_downstream_allowances_reused
         } else {
@@ -370,7 +592,7 @@ fn validate_model(model: &Model) -> Result<()> {
     ensure!(!model.ranges.is_empty(), "model has no public ranges");
     if matches!(
         model.schema.as_str(),
-        MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4
+        MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4 | MODEL_SCHEMA_V5
     ) {
         let estimate_directory = model
             .estimate_receipt_directory
@@ -407,6 +629,10 @@ fn validate_model(model: &Model) -> Result<()> {
     let mut epochs = BTreeSet::new();
     for range in &model.ranges {
         ensure!(
+            range.elapsed_execution_millis.is_none() == (model.schema == MODEL_SCHEMA_V5),
+            "v5 must omit manual elapsed; legacy models must supply it"
+        );
+        ensure!(
             ranges.insert(range.range.as_str()),
             "duplicate modeled range"
         );
@@ -442,7 +668,7 @@ fn validate_model(model: &Model) -> Result<()> {
                 range.epoch_downstream_allowance_seconds.is_empty(),
                 "v2 model mixes per-epoch downstream allowances"
             );
-        } else if model.schema == MODEL_SCHEMA_V4 {
+        } else if matches!(model.schema.as_str(), MODEL_SCHEMA_V4 | MODEL_SCHEMA_V5) {
             ensure!(
                 range.formula.len() == range.epochs.len(),
                 "v4 modeled range lacks formulas"
@@ -496,7 +722,10 @@ fn validate_model(model: &Model) -> Result<()> {
                 range.formula.contains_key(&epoch.to_string()),
                 "missing epoch formula"
             );
-            if matches!(model.schema.as_str(), MODEL_SCHEMA_V2 | MODEL_SCHEMA_V4) {
+            if matches!(
+                model.schema.as_str(),
+                MODEL_SCHEMA_V2 | MODEL_SCHEMA_V4 | MODEL_SCHEMA_V5
+            ) {
                 ensure!(
                     range
                         .epoch_additional_replay_slots
@@ -504,7 +733,7 @@ fn validate_model(model: &Model) -> Result<()> {
                     "missing epoch replay offset"
                 );
             }
-            if model.schema == MODEL_SCHEMA_V4 {
+            if matches!(model.schema.as_str(), MODEL_SCHEMA_V4 | MODEL_SCHEMA_V5) {
                 ensure!(
                     range
                         .epoch_downstream_allowance_seconds
@@ -522,7 +751,7 @@ fn validate_model(model: &Model) -> Result<()> {
     }
     if matches!(
         model.schema.as_str(),
-        MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4
+        MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4 | MODEL_SCHEMA_V5
     ) {
         let expected: BTreeSet<_> = model
             .expected_observer_ranges
@@ -610,7 +839,7 @@ fn estimate_range(
                 Ok(seconds as u64)
             })
             .collect::<Result<Vec<_>>>()?
-    } else if model_schema == MODEL_SCHEMA_V4 {
+    } else if matches!(model_schema, MODEL_SCHEMA_V4 | MODEL_SCHEMA_V5) {
         model
             .epochs
             .iter()
@@ -687,7 +916,7 @@ fn estimate_range(
                 archive_directory: model.archive_directory.display().to_string(),
                 expected_controller_invocation_id: model.expected_controller_invocation_id.clone(),
                 expected_producer_invocation_id: model.expected_producer_invocation_id.clone(),
-                elapsed_execution_millis: model.elapsed_execution_millis,
+                elapsed_execution_millis: model.elapsed_execution_millis.unwrap_or(0),
                 estimated_remaining_millis: seconds
                     .checked_mul(1000)
                     .context("millisecond overflow")?,
@@ -778,7 +1007,7 @@ fn run() -> Result<()> {
     let receipt_directory_metadata = fs::symlink_metadata(&model.status_receipt_directory)?;
     let expected_receipt_uid = if matches!(
         model.schema.as_str(),
-        MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4
+        MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4 | MODEL_SCHEMA_V5
     ) {
         model
             .status_receipt_directory_uid
@@ -806,7 +1035,7 @@ fn run() -> Result<()> {
     );
     if matches!(
         model.schema.as_str(),
-        MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4
+        MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4 | MODEL_SCHEMA_V5
     ) {
         let expected: BTreeSet<_> = model.expected_observer_ranges.iter().collect();
         let observed: BTreeSet<_> = observer
@@ -827,6 +1056,7 @@ fn run() -> Result<()> {
 
     let mut ranges = Vec::new();
     let mut estimates = Vec::new();
+    let mut producer_start_proofs = Vec::new();
     for range_model in &model.ranges {
         ensure!(
             range_model.archive_directory.canonicalize()? == range_model.archive_directory,
@@ -846,6 +1076,17 @@ fn run() -> Result<()> {
             "observer range is missing or duplicated"
         );
         let (range, mut range_estimates) = estimate_range(range_model, matches[0], &model.schema)?;
+        if model.schema == MODEL_SCHEMA_V5 {
+            let proof = producer_start_proof(
+                &range_model.range,
+                &matches[0].producer_after,
+                &observer.recorded_at_utc,
+            )?;
+            for estimate in &mut range_estimates {
+                estimate.elapsed_execution_millis = proof.elapsed_execution_millis;
+            }
+            producer_start_proofs.push(proof);
+        }
         ranges.push(range);
         estimates.append(&mut range_estimates);
     }
@@ -855,6 +1096,7 @@ fn run() -> Result<()> {
             MODEL_SCHEMA_V2 => OUTPUT_SCHEMA_V2,
             MODEL_SCHEMA_V3 => OUTPUT_SCHEMA_V3,
             MODEL_SCHEMA_V4 => OUTPUT_SCHEMA_V4,
+            MODEL_SCHEMA_V5 => OUTPUT_SCHEMA_V5,
             _ => OUTPUT_SCHEMA_V1,
         },
         sampled_at_utc: observer.recorded_at_utc,
@@ -867,6 +1109,7 @@ fn run() -> Result<()> {
         status_receipt_directory: model.status_receipt_directory.display().to_string(),
         ranges,
         estimates,
+        producer_start_proofs,
         mutations: Mutations {
             replay_state_changed: false,
             remote_mutations: false,
@@ -896,6 +1139,7 @@ mod tests {
 
     fn unit(invocation_id: &str) -> Unit {
         Unit {
+            unit: "test-producer.service".to_string(),
             invocation_id: invocation_id.to_string(),
             restarts: 0,
             active_state: "active".to_string(),
@@ -913,7 +1157,7 @@ mod tests {
             expected_producer_invocation_id: producer.to_string(),
             archive_directory: "/tmp/lane-216-output".into(),
             epochs: vec![216, 217, 218, 219],
-            elapsed_execution_millis: 336_638_000,
+            elapsed_execution_millis: Some(336_638_000),
             terminal_slot: 94_175_999,
             current_completion_overhead_seconds: Some(10_230),
             second_epoch_commit_offset_seconds: Some(2_442),
@@ -967,7 +1211,7 @@ mod tests {
             expected_producer_invocation_id: "1".repeat(32),
             archive_directory: "/tmp/lane-220-output".into(),
             epochs: vec![220, 221, 222, 223],
-            elapsed_execution_millis: 214_176_000,
+            elapsed_execution_millis: Some(214_176_000),
             terminal_slot: 95_903_999,
             current_completion_overhead_seconds: Some(8_779),
             second_epoch_commit_offset_seconds: Some(2_442),
@@ -1006,7 +1250,7 @@ mod tests {
             expected_producer_invocation_id: producer.to_string(),
             archive_directory: "/tmp/lane-220-output".into(),
             epochs: vec![220, 221, 222, 223],
-            elapsed_execution_millis: 214_176_000,
+            elapsed_execution_millis: Some(214_176_000),
             terminal_slot: 95_903_999,
             current_completion_overhead_seconds: Some(8_779),
             second_epoch_commit_offset_seconds: Some(2_442),
@@ -1052,7 +1296,7 @@ mod tests {
             expected_producer_invocation_id: producer.clone(),
             archive_directory: "/tmp/lane-output".into(),
             epochs: vec![136, 137, 138],
-            elapsed_execution_millis: 1_000,
+            elapsed_execution_millis: Some(1_000),
             terminal_slot: 2_000,
             current_completion_overhead_seconds: None,
             second_epoch_commit_offset_seconds: None,
@@ -1105,7 +1349,7 @@ mod tests {
             expected_producer_invocation_id: producer.clone(),
             archive_directory: "/tmp/lane-output".into(),
             epochs: vec![216, 217, 218, 219],
-            elapsed_execution_millis: 1_000,
+            elapsed_execution_millis: Some(1_000),
             terminal_slot: 2_000,
             current_completion_overhead_seconds: None,
             second_epoch_commit_offset_seconds: None,
@@ -1141,6 +1385,17 @@ mod tests {
             invocation_binding_stable: true,
         };
         let (range, estimates) = estimate_range(&model, &replay, MODEL_SCHEMA_V4).unwrap();
+        let (_, v5_estimates) = estimate_range(&model, &replay, MODEL_SCHEMA_V5).unwrap();
+        assert_eq!(
+            estimates
+                .iter()
+                .map(|e| e.estimated_remaining_millis)
+                .collect::<Vec<_>>(),
+            v5_estimates
+                .iter()
+                .map(|e| e.estimated_remaining_millis)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(range.current_completion_seconds, 700);
         assert_eq!(
             estimates
@@ -1159,7 +1414,7 @@ mod tests {
             expected_producer_invocation_id: "5".repeat(32),
             archive_directory: "/tmp/lane-output".into(),
             epochs: vec![216, 217, 218, 219],
-            elapsed_execution_millis: 1_000,
+            elapsed_execution_millis: Some(1_000),
             terminal_slot: 2_000,
             current_completion_overhead_seconds: None,
             second_epoch_commit_offset_seconds: None,
@@ -1210,10 +1465,78 @@ mod tests {
             },
         };
         validate_model(&model).unwrap();
+        model.schema = MODEL_SCHEMA_V5.to_string();
+        assert!(validate_model(&model).is_err());
+        model.ranges[0].elapsed_execution_millis = None;
+        validate_model(&model).unwrap();
         model.ranges[0]
             .epoch_downstream_allowance_seconds
             .remove("219");
         assert!(validate_model(&model).is_err());
+    }
+
+    #[test]
+    fn authoritative_elapsed_rejects_future_and_zero_start() {
+        let sample = sample_unix_micros("2026-10-20T05:38:00Z").unwrap();
+        assert_eq!(
+            elapsed_millis(sample, 1_792_019_814_582_790).unwrap(),
+            454_865_417
+        );
+        assert!(elapsed_millis(sample, sample + 1).is_err());
+        assert!(elapsed_millis(sample, 0).is_err());
+        for bad in [
+            "2026-02-30T00:00:00Z",
+            "2026-10-20T25:00:00Z",
+            "2026-10-20T+1:00:00Z",
+            "2026-10-20 05:38:00Z",
+        ] {
+            assert!(sample_unix_micros(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn dbus_start_requires_unsigned_scalar_microseconds() {
+        assert_eq!(
+            parse_start(br#"{"type":"t","data":1234567}"#).unwrap(),
+            1_234_567
+        );
+        for bad in [
+            br#"{"type":"t","data":[1234567]}"#.as_slice(),
+            br#"{"type":"s","data":1234567}"#,
+            br#"{"type":"t","data":0}"#,
+            br#"{"type":"t","data":-1}"#,
+        ] {
+            assert!(parse_start(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn elapsed_owner_rejects_restart_replacement_and_inactive_state() {
+        let owner = unit(&"a".repeat(32));
+        let good: BTreeMap<String, String> = [
+            ("Id", owner.unit.as_str()),
+            ("LoadState", "loaded"),
+            ("InvocationID", owner.invocation_id.as_str()),
+            ("ActiveState", "active"),
+            ("SubState", "running"),
+            ("NRestarts", "0"),
+            ("MainPID", "42"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        validate_owner(&good, &owner).unwrap();
+        for (key, value) in [
+            ("InvocationID", "other"),
+            ("NRestarts", "1"),
+            ("MainPID", "0"),
+            ("ActiveState", "inactive"),
+            ("LoadState", "not-found"),
+        ] {
+            let mut bad = good.clone();
+            bad.insert(key.to_string(), value.to_string());
+            assert!(validate_owner(&bad, &owner).is_err());
+        }
     }
 
     #[test]
@@ -1227,7 +1550,7 @@ mod tests {
                     expected_producer_invocation_id: "95fb05d1b78349bcb907c1e930e7682e".to_string(),
                     archive_directory: "/tmp/lane-216-output".into(),
                     epochs: vec![216, 217, 218, 219],
-                    elapsed_execution_millis: 334_838_000,
+                    elapsed_execution_millis: Some(334_838_000),
                     terminal_slot: 94_175_999,
                     current_completion_overhead_seconds: Some(10_230),
                     second_epoch_commit_offset_seconds: Some(2_442),
@@ -1251,7 +1574,7 @@ mod tests {
                     expected_producer_invocation_id: "c2adebaad0cb42b385156631156813fe".to_string(),
                     archive_directory: "/tmp/lane-220-output".into(),
                     epochs: vec![220, 221, 222, 223],
-                    elapsed_execution_millis: 212_376_000,
+                    elapsed_execution_millis: Some(212_376_000),
                     terminal_slot: 95_903_999,
                     current_completion_overhead_seconds: Some(8_779),
                     second_epoch_commit_offset_seconds: Some(2_442),
@@ -1321,7 +1644,7 @@ mod tests {
                 expected_producer_invocation_id: "c".repeat(32),
                 archive_directory: "/tmp/lane-output".into(),
                 epochs: vec![220, 221, 222, 223],
-                elapsed_execution_millis: 1,
+                elapsed_execution_millis: Some(1),
                 terminal_slot: 95_903_999,
                 current_completion_overhead_seconds: Some(8_779),
                 second_epoch_commit_offset_seconds: Some(2_442),
@@ -1373,7 +1696,7 @@ mod tests {
                 expected_producer_invocation_id: "c".repeat(32),
                 archive_directory: "/tmp/lane-output".into(),
                 epochs: vec![220, 221, 222, 223],
-                elapsed_execution_millis: 1,
+                elapsed_execution_millis: Some(1),
                 terminal_slot: 95_903_999,
                 current_completion_overhead_seconds: Some(8_779),
                 second_epoch_commit_offset_seconds: Some(2_442),
