@@ -123,6 +123,31 @@ root-private fsynced no-clobber result. `--check-only` tests local bindings with
 scanning or writing. This source alone does not prove an operational deployment,
 real census, source completeness, native liveness, PoH recovery or publication.
 
+`jetstreamer-epoch141-ledger-collect` is a separate fixed full-retention profile
+sharing the census executable's source, admission, guard and receipt gates.
+It additionally requires a separately hash-bound successful **complete** census
+of the same frozen compressed inode and source verification. Its immutable plan
+binds a separate empty root-private same-filesystem destination and an incremental
+peak budget covering every member's rounded allocation plus 64 MiB of slack.
+Fresh admission must cover that entire budget **above** the unchanged protected
+free-space threshold. This scheduling estimate does not equate logical lengths
+with exact physical allocation; the actual-free-space guard remains mandatory.
+
+The collector prehashes and fully decodes the input again, retaining every file
+through the reviewed no-clobber tar core. A result is written only if all names,
+lengths, digests, CURRENT/MANIFEST/WAL bindings and compressed identity match the
+prior complete census exactly (except the explicit `files_retained` bit).
+The census-only executable rejects retention plans; neither executable exposes
+a command-line mode override. Guard failure preserves partial diagnostic output,
+never reuses or deletes it and writes no successful collection receipt.
+
+This source is not an operational deployment or real collection result. Seal and
+qualify the exact executable, run fresh complete admission, and prove its initial
+guard under a persistent bounded non-restarting sandbox before real retention.
+Original-backup completeness, complete actual CF set, native read-only resolution,
+trusted clock and all post-gap PoH/canonical/publication gates remain separate.
+No live sealed census deployment is changed by this source refactor.
+
 The native crash-shaped fixture also compares direct-tar and digest-bound
 multistream-bzip2 collections byte-for-byte, then performs the complete-CF native
 read-only resolution against the compressed collection. It checks live-file
