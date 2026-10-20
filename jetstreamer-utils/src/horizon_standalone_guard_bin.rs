@@ -109,6 +109,11 @@ fn canary_scope(unit: &str) -> Result<(&'static str, u64)> {
             "jetstreamer-private-epoch224-canary-target-stop-v1",
             96_800_000,
         ))
+    } else if unit.starts_with("horizon-qualify-205-bounded-resource-") {
+        Ok((
+            "jetstreamer-private-epoch205-canary-target-stop-v1",
+            88_584_000,
+        ))
     } else if unit.starts_with("horizon-qualify-203-bounded-resource-") {
         Ok((
             "jetstreamer-private-epoch203-canary-target-stop-v1",
@@ -1219,6 +1224,45 @@ mod tests {
         ] {
             assert!(canary_scope(bad).is_err());
         }
+    }
+
+    #[test]
+    fn epoch205_handoff_is_exact_fresh_and_cannot_borrow_other_canaries() {
+        let root = Path::new("/private/canary");
+        let (mut intent, capture) = target_fixture(root);
+        let unit = "horizon-qualify-205-bounded-resource-test.service";
+        assert!(
+            validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1100, 180)
+                .is_err()
+        );
+        intent["schema"] = json!("jetstreamer-private-epoch205-canary-target-stop-v1");
+        intent["target_slot"] = json!(88_584_000);
+        intent["observed_slot"] = json!(88_584_005);
+        validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1100, 180).unwrap();
+        for other in [
+            "horizon-qualify-203-bounded-resource-test.service",
+            "horizon-qualify-224-bounded-resource-test.service",
+            "horizon-qualify-225-bounded-resource-test.service",
+        ] {
+            assert!(
+                validate_canary_target(other, &intent, &capture, &"a".repeat(32), root, 1100, 180)
+                    .is_err()
+            );
+        }
+        assert!(
+            validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1181, 180)
+                .is_err()
+        );
+        intent["observed_slot"] = json!(88_585_001);
+        assert!(
+            validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1100, 180)
+                .is_err()
+        );
+        intent["target_slot"] = json!(88_991_050);
+        assert!(
+            validate_canary_target(unit, &intent, &capture, &"a".repeat(32), root, 1100, 180)
+                .is_err()
+        );
     }
     #[test]
     fn canary_evidence_is_private_readonly_and_never_a_symlink() {

@@ -19,6 +19,8 @@ epoch203-single-thread-resource = []
 epoch203-root-prefix-resource = []
 # Private fixed-span epoch224 measurement against its pinned v1.6.25 package.
 epoch224-bounded-resource = []
+# Dormant exact epoch205 checkpoint-prefix measurement; no ordinary replay.
+epoch205-bounded-resource = []
 
 [lib]
 name = "jetstreamer_utils"
@@ -116,6 +118,11 @@ required-features = ["epoch224-bounded-resource"]
 [[bin]]
 name = "jetstreamer-epoch203-bounded-resource"
 path = "src/epoch203_bounded_resource_bin.rs"
+
+[[bin]]
+name = "jetstreamer-epoch205-bounded-resource"
+path = "src/epoch205_bounded_resource_bin.rs"
+required-features = ["epoch205-bounded-resource"]
 
 [[bin]]
 name = "jetstreamer-epoch203-resource-compare"
