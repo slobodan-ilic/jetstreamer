@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, process::Command as ProcessCommand};
 
 const SCHEMA: &str = "jetstreamer-horizon-campaign-fleet-v1";
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct BoundFile {
     path: PathBuf,
@@ -32,7 +32,7 @@ struct DiagnosticClaim {
 
 // Observational only: these claims never authorize launch, publication or upload.
 // Keep delivery distinct from private diagnostics, which forbid remote mutation.
-#[derive(Deserialize)]
+#[derive(Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct PipelineClaim {
     epoch: u64,
@@ -61,6 +61,17 @@ fn validate_pipeline_claim(claim: &PipelineClaim, first: u64, last: u64) -> Resu
             && !claim.expected_exec_start.trim().is_empty()
             && !claim.evidence.is_empty(),
         "invalid observational pipeline claim"
+    );
+    Ok(())
+}
+
+fn preserve_pipeline_claims(previous: &Plan, current: &Plan) -> Result<()> {
+    ensure!(
+        previous.schema == current.schema
+            && previous.first_epoch == current.first_epoch
+            && previous.last_epoch == current.last_epoch
+            && previous.pipeline_claims == current.pipeline_claims,
+        "same-sample diagnostic admission cannot change pipeline claims"
     );
     Ok(())
 }
@@ -857,10 +868,22 @@ pub(super) async fn run() -> Result<()> {
         names.insert(claim.unit.clone());
     }
     let mut pipeline_units = BTreeSet::new();
-    ensure!(
-        plan.admission_transition_guard.is_none() || plan.pipeline_claims.is_empty(),
-        "same-sample diagnostic admission cannot change pipeline claims"
-    );
+    if plan.admission_transition_guard.is_some() {
+        // Preserve the exact claims from the hash-bound predecessor plan,
+        // including completed delivery history. Requiring an empty vector
+        // would silently force history to be dropped just to add a diagnostic.
+        let previous_plan: Plan = serde_json::from_value(bound_json(&BoundFile {
+            path: previous_fleet["plan"]
+                .as_str()
+                .context("predecessor plan missing")?
+                .into(),
+            sha256: previous_fleet["plan_sha256"]
+                .as_str()
+                .context("predecessor plan digest missing")?
+                .into(),
+        })?)?;
+        preserve_pipeline_claims(&previous_plan, &plan)?;
+    }
     for claim in &plan.pipeline_claims {
         validate_pipeline_claim(claim, plan.first_epoch, plan.last_epoch)?;
         ensure!(
@@ -1398,6 +1421,25 @@ mod tests {
         assert!(!epoch203_resource_runner_matches(&claim, &receipt));
         receipt["solana_rayon_threads"] = json!(16);
         assert!(epoch203_resource_runner_matches(&claim, &receipt));
+    }
+
+    #[test]
+    fn same_sample_diagnostic_preserves_exact_existing_pipeline_history() {
+        let (_, mut previous, _, _) = admission_fixture();
+        let pipeline = json!({"epoch":213,"phase":"upload-readback","unit":"horizon-upload-213-test.service",
+            "invocation_id":"a".repeat(32),"expected_exec_start":"exact original command",
+            "evidence":[{"path":"/proof.json","sha256":"b".repeat(64)}]});
+        previous.pipeline_claims = vec![serde_json::from_value(pipeline.clone()).unwrap()];
+        let (_, mut current, _, _) = admission_fixture();
+        current.pipeline_claims = vec![serde_json::from_value(pipeline).unwrap()];
+        preserve_pipeline_claims(&previous, &current).unwrap();
+        current.pipeline_claims[0].invocation_id = "c".repeat(32);
+        assert!(preserve_pipeline_claims(&previous, &current).is_err());
+        current.pipeline_claims[0].invocation_id = "a".repeat(32);
+        current.pipeline_claims[0].expected_exec_start = "substituted command".into();
+        assert!(preserve_pipeline_claims(&previous, &current).is_err());
+        current.pipeline_claims.clear();
+        assert!(preserve_pipeline_claims(&previous, &current).is_err());
     }
     #[test]
     fn bounded_203_same_sample_event_requires_its_own_guard_and_preserves_cadence() {
