@@ -44,6 +44,7 @@ struct Plan {
     source_verification: Bound,
     admission_manifest: Bound,
     admission_receipt: PathBuf,
+    initial_guard_receipt: PathBuf,
     output_receipt: PathBuf,
     archive_root: PathBuf,
     minimum_free_bytes: u64,
@@ -103,6 +104,12 @@ fn validate_bounds(plan: &Plan) -> Result<()> {
                 .output_receipt
                 .starts_with(Path::new(INPUT).parent().unwrap()),
         "unsafe output scope"
+    );
+    ensure!(
+        plan.initial_guard_receipt != plan.output_receipt
+            && plan.initial_guard_receipt != plan.admission_receipt
+            && plan.initial_guard_receipt.parent() == plan.output_receipt.parent(),
+        "unsafe initial guard path"
     );
     let parent = plan
         .output_receipt
@@ -300,6 +307,17 @@ fn run() -> Result<()> {
         invocation.len() == 32 && is_sha(&format!("{invocation}{invocation}")),
         "invalid invocation"
     );
+    write_receipt(
+        &plan.initial_guard_receipt,
+        &json!({
+            "schema":"jetstreamer-epoch141-ledger-census-initial-guard-v1", "epoch":141,
+            "invocation_id":invocation,"plan_sha256":values["--plan-sha256"],
+            "self_sha256":values["--self-sha256"],"admission_receipt_sha256":values["--admission-sha256"],
+            "available_bytes":free_before,"minimum_free_bytes":plan.minimum_free_bytes,
+            "trip":false,"files_retained":false,"publication_authorized":false,
+            "remote_mutations":false,"r2_mutations":false
+        }),
+    )?;
     let mut last_guard = Instant::now();
     let census = census_bound_bzip2_guarded(
         input,
@@ -382,6 +400,7 @@ mod tests {
                 sha256: "2".repeat(64),
             },
             admission_receipt: "/proof/admitted.json".into(),
+            initial_guard_receipt: "/result/initial-guard.json".into(),
             output_receipt: "/result/census.json".into(),
             archive_root: "rocksdb".into(),
             minimum_free_bytes: 5_153_013_784_006,
