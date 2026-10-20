@@ -33,6 +33,197 @@ struct Plan {
     receipt_directory: PathBuf,
     #[serde(default)]
     bounded_measurement: Option<handoff::BoundedMeasurement>,
+    #[serde(default)]
+    bounded_canary: Option<BoundedCanary>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoundedCanary {
+    expected_uid: u32,
+    target_stop_intent: PathBuf,
+    maximum_drainage_seconds: u64,
+}
+
+fn read_canary_evidence(path: &Path, uid: u32, maximum: u64) -> Result<Vec<u8>> {
+    ensure!(
+        path.is_absolute() && path.canonicalize()? == path,
+        "noncanonical canary evidence"
+    );
+    let parent = path.parent().context("canary evidence parent")?;
+    let directory = fs::symlink_metadata(parent)?;
+    ensure!(
+        directory.is_dir() && directory.uid() == uid && directory.mode() & 0o077 == 0,
+        "unsafe canary evidence directory"
+    );
+    let before = fs::symlink_metadata(path)?;
+    ensure!(
+        before.is_file()
+            && before.uid() == uid
+            && before.nlink() == 1
+            && before.mode() & 0o222 == 0
+            && before.len() <= maximum,
+        "unsafe canary evidence"
+    );
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let opened = file.metadata()?;
+    ensure!(
+        before.dev() == opened.dev() && before.ino() == opened.ino(),
+        "canary evidence replaced"
+    );
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)?;
+    let after = fs::symlink_metadata(path)?;
+    ensure!(
+        bytes.len() as u64 == before.len()
+            && before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.len() == after.len()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec(),
+        "canary evidence changed"
+    );
+    Ok(bytes)
+}
+
+fn validate_canary_target(
+    intent: &Value,
+    capture: &Value,
+    invocation: &str,
+    root: &Path,
+    now: u64,
+    maximum_age: u64,
+) -> Result<()> {
+    ensure!(
+        intent["schema"] == "jetstreamer-private-epoch225-canary-target-stop-v1"
+            && intent["invocation_id"] == invocation
+            && intent["target_slot"] == 97_202_500u64
+            && intent["observed_slot"]
+                .as_u64()
+                .is_some_and(|s| (97_202_500..=97_203_500).contains(&s))
+            && intent["child_pid"]
+                .as_u64()
+                .is_some_and(|p| p > 1 && p <= i32::MAX as u64)
+            && intent["scratch_snapshot_captured"] == true
+            && intent["external_signal"] == 0,
+        "invalid canary target-stop scope"
+    );
+    let written = intent["written_unix_seconds"]
+        .as_u64()
+        .context("target-stop time")?;
+    ensure!(
+        written <= now && now - written <= maximum_age,
+        "canary drainage interval expired or future-dated"
+    );
+    let capture_path = root.join("receipts/target-capture.json");
+    ensure!(
+        intent["capture_path"].as_str() == capture_path.to_str(),
+        "wrong canary capture path"
+    );
+    let expected = intent["capture_canonical_json_sha256"]
+        .as_str()
+        .context("capture digest")?;
+    ensure!(
+        digest(expected) && sha(&serde_json::to_vec(capture)?) == expected,
+        "canary capture digest mismatch"
+    );
+    let scratch = root.join("scratch");
+    let accounts = Path::new(
+        capture["accounts_state"]["path"]
+            .as_str()
+            .context("accounts-state path")?,
+    );
+    ensure!(
+        capture["scratch"]["path"].as_str() == scratch.to_str()
+            && accounts.starts_with(&scratch)
+            && accounts.file_name().is_some_and(|n| n == "accounts-state")
+            && !accounts.components().any(|c| matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            ))
+            && capture["scratch"]["physical_bytes"]
+                .as_u64()
+                .is_some_and(|b| b <= 256u64 << 30)
+            && capture["accounts_state"]["regular_files"]
+                .as_u64()
+                .is_some_and(|n| n > 0)
+            && capture["cgroup"].as_object().is_some_and(|m| !m.is_empty()),
+        "invalid captured canary resources"
+    );
+    Ok(())
+}
+
+fn canary_target(p: &Plan, c: &BoundedCanary, now: u64) -> Result<Option<Value>> {
+    match fs::symlink_metadata(&c.target_stop_intent) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
+    let intent_raw = read_canary_evidence(&c.target_stop_intent, c.expected_uid, 64 << 10)?;
+    let capture_raw = read_canary_evidence(
+        &p.worker_root.join("receipts/target-capture.json"),
+        c.expected_uid,
+        64 << 20,
+    )?;
+    let intent: Value = serde_json::from_slice(&intent_raw)?;
+    let capture: Value = serde_json::from_slice(&capture_raw)?;
+    validate_canary_target(
+        &intent,
+        &capture,
+        &p.invocation_id,
+        &p.worker_root,
+        now,
+        c.maximum_drainage_seconds,
+    )?;
+    Ok(Some(
+        json!({"intent":intent,"intent_sha256":sha(&intent_raw),"capture_sha256":sha(&capture_raw)}),
+    ))
+}
+
+fn pinned_canary_target(
+    p: &Plan,
+    c: &BoundedCanary,
+    now: u64,
+    plan_sha: &str,
+) -> Result<Option<Value>> {
+    let Some(evidence) = canary_target(p, c, now)? else {
+        return Ok(None);
+    };
+    let pin_path = p.receipt_directory.join("canary-target-handoff-pin.json");
+    match fs::symlink_metadata(&pin_path) {
+        Ok(_) => {
+            let pin: Value = serde_json::from_slice(&read_private(&pin_path)?)?;
+            ensure!(
+                handoff_pin_matches(&pin, plan_sha, &p.invocation_id, &evidence),
+                "canary target evidence changed after first accepted observation"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => persist(
+            &pin_path,
+            &json!({"schema":"jetstreamer-horizon-bounded-handoff-pin-v1","plan_sha256":plan_sha,"producer_invocation_id":p.invocation_id,"target_handoff":evidence,"remote_mutations":false,"r2_mutations":false}),
+        )?,
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(evidence))
+}
+
+fn canary_trip_reason(
+    workers: usize,
+    valid_target: bool,
+    evidence_error: bool,
+) -> Option<&'static str> {
+    if evidence_error {
+        Some("canary-target-evidence-failed")
+    } else if workers == 0 && !valid_target {
+        Some("zero-workers-before-target")
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -349,6 +540,20 @@ fn run() -> Result<()> {
     ensure!(sha(&bytes) == args[3], "guard plan digest mismatch");
     let plan: Plan = serde_json::from_slice(&bytes)?;
     ensure!(
+        plan.bounded_measurement.is_none() || plan.bounded_canary.is_none(),
+        "choose exactly one bounded guard profile"
+    );
+    if let Some(c) = &plan.bounded_canary {
+        ensure!(
+            plan.unit
+                .starts_with("horizon-qualify-225-bounded-resource-")
+                && c.expected_uid == 1000
+                && c.target_stop_intent == plan.worker_root.join("receipts/target-stop.json")
+                && (60..=180).contains(&c.maximum_drainage_seconds),
+            "invalid bounded-canary guard scope"
+        );
+    }
+    ensure!(
         plan.schema == "jetstreamer-horizon-standalone-guard-plan-v1"
             && plan.unit.starts_with("horizon-qualify-")
             && plan.unit.ends_with(".service")
@@ -464,6 +669,20 @@ fn run() -> Result<()> {
     // never evidence that the unit has no worker.
     let error = observed_workers.as_ref().err().map(ToString::to_string);
     let worker_list = observed_workers.unwrap_or_default();
+    let target_observation = if active(&before) && error.is_none() {
+        plan.bounded_canary
+            .as_ref()
+            .map(|c| pinned_canary_target(&plan, c, now, &args[3]))
+    } else {
+        None
+    };
+    let target_error = target_observation
+        .as_ref()
+        .and_then(|r| r.as_ref().err())
+        .map(ToString::to_string);
+    let valid_target = target_observation
+        .as_ref()
+        .is_some_and(|r| matches!(r, Ok(Some(_))));
     let handoff = if active(&before) && error.is_none() && worker_list.is_empty() {
         plan.bounded_measurement
             .as_ref()
@@ -507,6 +726,11 @@ fn run() -> Result<()> {
             plan.bounded_measurement.is_some(),
             handoff_evidence.is_some(),
         )
+        .or_else(|| {
+            plan.bounded_canary.as_ref().and_then(|_| {
+                canary_trip_reason(worker_list.len(), valid_target, target_error.is_some())
+            })
+        })
     } else {
         None
     };
@@ -522,6 +746,7 @@ fn run() -> Result<()> {
         "minimum_free_bytes":plan.minimum_free_bytes,"maximum_worker_vmas":plan.maximum_worker_vmas,
         "workers":worker_list,"worker_observation_error":error,"trip_reason":reason,
         "bounded_measurement":plan.bounded_measurement.is_some(),
+        "bounded_canary":plan.bounded_canary,"canary_target_stop_valid":valid_target,"canary_target_error":target_error,
         "target_handoff":handoff_evidence,"target_handoff_error":handoff_error,
         "remote_mutations":false,"r2_mutations":false,"scratch_deleted":false});
     persist(
@@ -756,6 +981,190 @@ mod tests {
         let mut escaped = state;
         escaped.cgroup = "//system.slice/test.service".into();
         assert!(workers_from_roots(&escaped, &scratch, &cgroups, &proc).is_err());
+    }
+    #[test]
+    fn canary_zero_worker_exception_requires_fresh_valid_target_evidence() {
+        assert_eq!(canary_trip_reason(1, false, false), None);
+        assert_eq!(
+            canary_trip_reason(0, false, false),
+            Some("zero-workers-before-target")
+        );
+        assert_eq!(canary_trip_reason(0, true, false), None);
+        assert_eq!(
+            canary_trip_reason(0, true, true),
+            Some("canary-target-evidence-failed")
+        );
+        assert_eq!(
+            canary_trip_reason(1, false, true),
+            Some("canary-target-evidence-failed")
+        );
+        assert_eq!(
+            trip_reason(100, 100, &[(1, 1), (2, 1)], 500),
+            Some("multiple-workers")
+        );
+    }
+    fn target_fixture(root: &Path) -> (Value, Value) {
+        let capture = json!({"scratch":{"path":root.join("scratch"),"physical_bytes":4096},"accounts_state":{"path":root.join("scratch/runtime/accounts-state"),"regular_files":1},"cgroup":{"memory.current":"100\n"}});
+        let intent = json!({"schema":"jetstreamer-private-epoch225-canary-target-stop-v1","invocation_id":"a".repeat(32),"target_slot":97202500,"observed_slot":97202505,"child_pid":123,"written_unix_seconds":1000,"scratch_snapshot_captured":true,"external_signal":0,"capture_path":root.join("receipts/target-capture.json"),"capture_canonical_json_sha256":sha(&serde_json::to_vec(&capture).unwrap())});
+        (intent, capture)
+    }
+    #[test]
+    fn canary_target_binds_scope_time_capture_and_absence_of_external_signal() {
+        let root = Path::new("/private/canary");
+        let (intent, capture) = target_fixture(root);
+        validate_canary_target(&intent, &capture, &"a".repeat(32), root, 1100, 180).unwrap();
+        assert!(
+            validate_canary_target(&intent, &capture, &"b".repeat(32), root, 1100, 180).is_err()
+        );
+        assert!(
+            validate_canary_target(&intent, &capture, &"a".repeat(32), root, 999, 180).is_err()
+        );
+        assert!(
+            validate_canary_target(&intent, &capture, &"a".repeat(32), root, 1181, 180).is_err()
+        );
+        for (key, value) in [
+            ("target_slot", json!(97202501)),
+            ("observed_slot", json!(97202500 - 1)),
+            ("external_signal", json!(2)),
+            ("scratch_snapshot_captured", json!(false)),
+            ("child_pid", json!(1)),
+            ("capture_path", json!("/other")),
+            ("capture_canonical_json_sha256", json!("0".repeat(64))),
+        ] {
+            let mut bad = intent.clone();
+            bad[key] = value;
+            assert!(
+                validate_canary_target(&bad, &capture, &"a".repeat(32), root, 1100, 180).is_err(),
+                "{key}"
+            );
+        }
+        let mut substituted = capture.clone();
+        substituted["accounts_state"]["regular_files"] = json!(2);
+        assert!(
+            validate_canary_target(&intent, &substituted, &"a".repeat(32), root, 1100, 180)
+                .is_err()
+        );
+        let mut escaped = capture.clone();
+        escaped["accounts_state"]["path"] = json!("/other/accounts-state");
+        let mut forged = intent.clone();
+        forged["capture_canonical_json_sha256"] =
+            json!(sha(&serde_json::to_vec(&escaped).unwrap()));
+        assert!(
+            validate_canary_target(&forged, &escaped, &"a".repeat(32), root, 1100, 180).is_err()
+        );
+    }
+    #[test]
+    fn canary_evidence_is_private_readonly_and_never_a_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        fs::set_permissions(t.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = t.path().join("intent.json");
+        fs::write(&path, b"{}").unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert!(read_canary_evidence(&path, uid, 100).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(read_canary_evidence(&path, uid, 100).unwrap(), b"{}");
+        assert!(read_canary_evidence(&path, uid + 1, 100).is_err());
+        assert!(read_canary_evidence(&path, uid, 1).is_err());
+        let alias = t.path().join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(read_canary_evidence(&alias, uid, 100).is_err());
+    }
+    #[test]
+    fn canary_capture_then_intent_handoff_is_atomic_and_substitution_fails() {
+        let t = tempfile::tempdir().unwrap();
+        let receipts = t.path().join("receipts");
+        fs::create_dir(&receipts).unwrap();
+        fs::set_permissions(&receipts, fs::Permissions::from_mode(0o700)).unwrap();
+        let (intent, capture) = target_fixture(t.path());
+        let p:Plan=serde_json::from_value(json!({"schema":"jetstreamer-horizon-standalone-guard-plan-v1","unit":"horizon-qualify-225-bounded-resource-test.service","invocation_id":"a".repeat(32),"filesystem":"/","minimum_free_bytes":1,"worker_root":t.path(),"maximum_worker_vmas":3500000,"receipt_directory":t.path(),"bounded_canary":{"expected_uid":unsafe{libc::geteuid()},"target_stop_intent":receipts.join("target-stop.json"),"maximum_drainage_seconds":180}})).unwrap();
+        let c = p.bounded_canary.as_ref().unwrap();
+        let capture_path = receipts.join("target-capture.json");
+        fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+        fs::set_permissions(&capture_path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(canary_target(&p, c, 1100).unwrap().is_none());
+        fs::write(
+            &c.target_stop_intent,
+            serde_json::to_vec_pretty(&intent).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&c.target_stop_intent, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(canary_target(&p, c, 1100).unwrap().is_some());
+        let replacement = receipts.join("replacement.json");
+        fs::write(&replacement, b"{}").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::rename(replacement, &capture_path).unwrap();
+        assert!(canary_target(&p, c, 1100).is_err());
+    }
+    #[test]
+    fn pinned_canary_target_cannot_renew_its_timestamp() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        fs::set_permissions(t.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let receipts = t.path().join("receipts");
+        fs::create_dir(&receipts).unwrap();
+        fs::set_permissions(&receipts, fs::Permissions::from_mode(0o700)).unwrap();
+        let (mut intent, capture) = target_fixture(t.path());
+        let p:Plan=serde_json::from_value(json!({"schema":"jetstreamer-horizon-standalone-guard-plan-v1","unit":"horizon-qualify-225-bounded-resource-test.service","invocation_id":"a".repeat(32),"filesystem":"/","minimum_free_bytes":1,"worker_root":t.path(),"maximum_worker_vmas":3500000,"receipt_directory":t.path(),"bounded_canary":{"expected_uid":0,"target_stop_intent":receipts.join("target-stop.json"),"maximum_drainage_seconds":180}})).unwrap();
+        let c = p.bounded_canary.as_ref().unwrap();
+        let capture_path = receipts.join("target-capture.json");
+        fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+        fs::set_permissions(&capture_path, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::write(
+            &c.target_stop_intent,
+            serde_json::to_vec_pretty(&intent).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&c.target_stop_intent, fs::Permissions::from_mode(0o400)).unwrap();
+        pinned_canary_target(&p, c, 1100, "plan").unwrap().unwrap();
+        pinned_canary_target(&p, c, 1100, "plan").unwrap().unwrap();
+        intent["written_unix_seconds"] = json!(1100);
+        let replacement = receipts.join("renewed.json");
+        fs::write(&replacement, serde_json::to_vec_pretty(&intent).unwrap()).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::rename(replacement, &c.target_stop_intent).unwrap();
+        assert!(pinned_canary_target(&p, c, 1101, "plan").is_err());
+    }
+    #[test]
+    fn nested_cgroup_census_recognizes_the_actual_copied_worker_and_maps() {
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("generation");
+        fs::create_dir(&root).unwrap();
+        let exe = root.join("historical-worker");
+        fs::copy("/bin/sleep", &exe).unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o555)).unwrap();
+        let child = Owned(Command::new(&exe).arg("20").spawn().unwrap());
+        let cg = t.path().join("actual");
+        fs::create_dir(&cg).unwrap();
+        fs::write(cg.join("cgroup.procs"), b"").unwrap();
+        let nested = cg.join("child");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("cgroup.procs"), format!("{}\n", child.0.id())).unwrap();
+        let pids = cgroup_pids(&cg).unwrap();
+        assert_eq!(pids, vec![child.0.id()]);
+        let mut state = unit();
+        state.cgroup = "/actual".into();
+        let found = workers_from_roots(&state, &root, t.path(), Path::new("/proc")).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, child.0.id());
+        assert!(found[0].1 > 0);
+        assert!(
+            workers_from_roots(
+                &state,
+                &t.path().join("foreign"),
+                t.path(),
+                Path::new("/proc")
+            )
+            .is_err()
+        );
     }
     #[test]
     fn changed_invocation_or_restart_policy_is_never_stopped() {
