@@ -47,6 +47,139 @@ struct Plan {
     // They are active qualification work, not ordinary replay/sidecar claims.
     #[serde(default)]
     diagnostics: Vec<DiagnosticClaim>,
+    // One event-driven bounded admission may update the active list using the
+    // same observer. This is not authority for another resource observation.
+    #[serde(default)]
+    admission_transition_guard: Option<BoundFile>,
+}
+
+fn validate_same_sample_admission(
+    previous: &Value,
+    plan: &Plan,
+    sample: &str,
+    guard: &Value,
+    guard_plan: &Value,
+    now: u64,
+) -> Result<()> {
+    ensure!(
+        previous["schema"] == SCHEMA
+            && previous["first_epoch"] == plan.first_epoch
+            && previous["last_epoch"] == plan.last_epoch
+            && previous["sampled_at_utc"] == sample
+            && previous["observer_receipt"].as_str() == plan.observer.path.to_str()
+            && previous["observer_sha256"] == plan.observer.sha256
+            && previous["admission_transition_guard"].is_null(),
+        "same-sample admission requires the exact untransitioned modern predecessor"
+    );
+    let old = previous["diagnostics"]
+        .as_array()
+        .context("previous diagnostic census missing")?;
+    ensure!(
+        plan.diagnostics.len() == old.len() + 1,
+        "admission must add exactly one diagnostic"
+    );
+    for prior in old {
+        let matches: Vec<_> = plan
+            .diagnostics
+            .iter()
+            .filter(|claim| {
+                prior["unit"]["Id"] == claim.unit
+                    && prior["epoch"] == claim.epoch
+                    && prior["launch_invocation_id"] == claim.invocation_id
+                    && prior["launch_receipt"].as_str() == claim.launch_receipt.path.to_str()
+                    && prior["launch_receipt_sha256"] == claim.launch_receipt.sha256
+            })
+            .collect();
+        ensure!(
+            matches.len() == 1,
+            "admission removed or changed diagnostic history"
+        );
+    }
+    let added: Vec<_> = plan
+        .diagnostics
+        .iter()
+        .filter(|claim| !old.iter().any(|prior| prior["unit"]["Id"] == claim.unit))
+        .collect();
+    ensure!(added.len() == 1, "admission has no unique added unit");
+    let claim = added[0];
+    // The initial profile is deliberately limited to the qualified bounded225
+    // runner/guard contract, not arbitrary same-sample producer additions.
+    ensure!(
+        claim.epoch == 225
+            && claim
+                .unit
+                .starts_with("horizon-qualify-225-bounded-resource-"),
+        "unsupported admission transition profile"
+    );
+    let timestamp = guard["recorded_unix_seconds"]
+        .as_u64()
+        .context("guard omits time")?;
+    let sample_seconds = utc_seconds(sample)?;
+    ensure!(
+        timestamp >= sample_seconds
+            && timestamp <= now
+            && now - timestamp <= 1800
+            && now - sample_seconds <= 1800
+            && previous["recorded_unix_seconds"]
+                .as_u64()
+                .is_some_and(|t| t <= timestamp),
+        "admission guard is stale, future or predates predecessor"
+    );
+    ensure!(
+        guard["schema"] == "jetstreamer-horizon-standalone-guard-sample-v1"
+            && guard["guard_sha256"]
+                == "61e189bb50d58fa446b84f016d3b19433c30f490c6d470907130f113a01b644a"
+            && guard["producer_invocation_id"] == claim.invocation_id
+            && guard["producer"]["invocation_id"] == claim.invocation_id
+            && guard["producer"]["cgroup"] == format!("/system.slice/{}", claim.unit)
+            && guard["producer"]["active"] == "active"
+            && guard["producer"]["sub"] == "running"
+            && guard["producer"]["load_state"] == "loaded"
+            && guard["producer"]["result"] == "success"
+            && guard["producer"]["restart_policy"] == "no"
+            && guard["producer"]["kill_mode"] == "control-group"
+            && guard["producer"]["delegated"] == false
+            && guard["producer"]["restarts"] == 0
+            && guard["producer"]["pid"].as_u64().is_some_and(|pid| pid > 0)
+            && guard.get("trip_reason").is_some_and(Value::is_null)
+            && guard
+                .get("worker_observation_error")
+                .is_some_and(Value::is_null)
+            && guard.get("canary_target_error").is_some_and(Value::is_null)
+            && guard["r2_mutations"] == false
+            && guard["remote_mutations"] == false,
+        "admission lacks exact clean sandboxed guard evidence"
+    );
+    let workers = guard["workers"]
+        .as_array()
+        .context("guard workers missing")?;
+    ensure!(
+        workers.len() == 1
+            && workers[0][0].as_u64().is_some_and(|pid| pid > 0)
+            && workers[0][1]
+                .as_u64()
+                .is_some_and(|vmas| vmas > 0 && vmas <= 3_500_000),
+        "admission must prove one readable real worker"
+    );
+    ensure!(
+        guard_plan["schema"] == "jetstreamer-horizon-standalone-guard-plan-v1"
+            && guard_plan["unit"] == claim.unit
+            && guard_plan["invocation_id"] == claim.invocation_id
+            && guard_plan["worker_root"].as_str() == claim.scratch_path.to_str()
+            && guard_plan["bounded_canary"]["expected_uid"] == 1000
+            && guard_plan["maximum_worker_vmas"] == 3_500_000
+            && guard["maximum_worker_vmas"] == guard_plan["maximum_worker_vmas"]
+            && guard["minimum_free_bytes"] == guard_plan["minimum_free_bytes"]
+            && guard_plan["minimum_free_bytes"]
+                .as_u64()
+                .is_some_and(|floor| floor > 0)
+            && guard["available_bytes"]
+                .as_u64()
+                .zip(guard["minimum_free_bytes"].as_u64())
+                .is_some_and(|(free, floor)| free >= floor),
+        "admission guard plan or safety envelope differs"
+    );
+    Ok(())
 }
 
 fn validate_diagnostic_launch(receipt: &Value, claim: &DiagnosticClaim) -> Result<()> {
@@ -506,9 +639,32 @@ pub(super) async fn run() -> Result<()> {
     );
     let previous_fleet = if let Some(previous) = &plan.previous_fleet {
         let previous = bound_json(previous)?;
-        validate_previous_fleet(&previous, plan.first_epoch, plan.last_epoch, sample)?;
+        if let Some(binding) = &plan.admission_transition_guard {
+            let guard = bound_json(binding)?;
+            let guard_plan = bound_json(&BoundFile {
+                path: guard["plan"].as_str().context("guard plan missing")?.into(),
+                sha256: guard["plan_sha256"]
+                    .as_str()
+                    .context("guard plan digest missing")?
+                    .into(),
+            })?;
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                sample,
+                &guard,
+                &guard_plan,
+                started_seconds,
+            )?;
+        } else {
+            validate_previous_fleet(&previous, plan.first_epoch, plan.last_epoch, sample)?;
+        }
         previous
     } else {
+        ensure!(
+            plan.admission_transition_guard.is_none(),
+            "admission transition requires predecessor"
+        );
         Value::Null
     };
     let replays = observer["replays"]
@@ -536,6 +692,16 @@ pub(super) async fn run() -> Result<()> {
             );
         }
         names.insert(claim.unit.clone());
+    }
+    if plan.admission_transition_guard.is_some() {
+        ensure!(
+            previous_fleet["unit_census"]
+                .as_object()
+                .context("previous unit census missing")?
+                .keys()
+                .all(|name| names.contains(name)),
+            "admission transition dropped a previously tracked unit"
+        );
     }
     let before = census(&names, plan.first_epoch, plan.last_epoch)?;
     let r2 = r2_config_from_env()?;
@@ -656,7 +822,7 @@ pub(super) async fn run() -> Result<()> {
     );
     let inventory = inventory_report(remote_entries);
     let changes = transitions(&previous_fleet, &after, &entries);
-    let receipt = json!({"schema":SCHEMA,"first_epoch":plan.first_epoch,"last_epoch":plan.last_epoch,"sampled_at_utc":sample,"observer_receipt":plan.observer.path,"observer_sha256":plan.observer.sha256,"previous_fleet":plan.previous_fleet.as_ref().map(|p|json!({"path":p.path,"sha256":p.sha256})),"plan":plan_bound.path,"plan_sha256":plan_bound.sha256,"inventory":inventory,"unit_census":after,"active":active,"diagnostics":diagnostics,"transitions":changes,"epochs":entries,"recorded_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),"remote_mutations":false,"producer_mutations":false,"publication_authorized":false});
+    let receipt = json!({"schema":SCHEMA,"first_epoch":plan.first_epoch,"last_epoch":plan.last_epoch,"sampled_at_utc":sample,"observer_receipt":plan.observer.path,"observer_sha256":plan.observer.sha256,"previous_fleet":plan.previous_fleet.as_ref().map(|p|json!({"path":p.path,"sha256":p.sha256})),"plan":plan_bound.path,"plan_sha256":plan_bound.sha256,"admission_transition_guard":plan.admission_transition_guard.as_ref().map(|p|json!({"path":p.path,"sha256":p.sha256})),"inventory":inventory,"unit_census":after,"active":active,"diagnostics":diagnostics,"transitions":changes,"epochs":entries,"recorded_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),"remote_mutations":false,"producer_mutations":false,"publication_authorized":false});
     persist(&plan.output, &receipt)?;
     println!("{}", plan.output.display());
     Ok(())
@@ -665,6 +831,184 @@ pub(super) async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn admission_fixture() -> (Value, Plan, Value, Value) {
+        let prior = json!({"epoch":213,"unit":{"Id":"old.service"},"launch_invocation_id":"a".repeat(32),"launch_receipt":"/old/launch.json","launch_receipt_sha256":"b".repeat(64)});
+        let old_claim = json!({"epoch":213,"unit":"old.service","invocation_id":"a".repeat(32),"scratch_path":"/old/scratch","launch_receipt":{"path":"/old/launch.json","sha256":"b".repeat(64)}});
+        let new_claim = json!({"epoch":225,"unit":"horizon-qualify-225-bounded-resource-test.service","invocation_id":"c".repeat(32),"scratch_path":"/new/scratch","launch_receipt":{"path":"/new/launch.json","sha256":"d".repeat(64)}});
+        let previous = json!({"schema":SCHEMA,"first_epoch":201,"last_epoch":300,"sampled_at_utc":"2026-10-20T00:04:42Z","observer_receipt":"/observer.json","observer_sha256":"e".repeat(64),"recorded_unix_seconds":1792454800u64,"diagnostics":[prior]});
+        let plan:Plan=serde_json::from_value(json!({"schema":"jetstreamer-horizon-campaign-fleet-plan-v1","first_epoch":201,"last_epoch":300,"observer":{"path":"/observer.json","sha256":"e".repeat(64)},"previous_fleet":{"path":"/previous.json","sha256":"f".repeat(64)},"output":"/output.json","status_receipt_directory":"/receipts","gates":{},"tracked_units":["old.service"],"diagnostics":[old_claim,new_claim],"admission_transition_guard":{"path":"/guard.json","sha256":"a".repeat(64)}})).unwrap();
+        let guard = json!({"schema":"jetstreamer-horizon-standalone-guard-sample-v1","guard_sha256":"61e189bb50d58fa446b84f016d3b19433c30f490c6d470907130f113a01b644a","recorded_unix_seconds":1792455124u64,"producer_invocation_id":"c".repeat(32),"producer":{"invocation_id":"c".repeat(32),"cgroup":"/system.slice/horizon-qualify-225-bounded-resource-test.service","active":"active","sub":"running","load_state":"loaded","result":"success","restart_policy":"no","kill_mode":"control-group","delegated":false,"restarts":0,"pid":123},"trip_reason":null,"worker_observation_error":null,"canary_target_error":null,"workers":[[124,416937]],"maximum_worker_vmas":3500000,"minimum_free_bytes":2910800286422u64,"available_bytes":3605067464704u64,"r2_mutations":false,"remote_mutations":false});
+        let guard_plan = json!({"schema":"jetstreamer-horizon-standalone-guard-plan-v1","unit":"horizon-qualify-225-bounded-resource-test.service","invocation_id":"c".repeat(32),"worker_root":"/new/scratch","bounded_canary":{"expected_uid":1000},"maximum_worker_vmas":3500000,"minimum_free_bytes":2910800286422u64});
+        (previous, plan, guard, guard_plan)
+    }
+    #[test]
+    fn same_sample_admission_is_one_guarded_event_not_another_poll() {
+        let (previous, plan, guard, gp) = admission_fixture();
+        validate_same_sample_admission(
+            &previous,
+            &plan,
+            "2026-10-20T00:04:42Z",
+            &guard,
+            &gp,
+            1792455200,
+        )
+        .unwrap();
+        assert!(
+            validate_previous_fleet(&previous, 201, 300, "2026-10-20T00:04:42Z").is_err(),
+            "ordinary reconciliation must still advance"
+        );
+        let mut changed = previous.clone();
+        changed["admission_transition_guard"] = json!({"path":"/prior-guard.json"});
+        assert!(
+            validate_same_sample_admission(
+                &changed,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &gp,
+                1792455200
+            )
+            .is_err()
+        );
+        let mut changed = previous;
+        changed["observer_sha256"] = json!("0".repeat(64));
+        assert!(
+            validate_same_sample_admission(
+                &changed,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &gp,
+                1792455200
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn same_sample_admission_preserves_every_historical_claim() {
+        let (previous, mut plan, guard, gp) = admission_fixture();
+        plan.diagnostics[0].invocation_id = "0".repeat(32);
+        assert!(
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &gp,
+                1792455200
+            )
+            .is_err()
+        );
+        let (previous, mut plan, guard, gp) = admission_fixture();
+        plan.diagnostics.pop();
+        assert!(
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &gp,
+                1792455200
+            )
+            .is_err()
+        );
+        let (previous, mut plan, guard, gp) = admission_fixture();
+        plan.diagnostics[1].epoch = 226;
+        assert!(
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &gp,
+                1792455200
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn same_sample_admission_fails_on_stale_unsafe_or_unreadable_guard() {
+        let (previous, plan, guard, gp) = admission_fixture();
+        for (pointer, value) in [
+            ("/guard_sha256", json!("0".repeat(64))),
+            ("/recorded_unix_seconds", json!(1792454000u64)),
+            ("/recorded_unix_seconds", json!(1792455300u64)),
+            ("/producer/restarts", json!(1)),
+            ("/producer/invocation_id", json!("other")),
+            ("/producer/delegated", json!(true)),
+            ("/trip_reason", json!("reserve")),
+            ("/worker_observation_error", json!("unreadable")),
+            ("/canary_target_error", json!("bad intent")),
+            ("/workers", json!([])),
+            ("/workers", json!([[1, 2], [3, 4]])),
+            ("/workers", json!([[124, 3500001]])),
+            ("/available_bytes", json!(1)),
+        ] {
+            let mut changed = guard.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                validate_same_sample_admission(
+                    &previous,
+                    &plan,
+                    "2026-10-20T00:04:42Z",
+                    &changed,
+                    &gp,
+                    1792455200
+                )
+                .is_err(),
+                "{pointer}"
+            );
+        }
+        assert!(
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &guard,
+                &gp,
+                1792459000
+            )
+            .is_err()
+        );
+        let mut changed = guard;
+        changed.as_object_mut().unwrap().remove("trip_reason");
+        assert!(
+            validate_same_sample_admission(
+                &previous,
+                &plan,
+                "2026-10-20T00:04:42Z",
+                &changed,
+                &gp,
+                1792455200
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn same_sample_admission_guard_plan_must_match() {
+        let (previous, plan, guard, gp) = admission_fixture();
+        for (pointer, value) in [
+            ("/unit", json!("foreign.service")),
+            ("/invocation_id", json!("other")),
+            ("/worker_root", json!("/different")),
+            ("/maximum_worker_vmas", json!(4000000)),
+            ("/minimum_free_bytes", json!(1)),
+        ] {
+            let mut changed = gp.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                validate_same_sample_admission(
+                    &previous,
+                    &plan,
+                    "2026-10-20T00:04:42Z",
+                    &guard,
+                    &changed,
+                    1792455200
+                )
+                .is_err()
+            );
+        }
+    }
     #[test]
     fn bounded_225_replay_is_diagnostic_only_and_cannot_expand_its_target() {
         let claim = DiagnosticClaim {
