@@ -31,6 +31,11 @@ const MAX_CAPTURE: usize = 64 * 1024;
 const SINCE: &str = "2026-10-18 23:27:00 UTC";
 const UNTIL: &str = "2026-10-18 23:33:00 UTC";
 const PATTERN: &str = "historical checkpoint slot=60911751|historical checkpoint slot=60911999|verified legacy accounts hash at slot 60911751";
+const BOOTSTRAP_SINCE: &str = "2026-10-14 14:14:00 UTC";
+const BOOTSTRAP_UNTIL: &str = "2026-10-14 14:17:00 UTC";
+const BOOTSTRAP_PATTERN: &str =
+    "historical checkpoint slot=60479583|verified legacy accounts hash at slot 60479583";
+const BOOTSTRAP_ACCOUNTS: &str = "J8K4RVWeRvQavXqwbhA58KCWHKWGaRENqALCed65rfkZ";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +43,8 @@ struct Plan {
     schema: String,
     journalctl_sha256: String,
     output_receipt: PathBuf,
+    #[serde(default)]
+    capture_original_bootstrap: bool,
 }
 
 #[derive(Deserialize)]
@@ -215,15 +222,84 @@ fn capture<R: Read>(pipe: R) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn journal() -> Result<Vec<u8>> {
+fn extract_bootstrap(bytes: &[u8]) -> Result<Vec<Checkpoint>> {
+    #[derive(Deserialize)]
+    struct BootstrapRecord {
+        #[serde(flatten)]
+        record: Record,
+        #[serde(rename = "__SEQNUM")]
+        sequence: String,
+        #[serde(rename = "__SEQNUM_ID")]
+        sequence_id: String,
+    }
+    ensure!(bytes.len() <= MAX_CAPTURE, "journal byte limit exceeded");
+    let lines = std::str::from_utf8(bytes)?.lines().collect::<Vec<_>>();
+    ensure!(
+        lines.len() == 2,
+        "expected exactly2 original bootstrap records"
+    );
+    let mut previous_time = 0;
+    let mut previous_sequence = 0;
+    let mut cursors = BTreeSet::new();
+    let mut result = Vec::new();
+    for (index, line) in lines.into_iter().enumerate() {
+        let source: BootstrapRecord = serde_json::from_str(line)?;
+        let r = source.record;
+        let time = number(&r.timestamp)?;
+        let sequence = number(&source.sequence)?;
+        ensure!(
+            r.invocation == IID
+                && r.unit == UNIT
+                && r.boot == BOOT
+                && r.pid == "828090"
+                && r.executable == EXE
+                && source.sequence_id == "7f76387dd96140468b39dcf01e726fea"
+                && (1_791_987_240_000_000..1_791_987_420_000_000).contains(&time)
+                && time >= previous_time
+                && sequence > previous_sequence
+                && !r.cursor.is_empty()
+                && cursors.insert(r.cursor.clone()),
+            "original bootstrap identity/window/order mismatch"
+        );
+        previous_time = time;
+        previous_sequence = sequence;
+        if index == 0 {
+            ensure!(
+                r.message.starts_with('[')
+                    && r.message.ends_with(
+                        " INFO  jetstreamer_node] verified legacy accounts hash at slot 60479583"
+                    ),
+                "missing original verified bootstrap accounts message"
+            );
+        } else {
+            let c = checkpoint(&r, time)?;
+            ensure!(
+                c.slot == 60_479_583
+                    && c.accounts_hash == BOOTSTRAP_ACCOUNTS
+                    && c.writes == 0
+                    && c.tick_height == (c.slot + 1) * 64,
+                "original bootstrap scope/accounts/clock/write mismatch"
+            );
+            result.push(c);
+        }
+    }
+    Ok(result)
+}
+
+fn journal(original_bootstrap: bool) -> Result<Vec<u8>> {
+    let (since, until, pattern) = if original_bootstrap {
+        (BOOTSTRAP_SINCE, BOOTSTRAP_UNTIL, BOOTSTRAP_PATTERN)
+    } else {
+        (SINCE, UNTIL, PATTERN)
+    };
     let mut child = Command::new("/usr/bin/journalctl")
         .args([
             format!("_SYSTEMD_INVOCATION_ID={IID}"),
             "--since".into(),
-            SINCE.into(),
+            since.into(),
             "--until".into(),
-            UNTIL.into(),
-            format!("--grep={PATTERN}"),
+            until.into(),
+            format!("--grep={pattern}"),
             "--no-pager".into(),
             "--no-hostname".into(),
             "-o".into(),
@@ -284,8 +360,27 @@ fn run() -> Result<()> {
         16 * 1024 * 1024,
         false,
     )?;
-    let bytes = journal()?;
-    let checkpoints = extract(&bytes)?;
+    let bytes = journal(plan.capture_original_bootstrap)?;
+    let checkpoints = if plan.capture_original_bootstrap {
+        extract_bootstrap(&bytes)?
+    } else {
+        extract(&bytes)?
+    };
+    let (schema, since, until, pattern) = if plan.capture_original_bootstrap {
+        (
+            "jetstreamer-epoch140-bootstrap-journal-observation-v1",
+            BOOTSTRAP_SINCE,
+            BOOTSTRAP_UNTIL,
+            BOOTSTRAP_PATTERN,
+        )
+    } else {
+        (
+            "jetstreamer-epoch140-checkpoint-journal-observation-v1",
+            SINCE,
+            UNTIL,
+            PATTERN,
+        )
+    };
     bound_file(
         &journalctl,
         &plan.journalctl_sha256,
@@ -293,12 +388,12 @@ fn run() -> Result<()> {
         false,
     )?;
     let receipt = json!({
-        "schema":"jetstreamer-epoch140-checkpoint-journal-observation-v1",
+        "schema":schema,
         "recorded_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         "plan":plan_path,"plan_sha256":args[2],"self_sha256":args[4],
         "producer_invocation_id":IID,"producer_unit":UNIT,"producer_executable":EXE,
-        "journalctl_sha256":plan.journalctl_sha256,"since_utc":SINCE,"until_utc":UNTIL,
-        "grep_pattern":PATTERN,"raw_journal_base64":STANDARD.encode(&bytes),
+        "journalctl_sha256":plan.journalctl_sha256,"since_utc":since,"until_utc":until,
+        "grep_pattern":pattern,"raw_journal_base64":STANDARD.encode(&bytes),
         "raw_journal_sha256":sha(&bytes),"raw_journal_bytes":bytes.len(),
         "checkpoints":checkpoints,"fields_mechanically_extracted":true,
         "source_verified_accounts_message_observed":true,
@@ -351,6 +446,76 @@ mod tests {
             .collect::<String>()
             .into_bytes()
     }
+    #[test]
+    fn bootstrap_capture_preserves_u64_and_orders_equal_microsecond_records() {
+        let hash = bs58::encode([7u8; 32]).into_string();
+        let mut r = vec![
+            record(
+                "[2026-10-14T14:15:27Z INFO  jetstreamer_node] verified legacy accounts hash at slot 60479583",
+                1,
+            ),
+            record(
+                &format!(
+                    "[2026-10-14T14:15:27Z INFO  jetstreamer_node::historical_replay] historical checkpoint slot=60479583 bank_hash={hash} accounts_hash={BOOTSTRAP_ACCOUNTS} last_blockhash={hash} capitalization=488588429281363761 transactions=9214190271 tick_height=3870693376 complete=true writes=0 next_write_version=27312586702"
+                ),
+                2,
+            ),
+        ];
+        for (index, v) in r.iter_mut().enumerate() {
+            v["__REALTIME_TIMESTAMP"] = json!("1791987327903144");
+            v["__SEQNUM"] = json!((index + 1).to_string());
+            v["__SEQNUM_ID"] = json!("7f76387dd96140468b39dcf01e726fea");
+        }
+        let c = extract_bootstrap(&bytes(&r)).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].capitalization, 488_588_429_281_363_761);
+        assert_eq!(c[0].slot, 60_479_583);
+        assert_eq!(c[0].next_write_version, 27_312_586_702);
+        assert_eq!(c[0].writes, 0);
+        for (key, value) in [
+            ("__SEQNUM", json!("1")),
+            ("__SEQNUM_ID", json!("foreign")),
+            ("_SYSTEMD_INVOCATION_ID", json!("foreign")),
+            ("__REALTIME_TIMESTAMP", json!("1792366090000000")),
+            ("__CURSOR", r[0]["__CURSOR"].clone()),
+        ] {
+            let mut bad = r.clone();
+            bad[1][key] = value;
+            assert!(extract_bootstrap(&bytes(&bad)).is_err(), "{key}");
+        }
+        let mut bad = r.clone();
+        bad.swap(0, 1);
+        assert!(extract_bootstrap(&bytes(&bad)).is_err());
+        assert!(extract(&bytes(&r)).is_err());
+        assert!(extract_bootstrap(&bytes(&fixtures())).is_err());
+        let mut bad = r;
+        bad[1]["MESSAGE"] = json!(
+            bad[1]["MESSAGE"]
+                .as_str()
+                .unwrap()
+                .replace("writes=0", "writes=1")
+        );
+        assert!(extract_bootstrap(&bytes(&bad)).is_err());
+    }
+
+    #[test]
+    fn bootstrap_scope_is_explicit_and_old_plan_default_is_unchanged() {
+        let mut v = json!({"schema":"jetstreamer-epoch140-checkpoint-journal-plan-v1", "journalctl_sha256":"a".repeat(64),"output_receipt":"/private/out.json"});
+        assert!(
+            !serde_json::from_value::<Plan>(v.clone())
+                .unwrap()
+                .capture_original_bootstrap
+        );
+        v["capture_original_bootstrap"] = json!(true);
+        assert!(
+            serde_json::from_value::<Plan>(v.clone())
+                .unwrap()
+                .capture_original_bootstrap
+        );
+        v["replay_launch_authorized"] = json!(true);
+        assert!(serde_json::from_value::<Plan>(v).is_err());
+    }
+
     #[test]
     fn extracts_all_fields_without_handwritten_consensus_tuple() {
         let c = extract(&bytes(&fixtures())).unwrap();

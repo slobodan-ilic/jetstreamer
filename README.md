@@ -661,6 +661,14 @@ v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers the complete
 epoch-266-301 execution envelope, with publication ending at epoch 300 and epoch 301 retained as
 the private verification tail.
 
+The root-only `jetstreamer-epoch140-checkpoint-journal` also supports the explicit
+`capture_original_bootstrap: true` plan option for the original slot-60,479,583 checkpoint.
+It emits a distinct `jetstreamer-epoch140-bootstrap-journal-observation-v1` receipt, preserving
+the exact journal bytes and mechanically parsed u64 consensus fields. The two source records
+share a microsecond timestamp, so this scope additionally requires their strictly increasing
+journal sequence numbers and original sequence ID. The default restart/terminal capture is
+unchanged. Neither receipt constructs a manifest or authorizes replay/publication.
+
 `jetstreamer-epoch140-native-restore-probe` is a separate opt-in, private restore-only
 diagnostic for the exact slot-60,911,751 snapshot and retained v1.4.25 worker. Build with
 `cargo build --release -p jetstreamer-node --features epoch140-native-restore-diagnostic
