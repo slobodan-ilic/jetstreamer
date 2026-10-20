@@ -403,6 +403,12 @@ pub(super) async fn run() -> Result<()> {
     }
     let r2 = r2_config_from_env()?;
     let s3 = s3_client(&r2);
+    ensure!(
+        get_mutable_object(&s3, &r2.bucket, &format!("epoch-{}.jet.sha256", plan.epoch))
+            .await?
+            .is_none(),
+        "canonical sidecar already exists; reconcile completion instead of publishing a countdown"
+    );
     let (object_etag, previous_object_etag) = publish_epoch_status(&s3, &r2, &status).await?;
     let receipt = StatusPublicationReceipt {
         schema: PIPELINE_STATUS_RECEIPT_SCHEMA.into(),
