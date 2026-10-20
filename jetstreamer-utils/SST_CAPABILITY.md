@@ -309,3 +309,23 @@ three golden boundary hashes and a bincode1.3.1 SlotMeta wire digest, asserted b
 the modern decoders. These are synthetic SDK primitive/layout checks, **not** a
 real-ledger run, upstream full Entry-crate qualification, recovered epoch141
 boundaries or canonical checkpoint/plugin/publication evidence.
+
+`horizon_legacy_recovery` binds the exact logical lookup set to the entire
+independently supplied post-gap target census. The pinned blockstore keys are
+eight big-endian slot bytes for `meta`, and two big-endian u64s (slot/index) for
+`data_shred`; layout is checked against revision893cc764's `blockstore_db.rs`
+SHA-256 `7391732d9c41d09cdf4f1c9997c9ee37ccace9040aa5845249918084bcc0b046`.
+An initial complete metadata query determines every owed contiguous data index.
+A second native read must include unchanged metadata and every planned data key.
+Each native call still requires the same complete admitted census, independent
+family allowlist and the native core's full before/after integrity checks.
+
+The bridge rejects missing, extra, reordered, substituted or absent logical
+records before assembling all batches, decoding all entries and verifying all
+target chains under one aggregate hash-work bound. It also rejects a reused
+boundary across separate targets. Its eleven-target integration is synthetic,
+not actual epoch141 recovery or native provenance. Borrowed candidate records
+are not authenticated merely because this bridge accepts them. Trusted real
+clock, canonical anchors, backup/native evidence and persistent guarded receipt
+production remain separate caller obligations; there is no operational native
+recovery caller or runtime/publication promotion here.
