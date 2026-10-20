@@ -90,6 +90,11 @@ struct Config {
     filesystem_path: PathBuf,
     output: PathBuf,
     replays: Vec<ReplayConfig>,
+    // Private bounded experiments are measured in this same control cycle,
+    // never promoted to ordinary replay/status claims. Terminal diagnostics
+    // must not suppress healthy ordinary observations.
+    #[serde(default)]
+    diagnostic_replays: Vec<ReplayConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -291,8 +296,36 @@ fn parse_args() -> Result<Config> {
         config.filesystem_path.is_absolute(),
         "filesystem path must be absolute"
     );
-    for replay in &config.replays {
+    validate_replay_configs(&config.replays, &config.diagnostic_replays)?;
+    Ok(config)
+}
+
+fn validate_replay_configs(
+    replays: &[ReplayConfig],
+    diagnostic_replays: &[ReplayConfig],
+) -> Result<()> {
+    let mut ranges = std::collections::BTreeSet::new();
+    let mut intervals = Vec::new();
+    for replay in replays.iter().chain(diagnostic_replays) {
         ensure!(!replay.range.is_empty(), "replay range is empty");
+        ensure!(
+            ranges.insert(&replay.range),
+            "duplicate replay/diagnostic range"
+        );
+        let (first, last) = replay
+            .range
+            .split_once('-')
+            .unwrap_or((&replay.range, &replay.range));
+        let first: u64 = first.parse().context("invalid first epoch")?;
+        let last: u64 = last.parse().context("invalid last epoch")?;
+        ensure!(first <= last, "reversed replay/diagnostic range");
+        ensure!(
+            intervals
+                .iter()
+                .all(|&(start, end)| last < start || first > end),
+            "overlapping replay/diagnostic ranges"
+        );
+        intervals.push((first, last));
         ensure!(
             replay.controller_unit.ends_with(".service"),
             "controller unit must end in .service"
@@ -319,7 +352,7 @@ fn parse_args() -> Result<Config> {
             "invalid worker executable basename"
         );
     }
-    Ok(config)
+    Ok(())
 }
 
 fn is_invocation_id(value: &str) -> bool {
@@ -1407,6 +1440,140 @@ fn write_no_clobber(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn observe_replay(
+    replay: &ReplayConfig,
+    previous_value: &Value,
+    started_unix: u64,
+    progress_since_unix: u64,
+) -> Result<ReplayObservation> {
+    let controller_before = observe_unit(
+        &replay.controller_unit,
+        &replay.expected_controller_invocation_id,
+    )?;
+    let producer_before = observe_unit(
+        &replay.producer_unit,
+        &replay.expected_producer_invocation_id,
+    )?;
+    let worker_before = observe_worker(&replay.scratch_path, &replay.worker_executable_basename)?;
+    let scratch_pass_1 = scan_scratch(&replay.scratch_path)?;
+    let scratch_pass_2 = scan_scratch(&replay.scratch_path)?;
+    let controller_after = observe_unit(
+        &replay.controller_unit,
+        &replay.expected_controller_invocation_id,
+    )?;
+    let producer_after = observe_unit(
+        &replay.producer_unit,
+        &replay.expected_producer_invocation_id,
+    )?;
+    let worker_after = observe_worker(&replay.scratch_path, &replay.worker_executable_basename)?;
+    let producer_cgroup_counter_delta = counter_deltas(
+        &producer_before.cgroup.counters,
+        &producer_after.cgroup.counters,
+    )?;
+    let producer_io_counter_delta_available = producer_before.cgroup.io_counters_available
+        && producer_after.cgroup.io_counters_available
+        && producer_cgroup_counter_delta.io_counters_comparable;
+    let useful_work = if let Some(log) = &replay.append_log {
+        append_log::observe(log, &producer_before, progress_since_unix, started_unix)?
+    } else {
+        observe_progress(
+            &replay.expected_producer_invocation_id,
+            progress_since_unix,
+            started_unix,
+        )?
+    };
+    let conservative_observed_physical_bytes = scratch_pass_1
+        .physical_bytes
+        .max(scratch_pass_2.physical_bytes);
+    let cross_sample = cross_sample_observation(
+        previous_value,
+        replay,
+        started_unix,
+        &producer_before,
+        &worker_before,
+        conservative_observed_physical_bytes,
+        &useful_work,
+    )?;
+    let invocation_binding_stable = stable_unit(&controller_before, &controller_after)
+        && stable_unit(&producer_before, &producer_after)
+        && stable_worker(&worker_before, &worker_after);
+    ensure!(
+        invocation_binding_stable,
+        "{} invocation or worker changed during observation",
+        replay.range
+    );
+    let within_sample_physical_delta_bytes =
+        i128::from(scratch_pass_2.physical_bytes) - i128::from(scratch_pass_1.physical_bytes);
+    Ok(ReplayObservation {
+        range: replay.range.clone(),
+        controller_before,
+        producer_before,
+        worker_before,
+        scratch_path: replay.scratch_path.clone(),
+        scratch_measurement_method: "two race-tolerant non-symlink-following physical-block scans",
+        scratch_pass_1,
+        scratch_pass_2,
+        conservative_observed_physical_bytes,
+        within_sample_physical_delta_bytes,
+        controller_after,
+        producer_after,
+        worker_after,
+        producer_cgroup_counter_delta: producer_cgroup_counter_delta.counters,
+        producer_io_counter_delta_available,
+        useful_work,
+        cross_sample,
+        invocation_binding_stable,
+    })
+}
+
+fn diagnostic_predecessor(previous: &Value) -> Value {
+    let observations: Vec<Value> = previous
+        .get("diagnostic_replays")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["status"] == "observed")
+        .filter_map(|entry| entry.get("observation").cloned())
+        .collect();
+    serde_json::json!({
+        "schema": previous["schema"],
+        "completed_at_utc": previous["completed_at_utc"],
+        "replays": observations
+    })
+}
+
+fn observe_diagnostics(
+    replays: &[ReplayConfig],
+    previous: &Value,
+    mut sample: impl FnMut(&ReplayConfig, &Value) -> Result<Value>,
+) -> Vec<Value> {
+    let predecessor = diagnostic_predecessor(previous);
+    replays
+        .iter()
+        .map(|replay| {
+            let result = sample(replay, &predecessor);
+            let (status, observation, error) = match result {
+                Ok(value) => ("observed", Some(value), None),
+                Err(error) => ("unavailable", None, Some(format!("{error:#}"))),
+            };
+            serde_json::json!({
+                "range": replay.range,
+                "producer_unit": replay.producer_unit,
+                "expected_producer_invocation_id": replay.expected_producer_invocation_id,
+                "scratch_path": replay.scratch_path,
+                "status": status,
+                "observation": observation,
+                "error": error,
+                "ordinary_replay_claim": false,
+                "current_sidecar_eta_valid": false,
+                "replay_launch_authorized": false,
+                "publication_authorized": false,
+                "r2_mutations": false
+            })
+        })
+        .collect()
+}
+
 fn run(config: Config) -> Result<()> {
     let (previous_bytes, previous_value, previous_timestamp, previous_unix) =
         previous_sample(&config.previous_sample)?;
@@ -1440,88 +1607,26 @@ fn run(config: Config) -> Result<()> {
     );
     let mut observations = Vec::with_capacity(config.replays.len());
     for replay in &config.replays {
-        let controller_before = observe_unit(
-            &replay.controller_unit,
-            &replay.expected_controller_invocation_id,
-        )?;
-        let producer_before = observe_unit(
-            &replay.producer_unit,
-            &replay.expected_producer_invocation_id,
-        )?;
-        let worker_before =
-            observe_worker(&replay.scratch_path, &replay.worker_executable_basename)?;
-        let scratch_pass_1 = scan_scratch(&replay.scratch_path)?;
-        let scratch_pass_2 = scan_scratch(&replay.scratch_path)?;
-        let controller_after = observe_unit(
-            &replay.controller_unit,
-            &replay.expected_controller_invocation_id,
-        )?;
-        let producer_after = observe_unit(
-            &replay.producer_unit,
-            &replay.expected_producer_invocation_id,
-        )?;
-        let worker_after =
-            observe_worker(&replay.scratch_path, &replay.worker_executable_basename)?;
-        let producer_cgroup_counter_delta = counter_deltas(
-            &producer_before.cgroup.counters,
-            &producer_after.cgroup.counters,
-        )?;
-        let producer_io_counter_delta_available = producer_before.cgroup.io_counters_available
-            && producer_after.cgroup.io_counters_available
-            && producer_cgroup_counter_delta.io_counters_comparable;
-        let useful_work = if let Some(log) = &replay.append_log {
-            append_log::observe(log, &producer_before, progress_since_unix, started_unix)?
-        } else {
-            observe_progress(
-                &replay.expected_producer_invocation_id,
-                progress_since_unix,
-                started_unix,
-            )?
-        };
-        let conservative_observed_physical_bytes = scratch_pass_1
-            .physical_bytes
-            .max(scratch_pass_2.physical_bytes);
-        let cross_sample = cross_sample_observation(
-            &previous_value,
+        observations.push(observe_replay(
             replay,
+            &previous_value,
             started_unix,
-            &producer_before,
-            &worker_before,
-            conservative_observed_physical_bytes,
-            &useful_work,
-        )?;
-        let invocation_binding_stable = stable_unit(&controller_before, &controller_after)
-            && stable_unit(&producer_before, &producer_after)
-            && stable_worker(&worker_before, &worker_after);
-        ensure!(
-            invocation_binding_stable,
-            "{} invocation or worker changed during observation",
-            replay.range
-        );
-        let within_sample_physical_delta_bytes =
-            i128::from(scratch_pass_2.physical_bytes) - i128::from(scratch_pass_1.physical_bytes);
-        observations.push(ReplayObservation {
-            range: replay.range.clone(),
-            controller_before,
-            producer_before,
-            worker_before,
-            scratch_path: replay.scratch_path.clone(),
-            scratch_measurement_method:
-                "two race-tolerant non-symlink-following physical-block scans",
-            scratch_pass_1,
-            scratch_pass_2,
-            conservative_observed_physical_bytes,
-            within_sample_physical_delta_bytes,
-            controller_after,
-            producer_after,
-            worker_after,
-            producer_cgroup_counter_delta: producer_cgroup_counter_delta.counters,
-            producer_io_counter_delta_available,
-            useful_work,
-            cross_sample,
-            invocation_binding_stable,
-        });
+            progress_since_unix,
+        )?);
     }
+    let diagnostic_observations = observe_diagnostics(
+        &config.diagnostic_replays,
+        &previous_value,
+        |replay, previous| {
+            serde_json::to_value(observe_replay(
+                replay,
+                previous,
+                started_unix,
+                progress_since_unix,
+            )?)
+            .map_err(Into::into)
+        },
+    );
     let available_after = filesystem_available_bytes(&config.filesystem_path)?;
     let (_, memory_available_after_kib) = host_memory()?;
     let completed_unix = now_unix()?;
@@ -1558,6 +1663,7 @@ fn run(config: Config) -> Result<()> {
         },
         "vm_max_map_count": vm_max_map_count()?,
         "replays": observations,
+        "diagnostic_replays": diagnostic_observations,
         "mutation": {
             "producer_or_controller_signals_sent": false,
             "service_state_changed": false,
@@ -1618,6 +1724,7 @@ mod tests {
         });
         let config: Config = serde_json::from_value(base.clone()).unwrap();
         assert_eq!(config.observation_reason, ObservationReason::Routine);
+        assert!(config.diagnostic_replays.is_empty());
 
         let mut explicit = base.clone();
         explicit["observation_reason"] = serde_json::json!("user-requested-status");
@@ -1630,6 +1737,112 @@ mod tests {
         let mut invalid = base;
         invalid["observation_reason"] = serde_json::json!("automatic-bypass");
         assert!(serde_json::from_value::<Config>(invalid).is_err());
+    }
+
+    fn diagnostic_config(range: &str) -> ReplayConfig {
+        ReplayConfig {
+            range: range.into(),
+            controller_unit: "horizon-qualify-test.service".into(),
+            expected_controller_invocation_id: "a".repeat(32),
+            producer_unit: "horizon-qualify-test.service".into(),
+            expected_producer_invocation_id: "a".repeat(32),
+            scratch_path: "/private/diagnostic/scratch".into(),
+            worker_executable_basename: "historical-worker".into(),
+            append_log: None,
+        }
+    }
+
+    #[test]
+    fn diagnostic_failure_is_explicit_and_does_not_suppress_other_samples() {
+        let configs = [diagnostic_config("203-203"), diagnostic_config("225-225")];
+        let mut calls = 0;
+        let results = observe_diagnostics(&configs, &serde_json::json!({}), |config, _| {
+            calls += 1;
+            if config.range == "203-203" {
+                anyhow::bail!("terminal or identity-changing diagnostic");
+            }
+            Ok(serde_json::json!({"range": config.range, "invocation_binding_stable": true}))
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(results[0]["status"], "unavailable");
+        assert!(results[0]["observation"].is_null());
+        assert!(
+            results[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("identity-changing")
+        );
+        assert_eq!(results[1]["status"], "observed");
+        assert!(results[1]["error"].is_null());
+        for result in results {
+            for field in [
+                "ordinary_replay_claim",
+                "current_sidecar_eta_valid",
+                "replay_launch_authorized",
+                "publication_authorized",
+                "r2_mutations",
+            ] {
+                assert_eq!(result[field], false, "{field}");
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_history_is_separate_and_excludes_failed_observations() {
+        let previous = serde_json::json!({
+            "schema": OUTPUT_SCHEMA,
+            "completed_at_utc": "2026-10-20T03:04:42Z",
+            "replays": [{"range":"206-206"}],
+            "diagnostic_replays": [
+                {"status":"unavailable", "observation":null},
+                {"status":"observed", "observation":{"range":"203-203"}}
+            ]
+        });
+        let selected = diagnostic_predecessor(&previous);
+        assert_eq!(selected["schema"], OUTPUT_SCHEMA);
+        assert_eq!(selected["completed_at_utc"], previous["completed_at_utc"]);
+        assert_eq!(
+            selected["replays"],
+            serde_json::json!([{"range":"203-203"}])
+        );
+        assert!(
+            diagnostic_predecessor(&serde_json::json!({}))["replays"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diagnostic_and_ordinary_ranges_cannot_overlap_and_both_are_validated() {
+        validate_replay_configs(
+            &[diagnostic_config("206-206")],
+            &[diagnostic_config("203-203")],
+        )
+        .unwrap();
+        assert!(
+            validate_replay_configs(
+                &[diagnostic_config("203-203")],
+                &[diagnostic_config("203-203")]
+            )
+            .is_err()
+        );
+        assert!(
+            validate_replay_configs(
+                &[diagnostic_config("202-204")],
+                &[diagnostic_config("203-205")]
+            )
+            .is_err()
+        );
+        assert!(validate_replay_configs(&[], &[diagnostic_config("205-203")]).is_err());
+        validate_replay_configs(&[diagnostic_config("206")], &[diagnostic_config("203")]).unwrap();
+        assert!(
+            validate_replay_configs(&[diagnostic_config("203")], &[diagnostic_config("203-203")])
+                .is_err()
+        );
+        let mut invalid = diagnostic_config("203-203");
+        invalid.expected_producer_invocation_id = "foreign".into();
+        assert!(validate_replay_configs(&[], &[invalid]).is_err());
     }
 
     #[test]
