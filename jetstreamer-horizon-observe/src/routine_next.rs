@@ -448,7 +448,10 @@ mod tests {
             serde_json::to_value(&scope.diagnostic_ranges).unwrap(),
             diagnostics
         );
-        assert_eq!(scope.additional_tracked_units, [next.cycle_unit.clone()]);
+        assert_eq!(
+            scope.additional_tracked_units.as_slice(),
+            std::slice::from_ref(&next.cycle_unit)
+        );
         assert_eq!(cfg["replays"], config["replays"]);
         assert_eq!(
             cfg["replays"][0]["append_log"]["inode"].as_u64(),
