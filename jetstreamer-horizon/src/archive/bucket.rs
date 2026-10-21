@@ -1365,7 +1365,12 @@ fn read_tx_record<R: Read>(
     max_account_updates: usize,
     max_account_data_bytes: usize,
 ) -> Result<usize, ArchiveFormatError> {
-    scratch.clear();
+    // Every metadata field below is overwritten, including optional presence
+    // tags. Retain their inline buffers for in-place decoding (especially the
+    // multi-MiB log arena); only account updates are appended rather than decoded
+    // wholesale and must be cleared before this record is read. The caller emits
+    // no transaction callback unless the complete record decodes successfully.
+    scratch.clear_account_updates();
 
     scratch.signatures.decode_into(cur, Some(ctx))?;
     scratch.message.decode_into(cur, Some(ctx))?;
