@@ -17,15 +17,15 @@ use {
 const LIMIT: u64 = 64 << 20;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Plan {
+pub(crate) struct Plan {
     schema: String,
-    retention_plan: retained::Bound,
-    retention_receipt: retained::Bound,
-    retention_binary: retained::Bound,
-    expected_scratch_inode: u64,
-    receipt_directory: PathBuf,
+    pub(crate) retention_plan: retained::Bound,
+    pub(crate) retention_receipt: retained::Bound,
+    pub(crate) retention_binary: retained::Bound,
+    pub(crate) expected_scratch_inode: u64,
+    pub(crate) receipt_directory: PathBuf,
 }
-fn read_json(path: &Path) -> Result<(Value, String)> {
+pub(crate) fn read_json(path: &Path) -> Result<(Value, String)> {
     let (sha, m) = retained::hash_file(path, LIMIT)?;
     ensure!(
         path.canonicalize()? == path && m.uid() == 0 && m.mode() & 0o222 == 0,
@@ -44,7 +44,7 @@ fn read_json(path: &Path) -> Result<(Value, String)> {
     );
     Ok((serde_json::from_slice(&bytes)?, sha))
 }
-fn persist(path: &Path, value: &Value) -> Result<String> {
+pub(crate) fn persist(path: &Path, value: &Value) -> Result<String> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     ensure!(
@@ -62,7 +62,7 @@ fn persist(path: &Path, value: &Value) -> Result<String> {
     File::open(path.parent().context("receipt parent missing")?)?.sync_all()?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
-fn validate_plan(p: &Plan) -> Result<()> {
+pub(crate) fn validate_plan(p: &Plan) -> Result<()> {
     ensure!(
         p.schema == "jetstreamer-private-epoch203-ram-scratch-retire-plan-v1"
             && p.expected_scratch_inode > 0,
@@ -78,7 +78,7 @@ fn validate_plan(p: &Plan) -> Result<()> {
     );
     Ok(())
 }
-fn preserved(p: &Plan, r: &retained::Plan, report: &Value) -> Result<Value> {
+pub(crate) fn preserved(p: &Plan, r: &retained::Plan, report: &Value) -> Result<Value> {
     let outcome = retained::bound_json(&r.outcome)?;
     retained::validate_outcome(&outcome, r)?;
     let no_entry =

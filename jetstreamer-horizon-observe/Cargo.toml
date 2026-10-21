@@ -46,6 +46,10 @@ name = "jetstreamer-epoch203-ram-retire-scratch"
 path = "src/ram_scratch_retire_bin.rs"
 
 [[bin]]
+name = "jetstreamer-epoch203-ram-lifecycle-qualify"
+path = "src/ram_lifecycle_qualify_bin.rs"
+
+[[bin]]
 name = "jetstreamer-epoch203-ram-resource"
 path = "src/epoch203_ram_resource.rs"
 required-features = ["epoch203-ram-resource-supervisor"]

@@ -489,3 +489,31 @@ The primitive has real local-filesystem unlink/resumption tests; a real sealed
 check-only run and representative RAM unlink/lifecycle capability qualification
 are still independent requirements. Do not treat an empty scratch dry run as
 proof that a populated benchmark retirement has been qualified.
+
+## Actual populated-RAM lifecycle qualifier
+
+`jetstreamer-epoch203-ram-lifecycle-qualify` exercises the separately sealed
+scratch retirer on an actual persistent RAM volume. Its hash-bound plan names
+the exact retirement executable/plan, fixed worker and private evidence output.
+Fixture creation is permitted only for an already terminal **no-entry**
+supervisor capability, with the original empty scratch inode and preserved
+artifact/mount/reference gates passing. It records a durable intent before
+creating one4096-byte disposable marker, never an archive or replay cursor.
+
+The qualifier closes all fixture descriptors before starting the independent
+retirement child, so the child's process-reference census must genuinely pass.
+It requires successful check-only and execute children, checks that the ledger
+binds the exact newly created inode/bytes, verifies the durable check-to-intent-
+completion digest chain and exactly one actual unlink, then independently
+rechecks empty original scratch and unchanged retained artifact identities,
+hashes and persistent mount. Child failures retain private diagnostics and
+cannot produce a passing capability receipt. A preexisting attempt directory
+or populated scratch is never reused or overwritten.
+
+A successful real invocation may emit
+`jetstreamer-private-epoch203-ram-retention-capability-v1` for that exact worker
+profile. Its scope is actual filesystem lifecycle using disposable fixture
+bytes, not entry replay, workerIPC, archive semantic validation, cold-epoch peak,
+fleet admission, unmounting or publication. This is not a manually authored
+positive receipt or a unit-test result. Observer and fleet capability evidence
+and a fresh complete launch admission remain independently required.
