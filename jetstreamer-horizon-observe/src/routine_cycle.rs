@@ -17,6 +17,8 @@ use {
 };
 
 const PLAN_SCHEMA: &str = "jetstreamer-horizon-routine-cycle-plan-v1";
+const PLAN_SCHEMA_101: &str = "jetstreamer-horizon-routine-cycle-101-200-plan-v2";
+const FLEET_ROOT_101: &str = "/var/lib/jetstreamer-horizon-fleet-101-200-20261019-v1";
 const LIMIT: u64 = 16 << 20;
 const BUCKET: &str = "solana-archive-with-accounts-data";
 
@@ -57,6 +59,77 @@ struct Plan {
     fleet_output: PathBuf,
     #[serde(default)]
     additional_gate_evidence: BTreeMap<String, Vec<Bound>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope_101_200: Option<Scope101200>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Scope101200 {
+    diagnostic_ranges: Vec<DiagnosticClaim>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DiagnosticClaim {
+    range: String,
+    controller_unit: String,
+    producer_unit: String,
+    expected_controller_invocation_id: String,
+    expected_producer_invocation_id: String,
+}
+
+fn is_101(p: &Plan) -> Result<bool> {
+    match (p.schema.as_str(), &p.scope_101_200) {
+        (PLAN_SCHEMA, None) => Ok(false),
+        (PLAN_SCHEMA_101, Some(scope)) => {
+            ensure!(
+                scope.diagnostic_ranges.len() <= 1,
+                "unsupported diagnostic census"
+            );
+            for d in &scope.diagnostic_ranges {
+                ensure!(
+                    d.range == "144"
+                        && d.controller_unit
+                            == "horizon-qualify-epoch144-loader-focus-20261016-v1.service"
+                        && d.producer_unit == d.controller_unit
+                        && d.expected_controller_invocation_id == d.expected_producer_invocation_id,
+                    "unsupported private diagnostic owner/scope"
+                );
+                for id in [
+                    &d.expected_controller_invocation_id,
+                    &d.expected_producer_invocation_id,
+                ] {
+                    ensure!(
+                        id.len() == 32
+                            && id
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                        "invalid diagnostic invocation"
+                    );
+                }
+            }
+            Ok(true)
+        }
+        _ => anyhow::bail!("routine schema/profile mismatch"),
+    }
+}
+
+fn campaign_bounds(p: &Plan) -> Result<(u64, u64)> {
+    Ok(if is_101(p)? { (101, 200) } else { (201, 300) })
+}
+fn cycle_unit(p: &Plan) -> Result<String> {
+    Ok(if is_101(p)? {
+        format!(
+            "horizon-routine-cycle-101-200-{}-v2.service",
+            stamp(&p.sample_target_utc)
+        )
+    } else {
+        format!(
+            "horizon-routine-cycle-{}-v1.service",
+            stamp(&p.sample_target_utc)
+        )
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -225,7 +298,15 @@ fn absent(path: &Path) -> Result<()> {
 }
 
 fn newer_fleet(candidate: &Value, previous: &Value) -> Result<bool> {
-    if candidate["first_epoch"] != 201 || candidate["last_epoch"] != 300 {
+    newer_fleet_in_scope(candidate, previous, 201, 300)
+}
+fn newer_fleet_in_scope(
+    candidate: &Value,
+    previous: &Value,
+    first: u64,
+    last: u64,
+) -> Result<bool> {
+    if candidate["first_epoch"] != first || candidate["last_epoch"] != last {
         return Ok(false);
     }
     ensure!(
@@ -252,7 +333,46 @@ fn newer_fleet(candidate: &Value, previous: &Value) -> Result<bool> {
                     .context("predecessor recording time missing")?))
 }
 
-fn latest_fleet_unchanged(previous: &Value) -> Result<()> {
+fn latest_fleet_unchanged(p: &Plan, previous: &Value) -> Result<()> {
+    if is_101(p)? {
+        let root = Path::new(FLEET_ROOT_101);
+        private_dir(root)?;
+        ensure!(
+            p.previous_fleet.path.parent() == Some(root),
+            "foreign101fleet predecessor namespace"
+        );
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                anyhow::bail!("non-UTF8 fleet member")
+            };
+            if !name.starts_with("fleet-") || !name.ends_with(".json") {
+                continue;
+            }
+            ensure!(entry.file_type()?.is_file(), "unsafe101fleet census member");
+            let value: Value =
+                serde_json::from_slice(&read_checked(&entry.path(), LIMIT, 0, false)?)?;
+            ensure!(
+                value["first_epoch"] == 101 && value["last_epoch"] == 200,
+                "foreign fleet inside101namespace"
+            );
+            if entry.path() == p.previous_fleet.path {
+                ensure!(
+                    sha(&read_checked(&entry.path(), LIMIT, 0, false)?) == p.previous_fleet.sha256,
+                    "fleet predecessor changed during census"
+                );
+                continue;
+            }
+            let tied = value["sampled_at_utc"] == previous["sampled_at_utc"]
+                && value["recorded_unix_seconds"] == previous["recorded_unix_seconds"];
+            ensure!(
+                !tied && !newer_fleet_in_scope(&value, previous, 101, 200)?,
+                "newer campaign fleet exists;regenerate pending cycle"
+            );
+        }
+        return Ok(());
+    }
     // A user-requested cycle or an event-driven admission invalidates this
     // pending one-shot. Never silently fork the authoritative fleet chain.
     let root = Path::new("/var/lib/jetstreamer/horizon-campaign-fleet");
@@ -305,18 +425,13 @@ fn validate_templates(
     estimates: &Value,
     old_observer: &Value,
 ) -> Result<()> {
+    let host101 = is_101(p)?;
+    let (first, last) = campaign_bounds(p)?;
     ensure!(
-        p.schema == PLAN_SCHEMA && p.bucket == BUCKET && is_sha(&p.endpoint_sha256),
+        p.bucket == BUCKET && is_sha(&p.endpoint_sha256),
         "invalid cycle scope"
     );
-    ensure!(
-        p.cycle_unit
-            == format!(
-                "horizon-routine-cycle-{}-v1.service",
-                stamp(&p.sample_target_utc)
-            ),
-        "routine unit name mismatch"
-    );
+    ensure!(p.cycle_unit == cycle_unit(p)?, "routine unit name mismatch");
     let target = utc_seconds(&p.sample_target_utc)?;
     let old_time = old_observer["recorded_at_utc"]
         .as_str()
@@ -330,8 +445,10 @@ fn validate_templates(
             && model["schema"] == "jetstreamer-horizon-r2-status-eta-model-v5"
             && model["phase"] == "replay"
             && model["sample_target_utc"] == old_time
-            && model["evidence"][1]["path"] == p.previous_observer.path.to_str().unwrap_or("")
-            && model["evidence"][1]["sha256"] == p.previous_observer.sha256,
+            && (host101
+                || (model["evidence"][1]["path"]
+                    == p.previous_observer.path.to_str().unwrap_or("")
+                    && model["evidence"][1]["sha256"] == p.previous_observer.sha256)),
         "model does not bind exact predecessor"
     );
     ensure!(
@@ -342,10 +459,18 @@ fn validate_templates(
             && previous["observer_sha256"] == p.previous_observer.sha256,
         "fleet predecessor mismatch"
     );
+    if host101 {
+        ensure!(
+            previous["first_epoch"] == 101
+                && previous["last_epoch"] == 200
+                && p.previous_fleet.path.parent() == Some(Path::new(FLEET_ROOT_101)),
+            "foreign101fleet predecessor"
+        );
+    }
     ensure!(
         fleet["schema"] == "jetstreamer-horizon-campaign-fleet-plan-v1"
-            && fleet["first_epoch"] == 201
-            && fleet["last_epoch"] == 300
+            && fleet["first_epoch"] == first
+            && fleet["last_epoch"] == last
             && fleet["observer"]["path"].as_str() == p.previous_observer.path.to_str()
             && fleet["observer"]["sha256"] == p.previous_observer.sha256
             && fleet["admission_transition_guard"].is_null(),
@@ -367,7 +492,7 @@ fn validate_templates(
         for e in range["epochs"].as_array().context("model epochs missing")? {
             let e = e.as_u64().context("invalid model epoch")?;
             ensure!(
-                (201..=300).contains(&e) && epochs.insert(e),
+                (first..=last).contains(&e) && epochs.insert(e),
                 "overlapping or out-of-scope epoch"
             );
         }
@@ -381,7 +506,7 @@ fn validate_templates(
     for (epoch, evidence) in &p.additional_gate_evidence {
         let n = epoch.parse::<u64>()?;
         ensure!(
-            (201..=300).contains(&n)
+            (first..=last).contains(&n)
                 && n.to_string() == *epoch
                 && fleet["gates"][epoch]["evidence"].is_array()
                 && !evidence.is_empty(),
@@ -393,20 +518,36 @@ fn validate_templates(
             == model["estimate_receipt_directory"].as_str(),
         "estimate output parent differs"
     );
+    let expected_cycle = if host101 {
+        Path::new("/var/lib/jetstreamer/horizon-routine-cycles-101-200-v2")
+            .join(format!("{}-v2", stamp(&p.sample_target_utc)))
+    } else {
+        Path::new("/var/lib/jetstreamer/horizon-routine-cycles-v1")
+            .join(format!("{}-v1", stamp(&p.sample_target_utc)))
+    };
     ensure!(
-        p.cycle_directory.file_name().and_then(|s| s.to_str())
-            == Some(&format!("{}-v1", stamp(&p.sample_target_utc)))
-            && p.cycle_directory.parent()
-                == Some(Path::new("/var/lib/jetstreamer/horizon-routine-cycles-v1")),
+        p.cycle_directory == expected_cycle,
         "cycle path is outside bounded namespace"
     );
+    let expected_fleet_output = if host101 {
+        Path::new(FLEET_ROOT_101).join(format!("fleet-{}.json", stamp(&p.sample_target_utc)))
+    } else {
+        Path::new("/var/lib/jetstreamer/horizon-campaign-fleet")
+            .join(format!("{}-rust-v1", stamp(&p.sample_target_utc)))
+            .join("fleet-ledger.json")
+    };
     ensure!(
-        p.fleet_output
-            == Path::new("/var/lib/jetstreamer/horizon-campaign-fleet")
-                .join(format!("{}-rust-v1", stamp(&p.sample_target_utc)))
-                .join("fleet-ledger.json"),
+        p.fleet_output == expected_fleet_output,
         "fleet output mismatch"
     );
+    if host101 {
+        ensure!(
+            model["status_receipt_directory"]
+                == "/home/sol/.jetstreamer-private/r2-status-receipts"
+                && model["status_receipt_directory_uid"] == 1001,
+            "wrong101status reader/directory ownership policy"
+        );
+    }
     ensure!(
         p.estimate_output.file_name().and_then(|s| s.to_str())
             == Some(&format!(
@@ -443,7 +584,11 @@ fn validate_observation(p: &Plan, model: &Value, observer: &Value, now: u64) -> 
         .context("observer census missing")?;
     let modeled = model["ranges"].as_array().context("model census missing")?;
     ensure!(
-        observed.len() == modeled.len(),
+        observed.len()
+            == modeled.len()
+                + p.scope_101_200
+                    .as_ref()
+                    .map_or(0, |s| s.diagnostic_ranges.len()),
         "ordinary claim census changed"
     );
     for m in modeled {
@@ -479,6 +624,63 @@ fn validate_observation(p: &Plan, model: &Value, observer: &Value, now: u64) -> 
             "epoch terminal changed; require reviewed model handoff"
         );
     }
+    validate_diagnostics(p, model, observer, true)?;
+    Ok(())
+}
+
+fn validate_diagnostics(p: &Plan, model: &Value, value: &Value, observed: bool) -> Result<()> {
+    is_101(p)?;
+    let Some(scope) = &p.scope_101_200 else {
+        return Ok(());
+    };
+    for d in &scope.diagnostic_ranges {
+        ensure!(
+            !model["ranges"]
+                .as_array()
+                .context("model ranges")?
+                .iter()
+                .any(|r| r["range"] == d.range)
+                && !p.expected_epochs.contains(&144),
+            "private diagnostic cannot publish production ETA"
+        );
+        let matches: Vec<_> = value["replays"]
+            .as_array()
+            .context("diagnostic census")?
+            .iter()
+            .filter(|r| r["range"] == d.range)
+            .collect();
+        ensure!(matches.len() == 1, "diagnostic owner missing or duplicate");
+        let r = matches[0];
+        if observed {
+            ensure!(
+                r["invocation_binding_stable"] == true,
+                "diagnostic identity unstable"
+            );
+            for (kind, id) in [
+                ("controller", &d.expected_controller_invocation_id),
+                ("producer", &d.expected_producer_invocation_id),
+            ] {
+                for point in ["before", "after"] {
+                    let v = &r[format!("{kind}_{point}")];
+                    ensure!(
+                        v["invocation_id"] == *id
+                            && v["restarts"] == 0
+                            && matches!(v["active_state"].as_str(), Some("active" | "activating")),
+                        "diagnostic owner changed/stopped"
+                    );
+                }
+            }
+        } else {
+            ensure!(
+                r["controller_unit"] == d.controller_unit
+                    && r["producer_unit"] == d.producer_unit
+                    && r["expected_controller_invocation_id"]
+                        == d.expected_controller_invocation_id
+                    && r["expected_producer_invocation_id"] == d.expected_producer_invocation_id,
+                "diagnostic configured identity differs"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -498,7 +700,11 @@ fn validate_observer_config(p: &Plan, model: &Value, config: &Value) -> Result<(
         .context("configured replay census missing")?;
     let modeled = model["ranges"].as_array().context("model census missing")?;
     ensure!(
-        ranges.len() == modeled.len(),
+        ranges.len()
+            == modeled.len()
+                + p.scope_101_200
+                    .as_ref()
+                    .map_or(0, |s| s.diagnostic_ranges.len()),
         "scheduled observer census changed"
     );
     for m in modeled {
@@ -517,6 +723,7 @@ fn validate_observer_config(p: &Plan, model: &Value, config: &Value) -> Result<(
             );
         }
     }
+    validate_diagnostics(p, model, config, false)?;
     Ok(())
 }
 
@@ -572,8 +779,18 @@ fn derive(p: &Plan, model: &Value, fleet: &Value, observer: &Bound) -> Result<(V
     let mut model = model.clone();
     let mut fleet = fleet.clone();
     model["sample_target_utc"] = json!(p.sample_target_utc);
-    model["evidence"][0] = serde_json::to_value(&p.previous_estimates)?;
-    model["evidence"][1] = serde_json::to_value(observer)?;
+    if is_101(p)? {
+        let evidence = model["evidence"].as_array_mut().context("model evidence")?;
+        for binding in [&p.previous_estimates, observer] {
+            let value = serde_json::to_value(binding)?;
+            if !evidence.contains(&value) {
+                evidence.push(value);
+            }
+        }
+    } else {
+        model["evidence"][0] = serde_json::to_value(&p.previous_estimates)?;
+        model["evidence"][1] = serde_json::to_value(observer)?;
+    }
     fleet["observer"] = serde_json::to_value(observer)?;
     fleet["previous_fleet"] = serde_json::to_value(&p.previous_fleet)?;
     fleet["output"] = json!(p.fleet_output);
@@ -698,14 +915,7 @@ fn validate_service(
 }
 
 fn authenticate_service(p: &Plan) -> Result<String> {
-    ensure!(
-        p.cycle_unit
-            == format!(
-                "horizon-routine-cycle-{}-v1.service",
-                stamp(&p.sample_target_utc)
-            ),
-        "routine unit name mismatch"
-    );
+    ensure!(p.cycle_unit == cycle_unit(p)?, "routine unit name mismatch");
     let invocation = env::var("INVOCATION_ID")
         .context("actual cycle requires its bounded persistent oneshot")?;
     let output=Command::new("/usr/bin/systemctl").args(["show",&p.cycle_unit,"--no-pager","--no-ask-password",
@@ -783,7 +993,7 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
     let estimates = bound_json(&p.previous_estimates, false)?;
     let old_observer = bound_json(&p.previous_observer, false)?;
     validate_templates(p, &model, &fleet, &previous, &estimates, &old_observer)?;
-    latest_fleet_unchanged(&previous)?;
+    latest_fleet_unchanged(p, &previous)?;
     validate_observer_config(p, &model, &bound_json(&p.observer_config, true)?)?;
     for t in [&p.tools.sealer, &p.tools.estimator, &p.tools.r2] {
         tool_ok(t)?;
@@ -802,11 +1012,23 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
             .parent()
             .context("estimate parent missing")?,
     )?;
-    private_dir(Path::new(
+    let status_path = Path::new(
         model["status_receipt_directory"]
             .as_str()
             .context("status receipt parent missing")?,
-    ))?;
+    );
+    if is_101(p)? {
+        let m = fs::symlink_metadata(status_path)?;
+        ensure!(
+            status_path.canonicalize()? == status_path
+                && m.is_dir()
+                && m.uid() == 1001
+                && m.mode() & 0o6077 == 0,
+            "unsafe101status receipt directory"
+        );
+    } else {
+        private_dir(status_path)?;
+    }
     absent(&p.cycle_directory)?;
     absent(&p.estimate_output)?;
     absent(&p.fleet_output)?;
@@ -997,7 +1219,7 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
             File::open(parent.parent().unwrap())?.sync_all()?;
         }
         private_dir(parent)?;
-        latest_fleet_unchanged(&previous)?;
+        latest_fleet_unchanged(p, &previous)?;
         child(
             &p.tools.r2,
             &[
@@ -1364,6 +1586,148 @@ mod tests {
         assert!(utc_seconds("2026-10-20T25:00:00Z").is_err());
         assert!(utc_seconds("2026-10-20 10:34:42Z").is_err());
         assert!(utc_seconds("2026-10-20T10:34:42.0Z").is_err());
+    }
+
+    fn fixture101() -> (Plan, Value, Value, Value, Value, Value, Value, Value) {
+        let (mut p, mut model, mut fleet, mut prior, est, old, mut config, mut observer) =
+            fixture();
+        p.schema = PLAN_SCHEMA_101.into();
+        p.scope_101_200 = Some(Scope101200 {
+            diagnostic_ranges: vec![DiagnosticClaim {
+                range: "144".into(),
+                controller_unit: "horizon-qualify-epoch144-loader-focus-20261016-v1.service".into(),
+                producer_unit: "horizon-qualify-epoch144-loader-focus-20261016-v1.service".into(),
+                expected_controller_invocation_id: "d".repeat(32),
+                expected_producer_invocation_id: "d".repeat(32),
+            }],
+        });
+        p.cycle_unit = cycle_unit(&p).unwrap();
+        p.cycle_directory =
+            "/var/lib/jetstreamer/horizon-routine-cycles-101-200-v2/20261020T103442Z-v2".into();
+        p.fleet_output = Path::new(FLEET_ROOT_101).join("fleet-20261020T103442Z.json");
+        p.previous_fleet.path = Path::new(FLEET_ROOT_101).join("fleet-20261020T100442Z.json");
+        p.expected_epochs = vec![198];
+        model["status_receipt_directory"] =
+            json!("/home/sol/.jetstreamer-private/r2-status-receipts");
+        model["status_receipt_directory_uid"] = json!(1001);
+        model["ranges"][0]["range"] = json!("198");
+        model["ranges"][0]["epochs"] = json!([198]);
+        model["ranges"][0]["terminal_slot"] = json!(85967999);
+        model["evidence"] = json!([{"path":"/proof/retained-proof.json","sha256":"f".repeat(64)}]);
+        config["replays"][0] = model["ranges"][0].clone();
+        config["replays"].as_array_mut().unwrap().push(
+            serde_json::to_value(&p.scope_101_200.as_ref().unwrap().diagnostic_ranges[0]).unwrap(),
+        );
+        observer["replays"][0]["range"] = json!("198");
+        observer["replays"][0]["useful_work"]["last"]["terminal_slot"] = json!(85967999);
+        let point =
+            json!({"invocation_id":"d".repeat(32),"restarts":0,"active_state":"activating"});
+        observer["replays"].as_array_mut().unwrap().push(json!({"range":"144","invocation_binding_stable":true,
+            "controller_before":point,"controller_after":point,"producer_before":point,"producer_after":point}));
+        fleet["first_epoch"] = json!(101);
+        fleet["last_epoch"] = json!(200);
+        fleet["gates"] = json!({"140":{"state":"blocked-qualification","evidence":[]}});
+        prior["first_epoch"] = json!(101);
+        prior["last_epoch"] = json!(200);
+        (p, model, fleet, prior, est, old, config, observer)
+    }
+
+    #[test]
+    fn explicit101_profile_keeps_private_diagnostic_and_all_old_model_proofs() {
+        let (p, model, fleet, prior, est, old, config, observer) = fixture101();
+        validate_templates(&p, &model, &fleet, &prior, &est, &old).unwrap();
+        validate_observer_config(&p, &model, &config).unwrap();
+        validate_observation(
+            &p,
+            &model,
+            &observer,
+            utc_seconds(&p.sample_target_utc).unwrap() + 60,
+        )
+        .unwrap();
+        let bound = Bound {
+            path: p.observer.clone(),
+            sha256: "b".repeat(64),
+        };
+        let (derived, updated) = derive(&p, &model, &fleet, &bound).unwrap();
+        assert_eq!(derived["evidence"][0], model["evidence"][0]);
+        assert_eq!(derived["evidence"].as_array().unwrap().len(), 3);
+        assert_eq!(derived["ranges"], model["ranges"]);
+        assert_eq!(updated["gates"], fleet["gates"]);
+        assert_eq!(p.expected_epochs, vec![198]);
+    }
+
+    #[test]
+    fn profiles_cannot_cross_campaign_or_receipt_namespaces() {
+        let (p, model, fleet, prior, est, old, _, _) = fixture101();
+        for change in 0..7 {
+            let mut p: Plan = serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+            match change {
+                0 => p.schema = PLAN_SCHEMA.into(),
+                1 => p.scope_101_200 = None,
+                2 => p.expected_epochs = vec![206],
+                3 => p.cycle_unit = "horizon-routine-cycle-20261020T103442Z-v1.service".into(),
+                4 => {
+                    p.fleet_output =
+                        "/var/lib/jetstreamer/horizon-campaign-fleet/foreign/fleet-ledger.json"
+                            .into()
+                }
+                5 => p.previous_fleet.path = "/foreign/fleet.json".into(),
+                _ => {
+                    p.cycle_directory =
+                        "/var/lib/jetstreamer/horizon-routine-cycles-v1/20261020T103442Z-v1".into()
+                }
+            }
+            assert!(
+                validate_templates(&p, &model, &fleet, &prior, &est, &old).is_err(),
+                "accepted {change}"
+            );
+        }
+        let mut wrong = prior.clone();
+        wrong["first_epoch"] = json!(201);
+        assert!(validate_templates(&p, &model, &fleet, &wrong, &est, &old).is_err());
+        let mut wrong = model.clone();
+        wrong["status_receipt_directory_uid"] = json!(0);
+        assert!(validate_templates(&p, &wrong, &fleet, &prior, &est, &old).is_err());
+        let (mut legacy, ..) = fixture();
+        legacy.scope_101_200 = p.scope_101_200;
+        assert!(is_101(&legacy).is_err());
+    }
+
+    #[test]
+    fn diagnostic_exclusions_are_exact_and_never_production_status_claims() {
+        let (p, model, _, _, _, _, config, observer) = fixture101();
+        let now = utc_seconds(&p.sample_target_utc).unwrap() + 60;
+        for change in 0..5 {
+            let mut bad = observer.clone();
+            match change {
+                0 => {
+                    bad["replays"].as_array_mut().unwrap().pop();
+                }
+                1 => bad["replays"][1]["producer_after"]["invocation_id"] = json!("e".repeat(32)),
+                2 => bad["replays"][1]["controller_after"]["restarts"] = json!(1),
+                3 => bad["replays"][1]["producer_before"]["active_state"] = json!("failed"),
+                _ => bad["replays"][1]["range"] = json!("145"),
+            }
+            assert!(
+                validate_observation(&p, &model, &bad, now).is_err(),
+                "accepted diagnostic {change}"
+            );
+        }
+        let mut bad = config.clone();
+        bad["replays"][1]["producer_unit"] = json!("foreign.service");
+        assert!(validate_observer_config(&p, &model, &bad).is_err());
+        let mut bad_model = model;
+        bad_model["ranges"][0]["range"] = json!("144");
+        assert!(validate_observer_config(&p, &bad_model, &config).is_err());
+        assert!(
+            !newer_fleet_in_scope(
+                &json!({"first_epoch":201,"last_epoch":300}),
+                &json!({}),
+                101,
+                200
+            )
+            .unwrap()
+        );
     }
 
     #[test]
