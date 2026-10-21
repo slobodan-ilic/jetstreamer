@@ -13,6 +13,9 @@ keywords.workspace = true
 # Diagnostic CPU allocation released by the exact reserve-stopped epoch225.
 # Cannot run while that producer or another fleet claim is live.
 ram-snapshot-eight-core-stopped225 = []
+# Dormant private same-input RAM comparison; no ordinary replay or publication.
+epoch203-ram-resource-supervisor = []
+epoch203-ram-shrink-candidate = ["epoch203-ram-resource-supervisor"]
 
 [[bin]]
 name = "jetstreamer-horizon-status-estimate"
@@ -34,12 +37,18 @@ path = "src/epoch203_ram_resource_plan.rs"
 name = "jetstreamer-epoch203-ram-storage-probe"
 path = "src/epoch203_ram_storage_probe.rs"
 
+[[bin]]
+name = "jetstreamer-epoch203-ram-resource"
+path = "src/epoch203_ram_resource.rs"
+required-features = ["epoch203-ram-resource-supervisor"]
+
 [dependencies]
 anyhow.workspace = true
 libc.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 sha2.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
