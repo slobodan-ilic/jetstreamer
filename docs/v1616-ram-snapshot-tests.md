@@ -81,3 +81,25 @@ and its journal/intent; OOM or sandbox failure is not canonical divergence and
 must not be called a passing snapshot test. Tmpfs cleanup is confined to the
 service's private mount namespace. Do not relabel another snapshot as this
 86,831,488 fixture, and do not use live AccountsDb scratch.
+
+## Reserve-stop CPU diagnostic (opt-in only)
+
+`ram-snapshot-eight-core-stopped225` builds a distinct eight-core supervisor.
+The 128-GiB, two-core attempt reached the matching native initialization/freeze
+checkpoint, but its shared 30-minute test limit expired. Its actual terminal
+capture has zero memory high/max/OOM events and 16,030 CPU-throttled periods;
+this is not a snapshot-test pass. Keep the same two tests, 128-GiB hard cap,
+112-GiB soft threshold, 576/448-GiB host gates, swap prohibition and time bound.
+
+The opt-in build requires the exact immutable epoch-225 launch digest proving
+its old 16-core allocation, the exact guard-stop completion digest, and that
+same unit still failed with no PID, cgroup or restart. It checks these before
+capability proof and again after hashing inputs. A fresh routine observer must
+retain the complete four-range census: three exact live producers and the
+explicit unavailable epoch-225 diagnostic. Unavailability is not stop proof;
+the independently hash-bound guard completion and actual unit check are required.
+The matching fleet must contain exactly the nine remaining epoch claims, with
+no replacement or foreign producer. Thus the new eight-core diagnostic uses
+only part of an actually released 16-core budget; it does not add a replay or
+increase the prior fleet operating point. Use `CPUQuota=800%` only with this
+sealed feature build. Default builds retain their four-producer, two-core gate.

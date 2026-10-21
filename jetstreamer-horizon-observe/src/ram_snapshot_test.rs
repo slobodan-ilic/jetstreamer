@@ -29,6 +29,8 @@ const FLOOR: u64 = 231_874_716_783;
 const STOP_MEMORY: u64 = 448 * GIB;
 // Reserve the complete diagnostic cap above the unchanged host stop reserve.
 const START_MEMORY: u64 = STOP_MEMORY + MEMORY_MAX;
+const RELEASED_225: bool = cfg!(feature = "ram-snapshot-eight-core-stopped225");
+const CPU_CORES: u64 = if RELEASED_225 { 8 } else { 2 };
 const SNAPSHOT_SHA: &str = "348cba573c9e737e77c512d2c7ceda7bc81db61be6f4dc02838d168a10103043";
 const GENESIS_SHA: &str = "133f7eaefcd59466f3b291aadd1b0d3522432072cf5b539445218c6c125ea945";
 const TEST_SHA: &str = "bfa7aadf5be9d895747b379c18354ecc312e50ba895341a5e46a21a6a085fd64";
@@ -318,7 +320,7 @@ fn authenticate(p: &Plan) -> Result<String> {
             && words[0].parse::<u64>()?
                 == words[1]
                     .parse::<u64>()?
-                    .checked_mul(2)
+                    .checked_mul(CPU_CORES)
                     .context("quota overflow")?,
         "wrong CPU quota"
     );
@@ -489,7 +491,7 @@ fn validate_observer(v: &Value, now: u64) -> Result<()> {
             "ac9aee3d47eb41e483a5e008ed43d030",
         ),
     ];
-    for (range, controller, id) in expected {
+    for (range, controller, id) in expected.into_iter().take(if RELEASED_225 { 3 } else { 4 }) {
         let matches: Vec<_> = ordinary
             .iter()
             .chain(diagnostic)
@@ -520,6 +522,26 @@ fn validate_observer(v: &Value, now: u64) -> Result<()> {
             );
         }
     }
+    if RELEASED_225 {
+        let stopped: Vec<_> = diagnostic
+            .iter()
+            .filter(|d| d["range"] == "225-226")
+            .collect();
+        ensure!(stopped.len() == 1, "missing stopped225 census entry");
+        let d = stopped[0];
+        ensure!(
+            d["status"] == "unavailable"
+                && d["observation"].is_null()
+                && d["producer_unit"]
+                    == "horizon-qualify-225-natural-root-resource-63a2717-v1.service"
+                && d["expected_producer_invocation_id"] == "ac9aee3d47eb41e483a5e008ed43d030"
+                && d["ordinary_replay_claim"] == false
+                && d["replay_launch_authorized"] == false,
+            "sample still has live or foreign225 claim"
+        );
+        // Unavailability is never proof of a stop: the fixed guard receipt and
+        // actual terminal unit are independently checked before child launch.
+    }
     Ok(())
 }
 fn validate_reserves(tmpfs: u64, maximum: u64, floor: u64, stop: u64) -> Result<()> {
@@ -544,7 +566,10 @@ fn validate_fleet(f: &Value, observer: &Value, observer_hash: &str) -> Result<()
     let active = f["active"]
         .as_array()
         .context("active fleet census missing")?;
-    ensure!(active.len() == 10, "changed active fleet census");
+    ensure!(
+        active.len() == if RELEASED_225 { 9 } else { 10 },
+        "changed active fleet census"
+    );
     let expected = [
         "95fb05d1b78349bcb907c1e930e7682e",
         "c2adebaad0cb42b385156631156813fe",
@@ -567,7 +592,7 @@ fn validate_fleet(f: &Value, observer: &Value, observer_hash: &str) -> Result<()
         );
     }
     ensure!(
-        counts == [4, 4, 1, 1],
+        counts == [4, 4, 1, if RELEASED_225 { 0 } else { 1 }],
         "changed producer claim multiplicity"
     );
     ensure!(
@@ -595,6 +620,100 @@ fn validate_fleet(f: &Value, observer: &Value, observer_hash: &str) -> Result<()
         sum == 695_624_150_347 && (2 * sum).div_ceil(6) == FLOOR,
         "century floor changed"
     );
+    Ok(())
+}
+
+#[cfg(feature = "ram-snapshot-eight-core-stopped225")]
+fn validate_released_225(completion: &Value, launch: &Value) -> Result<()> {
+    let id = "ac9aee3d47eb41e483a5e008ed43d030";
+    ensure!(
+        completion["schema"] == "jetstreamer-horizon-standalone-stop-completion-v1"
+            && completion["producer_invocation_id"] == id
+            && completion["plan_sha256"]
+                == "0179bdba5b7d6536d5037b4b195baeca61bd74afd018a0f1a5db43355b9cede5"
+            && completion["terminal"]["invocation_id"] == id
+            && completion["terminal"]["active"] == "failed"
+            && completion["terminal"]["pid"] == 0
+            && completion["terminal"]["restarts"] == 0
+            && completion["terminal"]["cgroup"] == ""
+            && completion["scratch_deleted"] == false
+            && completion["remote_mutations"] == false
+            && completion["r2_mutations"] == false
+            && launch["schema"] == "jetstreamer-private-epoch225-natural-root-resource-launch-v1"
+            && launch["launched"] == true
+            && launch["epoch"] == 225
+            && launch["hard_limits"]["cpu_quota_cores"] == 16
+            && launch["hard_limits"]["restart_policy"] == "no",
+        "CPU release is not the exact terminal225 guard/launch chain"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "ram-snapshot-eight-core-stopped225")]
+fn verify_released_225() -> Result<()> {
+    let completion = Path::new(
+        "/var/lib/jetstreamer/horizon-natural-root225-guard-receipts-v1/stop-completion.json",
+    );
+    let launch = Path::new(
+        "/var/lib/jetstreamer/horizon-225-natural-root-launch-20261020T190442Z-v1/launch.json",
+    );
+    checked_input(
+        completion,
+        "407169f6ef6da54c5ffdab36a3664f7c7a21cba25bec489e73f0857bc2aaffa0",
+        1 << 20,
+        false,
+    )?;
+    checked_input(
+        launch,
+        "66b9ce5c324bcf5cc2ffb3c56330809b6b831262133d4f4bccdcc1b030ca39e3",
+        1 << 20,
+        false,
+    )?;
+    let completion_bytes = fs::read(completion)?;
+    let launch_bytes = fs::read(launch)?;
+    ensure!(
+        hex(&Sha256::digest(&completion_bytes))
+            == "407169f6ef6da54c5ffdab36a3664f7c7a21cba25bec489e73f0857bc2aaffa0"
+            && hex(&Sha256::digest(&launch_bytes))
+                == "66b9ce5c324bcf5cc2ffb3c56330809b6b831262133d4f4bccdcc1b030ca39e3",
+        "CPU release input changed"
+    );
+    validate_released_225(
+        &serde_json::from_slice(&completion_bytes)?,
+        &serde_json::from_slice(&launch_bytes)?,
+    )?;
+    let output = Command::new("/usr/bin/systemctl").args([
+        "show", "horizon-qualify-225-natural-root-resource-63a2717-v1.service", "--no-pager",
+        "--property=Id,InvocationID,ActiveState,SubState,MainPID,NRestarts,ControlGroup,Restart,KillMode,Delegate",
+    ]).output()?;
+    ensure!(
+        output.status.success() && output.stdout.len() < 16_384,
+        "cannot authenticate released225"
+    );
+    let text = std::str::from_utf8(&output.stdout)?;
+    for (key, expected) in [
+        (
+            "Id",
+            "horizon-qualify-225-natural-root-resource-63a2717-v1.service",
+        ),
+        ("InvocationID", "ac9aee3d47eb41e483a5e008ed43d030"),
+        ("ActiveState", "failed"),
+        ("SubState", "failed"),
+        ("MainPID", "0"),
+        ("NRestarts", "0"),
+        ("ControlGroup", ""),
+        ("Restart", "no"),
+        ("KillMode", "control-group"),
+        ("Delegate", "no"),
+    ] {
+        ensure!(
+            text.lines()
+                .filter(|line| *line == format!("{key}={expected}"))
+                .count()
+                == 1,
+            "released225 unit changed: {key}"
+        );
+    }
     Ok(())
 }
 fn drop_child_credentials(command: &mut Command) {
@@ -644,6 +763,8 @@ fn execute(p: &Plan, plan_hash: &str, self_hash: &str) -> Result<()> {
         "tmpfs floor admission failed"
     );
     credential_probe()?;
+    #[cfg(feature = "ram-snapshot-eight-core-stopped225")]
+    verify_released_225()?;
     if p.mode == "capability" {
         write_new(
             &p.receipt_directory,
@@ -681,6 +802,8 @@ fn execute(p: &Plan, plan_hash: &str, self_hash: &str) -> Result<()> {
         host_memory()? >= START_MEMORY,
         "post-hash memory admission failed"
     );
+    #[cfg(feature = "ram-snapshot-eight-core-stopped225")]
+    verify_released_225()?;
     let resources_before = resource_snapshot(p)?;
     write_new(
         &p.receipt_directory,
@@ -833,6 +956,43 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "ram-snapshot-eight-core-stopped225")]
+    #[test]
+    fn released_cpu_requires_exact_guard_and_original_allocation() {
+        let id = "ac9aee3d47eb41e483a5e008ed43d030";
+        let completion = json!({"schema":"jetstreamer-horizon-standalone-stop-completion-v1",
+            "producer_invocation_id":id,"plan_sha256":"0179bdba5b7d6536d5037b4b195baeca61bd74afd018a0f1a5db43355b9cede5",
+            "terminal":{"invocation_id":id,"active":"failed","pid":0,"restarts":0,"cgroup":""},
+            "scratch_deleted":false,"remote_mutations":false,"r2_mutations":false});
+        let launch = json!({"schema":"jetstreamer-private-epoch225-natural-root-resource-launch-v1",
+            "launched":true,"epoch":225,"hard_limits":{"cpu_quota_cores":16,"restart_policy":"no"}});
+        validate_released_225(&completion, &launch).unwrap();
+        for (ptr, value) in [
+            ("/terminal/active", json!("active")),
+            ("/terminal/pid", json!(1)),
+            ("/terminal/restarts", json!(1)),
+            ("/terminal/cgroup", json!("/live")),
+            ("/terminal/invocation_id", json!("d".repeat(32))),
+            ("/r2_mutations", json!(true)),
+        ] {
+            let mut bad = completion.clone();
+            *bad.pointer_mut(ptr).unwrap() = value;
+            assert!(validate_released_225(&bad, &launch).is_err(), "{ptr}");
+        }
+        let mut bad = launch;
+        bad["hard_limits"]["cpu_quota_cores"] = json!(2);
+        assert!(validate_released_225(&completion, &bad).is_err());
+        assert_eq!(CPU_CORES, 8);
+    }
+
+    #[cfg(feature = "ram-snapshot-eight-core-stopped225")]
+    #[test]
+    fn released_cpu_observer_cannot_reclassify_live_225_as_free_capacity() {
+        let mut v = fixture();
+        v["diagnostic_replays"][1]["status"] = json!("observed");
+        assert!(validate_observer(&v, utc("2026-10-21T00:05:00Z").unwrap()).is_err());
+    }
+
     #[test]
     fn terminal_resources_preserve_exact_kernel_counters_and_require_all_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -948,11 +1108,19 @@ mod tests {
                 "producer_before":{"invocation_id":prod,"restarts":0,"active_state":"active"},
                 "producer_after":{"invocation_id":prod,"restarts":0,"active_state":"active"}}));
         }
+        let stopped = if RELEASED_225 {
+            json!({"range":"225-226","status":"unavailable","observation":null,
+                "producer_unit":"horizon-qualify-225-natural-root-resource-63a2717-v1.service",
+                "expected_producer_invocation_id":"ac9aee3d47eb41e483a5e008ed43d030",
+                "ordinary_replay_claim":false,"replay_launch_authorized":false})
+        } else {
+            json!({"range":"225-226","observation":ranges[3]})
+        };
         json!({"schema":"jetstreamer-horizon-live-resource-sample-v2","recorded_at_utc":"2026-10-21T00:04:42Z",
             "cadence":{"routine_minimum_interval_enforced":true,"observation_reason":"routine","minimum_interval_seconds":1800},
             "mutation":{"producer_or_controller_signals_sent":false,"service_state_changed":false,"remote_mutations":false,"r2_mutations":false},
             "host_memory":{"conservative_available_kib":START_MEMORY/1024},
-            "replays":[ranges[0],ranges[1]],"diagnostic_replays":[{"range":"203-203","observation":ranges[2]},{"range":"225-226","observation":ranges[3]}]})
+            "replays":[ranges[0],ranges[1]],"diagnostic_replays":[{"range":"203-203","observation":ranges[2]},stopped]})
     }
     #[test]
     fn observer_admission_binds_every_controller_producer_and_memory() {
@@ -970,8 +1138,16 @@ mod tests {
                 json!("failed"),
             ),
             (
-                "/diagnostic_replays/1/observation/invocation_binding_stable",
-                json!(false),
+                if RELEASED_225 {
+                    "/diagnostic_replays/1/expected_producer_invocation_id"
+                } else {
+                    "/diagnostic_replays/1/observation/invocation_binding_stable"
+                },
+                if RELEASED_225 {
+                    json!("d".repeat(32))
+                } else {
+                    json!(false)
+                },
             ),
             (
                 "/host_memory/conservative_available_kib",
@@ -1001,7 +1177,10 @@ mod tests {
             ("95fb05d1b78349bcb907c1e930e7682e", 4),
             ("c2adebaad0cb42b385156631156813fe", 4),
             ("92e367eb7cf944a1825fe5a20d9243ca", 1),
-            ("ac9aee3d47eb41e483a5e008ed43d030", 1),
+            (
+                "ac9aee3d47eb41e483a5e008ed43d030",
+                if RELEASED_225 { 0 } else { 1 },
+            ),
         ] {
             for _ in 0..count {
                 active.push(
