@@ -38,6 +38,10 @@ name = "jetstreamer-epoch203-ram-storage-probe"
 path = "src/epoch203_ram_storage_probe.rs"
 
 [[bin]]
+name = "jetstreamer-epoch203-ram-retain"
+path = "src/ram_artifact_retain.rs"
+
+[[bin]]
 name = "jetstreamer-epoch203-ram-resource"
 path = "src/epoch203_ram_resource.rs"
 required-features = ["epoch203-ram-resource-supervisor"]

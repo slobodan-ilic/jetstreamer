@@ -431,3 +431,32 @@ mutation. This is a policy implementation, not a real launch receipt: a reviewed
 launcher/collector and actual observer/fleet/retention capability evidence are
 still missing. Unit-test fixtures must never be published as those receipts.
 The fleet binary remains undeployed until those independent qualifications pass.
+
+## Terminal artifact retention (no retirement authority)
+
+`jetstreamer-epoch203-ram-retain` implements the non-destructive retention step.
+It accepts a separately hash-bound root-owned immutable plan and executable,
+requires the original terminal baseline/shrink owner with no live process,
+restart or trigger, authenticates its outcome's exact invocation/root/mount
+generation, and binds the persistent768-GiB tmpfs device/inode before and after
+inspection. It scans process commands, maps, cwd/root/exe and descriptors for
+references to the exact RAM tree, inventories its private same-device files,
+hashes every explicitly planned non-scratch artifact and fsyncs only a bounded
+root-private `retention.json` on durable storage. Scratch is counted, not hashed
+or declared resumable. Any unknown artifact, sidecar, link, wrong owner/mode,
+changed digest, reference or unreadable process state fails closed.
+
+The shared reference scanner streams mmap-heavy maps in64-KiB chunks with a
+1-GiB per-source ceiling and preserves matches spanning chunks. It distinguishes
+real descendants from similarly named siblings and never treats a permissions
+failure as absence. Both the scanner and retention policy have component tests;
+those tests do not establish actual artifact-lifecycle qualification.
+
+Retention keeps the archive and metadata on the independent RAM volume. It does
+not copy an archive onto constrained root storage, delete scratch or artifacts,
+unmount, signal or restart any owner, access R2, or authorize replay/publication.
+The receipt schema deliberately differs from the required retention-capability
+attestation and explicitly denies retirement/unmount authority. Exact-reference-
+scanned retirement and complete lifecycle qualification are still required
+before the RAM comparison can be admitted. Preserve the original RAM artifacts
+and mount pending those gates, even after a successful retention inventory.
