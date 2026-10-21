@@ -17,7 +17,7 @@ groups; a real self-probe proves zero effective child capabilities and writable
 private `/tmp`. No private receipt permissions are relaxed.
 
 Require `Type=oneshot`, `Restart=no`, `KillMode=control-group`, `Delegate=no`,
-`MemoryHigh=60G`, `MemoryMax=64G`, `MemorySwapMax=0`, `TasksMax=512`, and
+`MemoryHigh=112G`, `MemoryMax=128G`, `MemorySwapMax=0`, `TasksMax=512`, and
 `CPUQuota=200%`. Set `OOMScoreAdjust=1000` and `OOMPolicy=kill` so a resource
 failure stays within this diagnostic. The runner independently requires the
 actual cgroup `memory.oom.group` value to be `1`; the host's native
@@ -28,8 +28,8 @@ Use `TemporaryFileSystem=/tmp:rw,size=512G,nosuid,nodev,mode=1777`,
 Make only the exact receipt directory writable outside tmpfs. A 35-minute
 oneshot timeout bounds the supervisor's maximum 30-minute child execution.
 
-Every newly allocated tmpfs page is charged to the 64-GiB cgroup, with no swap.
-Even at that cap, at least 448 GiB of the 512-GiB filesystem remains free,
+Every newly allocated tmpfs page is charged to the 128-GiB cgroup, with no swap.
+Even at that cap, at least 384 GiB of the 512-GiB filesystem remains free,
 above the current 231,874,716,783-byte century floor. This is not new root-disk
 capacity or permission to spend another lane's disk reservations. Keep the
 epoch-203 component-reserve correction and all existing guards intact.
@@ -40,7 +40,7 @@ It does not verify the fixture inputs. `snapshot-tests` mode additionally
 requires a separately hash-bound, no-more-than-30-minute-old routine v2 sample
 and matching complete fleet ledger: the exact four existing producer/controller
 identities, ten active epoch claims and unchanged six canonical century
-samples. It hashes every input, requires at least 512 GiB `MemAvailable`
+samples. It hashes every input, requires at least 576 GiB `MemAvailable`
 before and after hashing, proves the exact two-test census, then launches the
 unchanged test binary with `RUST_MIN_STACK=134217728`,
 `SOLANA_RAYON_THREADS=16` and one libtest thread.
@@ -60,14 +60,20 @@ actual child outcome but fails qualification closed. Do not infer memory
 throttling from a peak alone: terminal cgroups can disappear before external
 inspection. This capture never samples or changes another replay's cgroup.
 
-The 60-GiB soft threshold is a new diagnostic generation, not an in-place
-change to the prior 56-GiB sandbox or any campaign replay. The five-minute
-56-GiB measurement (`59f179096f334d7aa749c194c95f8654`) recorded 6,874
-`memory.events high` events and 34.7 seconds of full memory pressure, with
-zero hard-limit/OOM events. This motivates a bounded comparison within the
-unchanged 64-GiB hard ceiling, not a claim that the tests or replay fit. Require
-a new immutable executable/plan, exact sandbox capability proof and fresh
-observer/fleet admission. Preserve any timeout or OOM as failure evidence.
+The 128-GiB envelope is a separate diagnostic generation, not an in-place
+change to either prior sandbox or any campaign replay. The 56-GiB soft-threshold
+measurement recorded 6,874 high events in five minutes. The subsequent
+60/64-GiB measurement (`12f7f0076ee6483b9ab13ea8e042112d`) still timed out:
+18,993 high events, 192.6 seconds of full memory pressure, approximately
+65.36 GB peak, and no hard-limit/OOM event. Its pre-kill capture contains
+37.8 GB anonymous memory plus 26.7 GB RAM-backed snapshot pages. This motivates
+a bounded envelope of roughly twice that observed footprint, not a claim
+that qualification fits or passes. The unchanged 448-GiB host stop reserve
+plus the complete new 128-GiB cap requires a 576-GiB startup minimum; the
+worst-case tmpfs free space remains above the century floor. Require a new
+immutable executable/plan, exact sandbox capability proof, and fresh matching
+observer/fleet admission before launch. Preserve either timeout or OOM as
+failure evidence. Never apply these limits to existing campaign replays.
 
 A successful child exit, unchanged input identities and no guard trip produce
 a private result, never a publication receipt. Preserve a failing invocation
