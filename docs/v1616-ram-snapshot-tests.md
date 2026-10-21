@@ -18,8 +18,10 @@ private `/tmp`. No private receipt permissions are relaxed.
 
 Require `Type=oneshot`, `Restart=no`, `KillMode=control-group`, `Delegate=no`,
 `MemoryHigh=56G`, `MemoryMax=64G`, `MemorySwapMax=0`, `TasksMax=512`, and
-`CPUQuota=200%`. Set `OOMScoreAdjust=1000`, `OOMPolicy=stop` and
-`MemoryOOMGroup=yes` so a resource failure stays within this diagnostic.
+`CPUQuota=200%`. Set `OOMScoreAdjust=1000` and `OOMPolicy=kill` so a resource
+failure stays within this diagnostic. The runner independently requires the
+actual cgroup `memory.oom.group` value to be `1`; the host's native
+`OOMPolicy=kill` sets it. Do not use unsupported `MemoryOOMGroup=` assignments.
 Use `TemporaryFileSystem=/tmp:rw,size=512G,nosuid,nodev,mode=1777`,
 `TMPDIR=/tmp`, `ProtectSystem=strict`, `ProtectHome=read-only`,
 `ProtectControlGroups=yes`, `PrivateNetwork=yes`, and `NoNewPrivileges=yes`.

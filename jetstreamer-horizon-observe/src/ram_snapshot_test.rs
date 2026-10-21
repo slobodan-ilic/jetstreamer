@@ -264,6 +264,7 @@ fn authenticate(p: &Plan) -> Result<String> {
         ("memory.max", MEMORY_MAX),
         ("memory.high", 56 * GIB),
         ("memory.swap.max", 0),
+        ("memory.oom.group", 1),
         ("pids.max", 512),
     ] {
         ensure!(
@@ -292,7 +293,7 @@ fn authenticate(p: &Plan) -> Result<String> {
             &p.unit,
             "--no-pager",
             "--no-ask-password",
-        "--property=Id,InvocationID,MainPID,NRestarts,Restart,KillMode,Delegate,Type,NoNewPrivileges,ProtectSystem,ProtectHome,ProtectControlGroups,PrivateNetwork,TemporaryFileSystem,ReadWritePaths,CapabilityBoundingSet,OOMPolicy,OOMScoreAdjust,MemoryOOMGroup",
+        "--property=Id,InvocationID,MainPID,NRestarts,Restart,KillMode,Delegate,Type,NoNewPrivileges,ProtectSystem,ProtectHome,ProtectControlGroups,PrivateNetwork,TemporaryFileSystem,ReadWritePaths,CapabilityBoundingSet,OOMPolicy,OOMScoreAdjust",
         ])
         .output()?;
     ensure!(
@@ -332,9 +333,8 @@ fn validate_sandbox(text: &str, receipts: &Path) -> Result<()> {
         ("ProtectHome", "read-only"),
         ("ProtectControlGroups", "yes"),
         ("PrivateNetwork", "yes"),
-        ("OOMPolicy", "stop"),
+        ("OOMPolicy", "kill"),
         ("OOMScoreAdjust", "1000"),
-        ("MemoryOOMGroup", "yes"),
         (
             "TemporaryFileSystem",
             "/tmp:rw,size=512G,nosuid,nodev,mode=1777",
@@ -831,7 +831,7 @@ mod tests {
         let path =
             Path::new("/var/lib/jetstreamer/horizon-ram-snapshot-tests/ram-snapshot-test-fixture");
         let s = format!(
-            "NoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectControlGroups=yes\nPrivateNetwork=yes\nOOMPolicy=stop\nOOMScoreAdjust=1000\nMemoryOOMGroup=yes\nTemporaryFileSystem=/tmp:rw,size=512G,nosuid,nodev,mode=1777\nReadWritePaths={}\nCapabilityBoundingSet=cap_dac_override cap_kill cap_setgid cap_setuid\n",
+            "NoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectControlGroups=yes\nPrivateNetwork=yes\nOOMPolicy=kill\nOOMScoreAdjust=1000\nTemporaryFileSystem=/tmp:rw,size=512G,nosuid,nodev,mode=1777\nReadWritePaths={}\nCapabilityBoundingSet=cap_dac_override cap_kill cap_setgid cap_setuid\n",
             path.display()
         );
         validate_sandbox(&s, path).unwrap();
@@ -840,7 +840,7 @@ mod tests {
             ("ProtectHome=read-only", "ProtectHome=no"),
             ("size=512G", "size=64G"),
             ("ReadWritePaths=/var/lib", "ReadWritePaths=/other"),
-            ("OOMPolicy=stop", "OOMPolicy=continue"),
+            ("OOMPolicy=kill", "OOMPolicy=continue"),
         ] {
             assert!(
                 validate_sandbox(&s.replace(from, to), path).is_err(),
