@@ -30,6 +30,10 @@ path = "src/ram_snapshot_test.rs"
 name = "jetstreamer-epoch203-ram-resource-plan"
 path = "src/epoch203_ram_resource_plan.rs"
 
+[[bin]]
+name = "jetstreamer-epoch203-ram-storage-probe"
+path = "src/epoch203_ram_storage_probe.rs"
+
 [dependencies]
 anyhow.workspace = true
 libc.workspace = true

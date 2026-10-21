@@ -104,3 +104,62 @@ as an admission service or reinterpret the old disk runner's free-space gate.
 
 The geometry is intentionally separated from implementation and admission.
 Leave existing replays, guards, metadata owners and sealed binaries unchanged.
+
+## Persistent-storage capability probe
+
+`jetstreamer-epoch203-ram-storage-probe` now implements the storage/sandbox
+authentication component, not the replay supervisor or admission. It accepts
+`PLAN --plan-sha256 HEX --self-sha256 HEX`, verifies its own immutable executable
+and the root-owned immutable plan, and authenticates the actual unit/cgroup,
+mount unit, mount ID, filesystem type/capacity, root inode device, child
+directories, TMPDIR and exact before/after identities. Its only write is
+`receipts/storage-capability.json` beneath the exact private RAM root, with
+no-clobber creation, mode0400 and file/directory fsync. Seal that metadata onto
+durable storage before treating it as retained evidence: fsync on tmpfs does
+not make it survive reboot. It never launches replay, polls host memory or
+the fleet, signals a process, mounts/unmounts, removes files or accesses R2.
+
+The strict plan has these fields, with no others:
+
+```json
+{
+  "schema": "jetstreamer-private-epoch203-ram-storage-probe-plan-v1",
+  "unit": "horizon-203-ram-storage-probe-ATTEMPT.service",
+  "run_root": "/home/ubuntu/.jetstreamer-private/ram-resource-203-ATTEMPT",
+  "mount_unit": "EXACT_SYSTEMD_ESCAPED_PATH.mount",
+  "mount_invocation_id": "EXACT_32_LOWERCASE_HEX",
+  "mount_id": 123
+}
+```
+
+The mount must be a separately managed active `tmpfs` mount with
+`StopWhenUnneeded=no`, empty `BindsTo=`/`PartOf=`, 768-GiB capacity,
+`rw,nosuid,nodev` and executable files, root mode0700/UID1000/GID1000, and
+empty mode0700 `scratch`, `output`, `ledger`, `tmp` and `receipts` children
+on the same device. Do not substitute a bind-mounted subtree or a service's
+`TemporaryFileSystem=` namespace. Probe plans bind its actual current
+invocation and mount ID; a changed or multiply mounted path fails closed.
+
+For the future exact probe service require `Type=oneshot`, `Restart=no`,
+`KillMode=control-group`, `Delegate=no`, `NoNewPrivileges=yes`,
+`ProtectSystem=strict`, `ProtectHome=read-only`, `ProtectControlGroups=yes`,
+`PrivateDevices=yes`, `RestrictSUIDSGID=yes`, `UMask=0077`, `PrivateNetwork=no`,
+empty `TemporaryFileSystem=`, and only the exact RAM root in `ReadWritePaths=`.
+The actual cgroup must have memory.high304GiB, memory.max320GiB, swap0,
+groupOOM1, pids512 and an exact 16-core CPU quota. The probe makes no claim
+that this CPU budget is available: stopped225 allocation and fresh fleet
+admission remain separate gates before **any replay**.
+
+`User=1000` alone retains ubuntu's NSS supplementary groups (including sudo
+and lxd on this host). Instead the probe service starts a fixed setpriv exec
+wrapper as `User=root`, `Group=root`, with only
+`CapabilityBoundingSet=CAP_SETGID CAP_SETUID CAP_SETPCAP` and no ambient or
+added supplementary groups. Invoke the immutable reviewed wrapper with
+`--reuid=1000 --regid=1000 --clear-groups --bounding-set=-all --no-new-privs`
+and the sealed probe/plan/digests. The probe itself must observe all four
+real/effective/saved/filesystem UID and GID values1000, no foreign supplementary
+groups, all five process capability sets zero and effective NoNewPrivs1.
+A real host read-only `/usr/bin/setpriv ... /usr/bin/cat /proc/self/status`
+check confirmed that this drop mechanism works; that check was **not** an
+actual sandbox or storage capability pass. No mount or replay is authorized
+by it. Require a separately sealed actual probe invocation before deployment.
