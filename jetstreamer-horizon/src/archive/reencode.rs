@@ -312,6 +312,128 @@ where
     reencode_archive_inner(source, sink, options, None)
 }
 
+/// Exports a dense, proper prefix of one uninterrupted V2 source into a new
+/// V2 archive. Only the declared range and segment-local epoch slot count are
+/// narrowed; worker identity, bootstrap, raw write versions and event order
+/// are preserved. The initial PoH anchor must be nonzero and stored links are
+/// checked strictly. This is not full PoH verification, a checkpoint proof,
+/// canonical-root qualification, or permission to publish the result.
+///
+/// Callers must separately bind immutable source handles/digests, admit the
+/// output allocation, use a no-clobber private sink, and independently reread
+/// the result. No file, manifest or checksum lifecycle is implemented here.
+/// Source/output semantic digests differ only when epoch range metadata is
+/// narrowed; the output digest is suitable for an independent output reread.
+pub fn reencode_archive_prefix<R, W>(
+    mut source: R,
+    sink: W,
+    writer_config: ArchiveWriterConfig,
+    prefix_slot_count: u64,
+) -> Result<(W, ReencodeStats), ArchiveFormatError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    let invalid = ArchiveFormatError::InvalidContainerLayout;
+    let source_file_bytes = source.seek(SeekFrom::End(0))?;
+    let mut reader = ArchiveReader::open(source)?;
+    let header = reader.header().clone();
+    if header.format_version != super::FORMAT_VERSION_V2
+        || writer_config.format != super::ArchiveVersion::V2
+        || prefix_slot_count == 0
+        || prefix_slot_count >= header.slot_count
+        || !reader.has_complete_slot_coverage()?
+    {
+        return Err(invalid(
+            "prefix export requires a dense V2 source and a nonempty proper V2 prefix",
+        ));
+    }
+    let Some(super::ArchiveProvenance::V2(mut provenance)) = reader.provenance()? else {
+        return Err(invalid(
+            "prefix export requires uninterrupted single-runtime V2 provenance",
+        ));
+    };
+    provenance.base.requested_slot_count = prefix_slot_count;
+    reader.verify_chain = true;
+    reader.chain_mismatch_policy = ChainMismatchPolicy::Reject;
+    // Load and validate the first bucket before staging destination events.
+    // read_slots re-seeks when the next request repeats the first slot, so
+    // the real visitor still receives every event exactly once.
+    if reader.read_slots(header.slot_start, 1, &mut SemanticDigest::new())? != 1 {
+        return Err(invalid("prefix source has no initial slot"));
+    }
+    let anchor = reader
+        .current_bucket_header()
+        .ok_or(invalid("missing prefix source bucket header"))?
+        .poh_start_hash;
+    if anchor == Hash::default() {
+        return Err(invalid(
+            "prefix export requires a nonzero initial PoH anchor",
+        ));
+    }
+    let mut writer = ArchiveWriter::new_with_provenance(
+        sink,
+        header.epoch,
+        header.slot_start,
+        prefix_slot_count,
+        writer_config,
+        &super::ArchiveProvenance::V2(provenance),
+    )?;
+    writer.preserve_initial_poh_anchor(header.slot_start, anchor)?;
+    let (slots_reencoded, source_semantic_sha256, output_semantic_sha256) = {
+        let mut visitor = ReencodeVisitor::new(&mut writer, None);
+        visitor.prefix_range = Some((
+            header.epoch,
+            header.slot_start,
+            header.slot_count,
+            prefix_slot_count,
+        ));
+        visitor.prefix_next_slot = Some(header.slot_start);
+        visitor.prefix_last_blockhash = Some(anchor);
+        let slots = reader.read_slots(header.slot_start, prefix_slot_count, &mut visitor)?;
+        if let Some(error) = visitor.error.take() {
+            return Err(error);
+        }
+        if slots != prefix_slot_count {
+            return Err(invalid("prefix source ended before its declared cut"));
+        }
+        (
+            slots,
+            visitor.source_digest.finish()?,
+            visitor.output_digest.finish()?,
+        )
+    };
+    let end = header
+        .slot_start
+        .checked_add(prefix_slot_count)
+        .ok_or(invalid("prefix range overflow"))?;
+    let selected = reader
+        .bucket_index()
+        .iter()
+        .take_while(|entry| entry.first_slot < end);
+    let (source_buckets, source_bucket_bytes) = selected.fold((0, 0), |(count, bytes), entry| {
+        (count + 1, bytes + entry.len)
+    });
+    let (sink, output) = writer.finish()?;
+    Ok((
+        sink,
+        ReencodeStats {
+            source_epoch: header.epoch,
+            source_slot_start: header.slot_start,
+            source_slot_count: header.slot_count,
+            source_file_bytes,
+            source_bucket_bytes,
+            source_buckets,
+            slots_reencoded,
+            source_zero_parent_resume_artifacts: 0,
+            output_zero_parent_resume_artifacts: 0,
+            source_semantic_sha256,
+            output_semantic_sha256,
+            output,
+        },
+    ))
+}
+
 /// Re-encodes a complete archive while repairing its single initial
 /// zero-parent placeholder from a canonical predecessor.
 ///
@@ -572,6 +694,10 @@ struct ReencodeVisitor<'a, W: Write> {
     repair_applied: bool,
     first_block_signatures: Vec<Vec<Signature>>,
     error: Option<ArchiveFormatError>,
+    prefix_range: Option<(u64, u64, u64, u64)>,
+    prefix_next_slot: Option<u64>,
+    prefix_last_blockhash: Option<Hash>,
+    prefix_epoch_seen: bool,
 }
 
 impl<'a, W: Write> ReencodeVisitor<'a, W> {
@@ -584,6 +710,10 @@ impl<'a, W: Write> ReencodeVisitor<'a, W> {
             repair_applied: false,
             first_block_signatures: Vec::new(),
             error: None,
+            prefix_range: None,
+            prefix_next_slot: None,
+            prefix_last_blockhash: None,
+            prefix_epoch_seen: false,
         }
     }
 
@@ -602,6 +732,15 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
         if self.error.is_some() {
             return;
         }
+        if let Some(expected) = self.prefix_next_slot {
+            if slot != expected {
+                self.error = Some(ArchiveFormatError::InvalidContainerLayout(
+                    "prefix source slot coverage is not contiguous",
+                ));
+                return;
+            }
+            self.prefix_next_slot = slot.checked_add(1);
+        }
         self.source_digest.on_slot_start(slot, kind);
         self.output_digest.on_slot_start(slot, kind);
         let result = match kind {
@@ -616,6 +755,49 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
             return;
         }
         self.source_digest.on_epoch(meta);
+        if let Some((epoch, start, original_count, prefix_count)) = self.prefix_range {
+            if self.prefix_epoch_seen
+                || meta.epoch != epoch
+                || meta.start_slot != start
+                || meta.slot_count != original_count
+                || meta.first_block_slot.checked_add(1) != self.prefix_next_slot
+            {
+                self.error = Some(ArchiveFormatError::InvalidContainerLayout(
+                    "prefix source epoch metadata range mismatch",
+                ));
+                return;
+            }
+            self.prefix_epoch_seen = true;
+            // EpochMeta intentionally has no Clone: keep its large arena on
+            // the heap and copy nested writes in their original event order.
+            let mut narrowed = EpochMeta::new_boxed();
+            narrowed.epoch = meta.epoch;
+            narrowed.start_slot = meta.start_slot;
+            narrowed.slot_count = prefix_count;
+            narrowed.first_block_slot = meta.first_block_slot;
+            narrowed.num_reward_partitions = meta.num_reward_partitions;
+            for (update, data) in meta.updates.iter() {
+                let view = AccountUpdateView {
+                    pubkey: update.pubkey,
+                    lamports: update.lamports,
+                    owner: update.owner,
+                    executable: update.executable,
+                    rent_epoch: update.rent_epoch,
+                    write_version: update.write_version,
+                    data,
+                };
+                if narrowed.updates.push(&view).is_err() {
+                    self.error = Some(ArchiveFormatError::InvalidContainerLayout(
+                        "prefix epoch update copy exceeded its original arena",
+                    ));
+                    return;
+                }
+            }
+            self.output_digest.on_epoch(&narrowed);
+            let result = self.writer.write_epoch_meta(&narrowed);
+            self.record(result);
+            return;
+        }
         self.output_digest.on_epoch(meta);
         let result = self.writer.write_epoch_meta(meta);
         self.record(result);
@@ -658,6 +840,17 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
     fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
         if self.error.is_some() {
             return;
+        }
+        if let (Some(previous), BlockNotification::Block(meta)) =
+            (self.prefix_last_blockhash, notification)
+        {
+            if meta.parent_blockhash != previous {
+                self.error = Some(ArchiveFormatError::InvalidContainerLayout(
+                    "prefix source blockhash link is discontinuous",
+                ));
+                return;
+            }
+            self.prefix_last_blockhash = Some(meta.blockhash);
         }
         self.source_digest.record_block(notification, entries, None);
         if let BlockNotification::Block(meta) = notification {
@@ -734,6 +927,35 @@ mod tests {
     use crate::block_metas::BlockMeta;
 
     use super::*;
+
+    #[test]
+    fn prefix_visitor_rejects_slot_gaps_and_cross_bucket_link_changes() {
+        let mut writer =
+            ArchiveWriter::new(Vec::new(), 1, 10, 2, ArchiveWriterConfig::default()).unwrap();
+        let mut visitor = ReencodeVisitor::new(&mut writer, None);
+        visitor.prefix_next_slot = Some(10);
+        visitor.on_slot_start(11, SlotKind::Skipped);
+        assert!(visitor.error.is_some());
+
+        let mut visitor = ReencodeVisitor::new(&mut writer, None);
+        visitor.prefix_last_blockhash = Some(Hash::new_from_array([1; 32]));
+        let mut meta = crate::block_metas::BlockMeta::new_boxed();
+        meta.slot = 10;
+        meta.parent_slot = 9;
+        meta.parent_blockhash = Hash::new_from_array([2; 32]);
+        meta.blockhash = Hash::new_from_array([3; 32]);
+        let mut source =
+            ArchiveWriter::new(Vec::new(), 1, 10, 1, ArchiveWriterConfig::default()).unwrap();
+        source
+            .preserve_initial_poh_anchor(10, meta.parent_blockhash)
+            .unwrap();
+        source.begin_slot(10).unwrap();
+        source.end_slot(&meta, &[]).unwrap();
+        let mut reader =
+            ArchiveReader::open(std::io::Cursor::new(source.finish().unwrap().0)).unwrap();
+        reader.read_slots(10, 1, &mut visitor).unwrap();
+        assert!(visitor.error.is_some());
+    }
 
     fn one_update_digest(lamports: u64, data: &[u8]) -> [u8; 32] {
         let update = AccountUpdateView {

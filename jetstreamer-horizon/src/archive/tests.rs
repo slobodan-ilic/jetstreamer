@@ -607,6 +607,230 @@ fn full_reencode_preserves_v3_provenance_bytes() {
     assert_full_reencode_preserves_provenance_bytes(sample_archive_provenance_v3());
 }
 
+fn prefix_export_source(anchor: Hash, epoch_count: u64) -> Vec<u8> {
+    let mut base = sample_archive_provenance_v1();
+    base.requested_slot_count = 7;
+    let provenance = ArchiveProvenance::V2(ArchiveProvenanceV2 {
+        base,
+        worker_executable_sha256: [0x42; 32],
+    });
+    let mut writer = ArchiveWriter::new_with_provenance(
+        Vec::new(),
+        1,
+        432_000,
+        7,
+        ArchiveWriterConfig {
+            bucket_slots: 4,
+            compression: Compression::None,
+            ..Default::default()
+        },
+        &provenance,
+    )
+    .unwrap();
+    writer.preserve_initial_poh_anchor(432_000, anchor).unwrap();
+    let mut parent = anchor;
+    // Leading skipped slots exercise propagation of the source bucket anchor.
+    for offset in 0..7 {
+        let slot = 432_000 + offset;
+        if offset < 2 {
+            writer.write_skipped_slot(slot).unwrap();
+            continue;
+        }
+        writer.begin_slot(slot).unwrap();
+        let mut update = AccountUpdateView {
+            pubkey: Address::new_from_array([7; 32]),
+            lamports: offset,
+            owner: Address::new_from_array([8; 32]),
+            executable: false,
+            rent_epoch: u64::MAX,
+            write_version: 9_007_199_254_740_993 + offset * 10,
+            data: b"retained exactly",
+        };
+        if offset == 2 {
+            let mut epoch = EpochMeta::new_boxed();
+            epoch.epoch = 1;
+            epoch.start_slot = 432_000;
+            epoch.slot_count = epoch_count;
+            epoch.first_block_slot = slot;
+            epoch.updates.push(&update).unwrap();
+            writer.write_epoch_meta(&epoch).unwrap();
+            update.write_version += 1;
+        }
+        writer.write_reencoded_pre_update(&update).unwrap();
+        update.write_version += 1;
+        let mut tx = Transaction::new_boxed();
+        tx.signatures.push(Signature::default());
+        tx.push_account_update(&update).unwrap();
+        writer.write_transaction(&tx).unwrap();
+        update.write_version += 1;
+        writer.write_reencoded_post_update(&update).unwrap();
+        let mut block = BlockMeta::new_boxed();
+        block.slot = slot;
+        block.parent_slot = if offset == 2 { 431_999 } else { slot - 1 };
+        block.parent_blockhash = parent;
+        block.blockhash = Hash::new_from_array([offset as u8; 32]);
+        block.executed_transaction_count = 1;
+        block.entry_count = 1;
+        writer
+            .end_slot(
+                &block,
+                &[EntryRecord {
+                    num_hashes: 1,
+                    tx_count: 1,
+                }],
+            )
+            .unwrap();
+        parent = block.blockhash;
+    }
+    writer.finish().unwrap().0
+}
+
+#[test]
+fn prefix_export_cuts_inside_bucket_and_preserves_events_and_provenance() {
+    let source = prefix_export_source(Hash::new_from_array([0xa5; 32]), 7);
+    for bucket_slots in [1, 2, 4, 8] {
+        let (output, stats) = reencode_archive_prefix(
+            std::io::Cursor::new(&source),
+            Vec::new(),
+            ArchiveWriterConfig {
+                bucket_slots,
+                ..Default::default()
+            },
+            5,
+        )
+        .unwrap();
+        let mut reader = ArchiveReader::open(std::io::Cursor::new(&output)).unwrap();
+        assert_eq!(reader.header().slot_start, 432_000);
+        assert_eq!(reader.header().slot_count, 5);
+        assert!(reader.has_complete_slot_coverage().unwrap());
+        let ArchiveProvenance::V2(mut expected) =
+            ArchiveReader::open(std::io::Cursor::new(&source))
+                .unwrap()
+                .provenance()
+                .unwrap()
+                .unwrap()
+        else {
+            panic!()
+        };
+        expected.base.requested_slot_count = 5;
+        assert_eq!(reader.provenance().unwrap(), Some(expected.into()));
+        assert_eq!(
+            read_all(&output, 432_000, 5, true),
+            read_all(&source, 432_000, 5, true)
+        );
+        assert_eq!(stats.slots_reencoded, 5);
+        assert_eq!(stats.source_slot_count, 7);
+        assert_eq!(
+            stats.output_semantic_sha256,
+            archive_semantic_sha256(&output)
+        );
+        assert_ne!(stats.source_semantic_sha256, stats.output_semantic_sha256);
+        let mut prefix_digest = SemanticDigest::new();
+        ArchiveReader::open(std::io::Cursor::new(&source))
+            .unwrap()
+            .read_slots(432_000, 5, &mut prefix_digest)
+            .unwrap();
+        assert_eq!(
+            stats.source_semantic_sha256,
+            prefix_digest.finish().unwrap()
+        );
+        struct EpochCount(Option<u64>);
+        impl SlotVisitor for EpochCount {
+            fn on_epoch(&mut self, meta: &EpochMeta) {
+                self.0 = Some(meta.slot_count);
+            }
+        }
+        let mut count = EpochCount(None);
+        reader.read_slots(432_000, 5, &mut count).unwrap();
+        assert_eq!(count.0, Some(5));
+    }
+}
+
+#[test]
+fn prefix_export_rejects_unsafe_range_anchor_metadata_and_provenance() {
+    let source = prefix_export_source(Hash::new_from_array([0xa5; 32]), 7);
+    for count in [0, 7, 8, u64::MAX] {
+        assert!(
+            reencode_archive_prefix(
+                std::io::Cursor::new(&source),
+                Vec::new(),
+                ArchiveWriterConfig::default(),
+                count
+            )
+            .is_err()
+        );
+    }
+    let zero_anchor = prefix_export_source(Hash::default(), 7);
+    let wrong_metadata = prefix_export_source(Hash::new_from_array([0xa5; 32]), 6);
+    for source in [&zero_anchor, &wrong_metadata] {
+        assert!(
+            reencode_archive_prefix(
+                std::io::Cursor::new(source),
+                Vec::new(),
+                ArchiveWriterConfig::default(),
+                5
+            )
+            .is_err()
+        );
+    }
+    let (legacy, _, _) = write_archive(1_000, 10, ArchiveWriterConfig::default());
+    assert!(
+        reencode_archive_prefix(
+            std::io::Cursor::new(legacy),
+            Vec::new(),
+            ArchiveWriterConfig::default(),
+            5
+        )
+        .is_err()
+    );
+    assert!(
+        reencode_archive_prefix(
+            std::io::Cursor::new(source),
+            Vec::new(),
+            ArchiveWriterConfig {
+                format: ArchiveVersion::V1,
+                ..Default::default()
+            },
+            5
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn prefix_export_never_projects_legacy_or_assembled_provenance_into_v2() {
+    let mut legacy = sample_archive_provenance_v1();
+    legacy.requested_slot_count = 2;
+    for provenance in [legacy.into(), sample_archive_provenance_v3()] {
+        let range = provenance.requested_range().unwrap();
+        let mut writer = ArchiveWriter::new_with_provenance(
+            Vec::new(),
+            1,
+            range.start,
+            range.end - range.start,
+            ArchiveWriterConfig::default(),
+            &provenance,
+        )
+        .unwrap();
+        writer
+            .preserve_initial_poh_anchor(range.start, Hash::new_from_array([0xa5; 32]))
+            .unwrap();
+        for slot in range {
+            writer.write_skipped_slot(slot).unwrap();
+        }
+        let source = writer.finish().unwrap().0;
+        assert!(
+            reencode_archive_prefix(
+                std::io::Cursor::new(source),
+                Vec::new(),
+                ArchiveWriterConfig::default(),
+                1
+            )
+            .is_err()
+        );
+    }
+}
+
 #[test]
 fn sparse_reencode_does_not_inherit_full_range_provenance() {
     let mut base = sample_archive_provenance_v1();
