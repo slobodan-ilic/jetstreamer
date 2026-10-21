@@ -354,3 +354,26 @@ them, or treat the synthetic in-memory unit-test fixtures as qualification.
 Implement and exercise the real observer/fleet auxiliary role and retained-
 artifact lifecycle, seal their actual capability evidence, qualify this exact
 supervisor package/environment and prove its real guard fire before deployment.
+
+Append `--storage-capability` for the separately scoped **no-entry** path.
+The shared runner still authenticates its self/plan, exact profile and all
+parent/worker/snapshot/genesis/checkpoint input hashes. It authenticates the
+actual RAM sandbox before the large reads, repeats preparation checks, copies
+only verified genesis into the private ledger, builds the exact child command/
+cleared environment, and authenticates the pre-spawn storage phase. It then
+returns through a distinct capability dispatch **before any replay/measurement
+call** and writes only `receipts/supervisor-storage-capability.json` mode0400,
+no-clobber with file/directory fsync. A subprocess-dispatch regression rejects
+any path into replay admission, spawn or safety guard during this operation.
+Existing DiskStorage profiles reject this extra CLI argument.
+
+This mode intentionally does not load auxiliary qualification or claim fresh
+fleet/CPU/memory admission: it takes no host-memory sample, starts no guard,
+executes neither node nor worker and creates no archive. Its distinct schema
+denies replay launch, workerIPC, fullpeak, runtime promotion, publication and
+retirement. It cannot satisfy any of the observer/fleet/retention attestation
+schemas. Unresolved auxiliary-contract fields in this capability-only envelope
+are not receipts and must never be filled with fabricated positive evidence.
+Seal the resulting metadata onto durable storage; its original RAM copy does
+not survive reboot. Fullbenchmark mode remains fail-closed on all qualification
+evidence and repeats fresh admission immediately before its actual fork.

@@ -56,6 +56,10 @@ pub(crate) struct Plan {
 /// Plans cannot select an implementation. Existing binaries use DiskStorage;
 /// no RAM path, mount operation or relaxed resource gate is introduced here.
 pub(crate) trait StorageHooks {
+    fn capability_only(&self)->bool {false}
+    fn capability_result(&self,_p:&Plan,_invocation:&str,_bindings:&Value,_command:&Command)->Result<()> {
+        anyhow::bail!("storage capability path is unsupported")
+    }
     fn decode_plan(&self, bytes: &[u8]) -> Result<Plan> {
         Ok(serde_json::from_slice(bytes)?)
     }
@@ -151,7 +155,7 @@ fn private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn persist(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn persist(path: &Path, value: &Value) -> Result<()> {
     let parent = path.parent().context("receipt parent")?;
     private_directory(parent)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
@@ -495,8 +499,10 @@ fn run(storage: &dyn StorageHooks) -> Result<()> {
         "run as isolated replay user"
     );
     let args: Vec<_> = env::args().collect();
+    let capability=storage.capability_only();
     ensure!(
-        args.len() == 6 && args[2] == "--plan-sha256" && args[4] == "--self-sha256",
+        args.len() == if capability {7}else{6} && args[2] == "--plan-sha256" && args[4] == "--self-sha256"
+            && (!capability || args[6]=="--storage-capability"),
         "usage: canary PLAN --plan-sha256 HEX --self-sha256 HEX"
     );
     bound_file(&fs::read_link("/proc/self/exe")?, &args[5], 256 << 20)?;
@@ -569,17 +575,23 @@ fn run(storage: &dyn StorageHooks) -> Result<()> {
     File::open(p.run_root.join("ledger"))?.sync_all()?;
     let mut cmd = command(&p);
     storage.configure_command(&p, &mut cmd)?;
+    execute_prepared(storage,&p,&invocation,&cgroup,&mut cmd,
+        &json!({"plan_path":args[1],"plan_sha256":args[3],"self_sha256":args[5]}))
+}
+
+fn execute_prepared(storage:&dyn StorageHooks,p:&Plan,invocation:&str,cgroup:&Path,cmd:&mut Command,bindings:&Value)->Result<()> {
+    if storage.capability_only() {return storage.capability_result(p,invocation,bindings,cmd);}
     let execute = if NATURAL_ROOT_FINISH {
         measure_root
     } else {
         measure
     };
     execute(
-        &p,
-        &invocation,
-        &cgroup,
-        &mut cmd,
-        &json!({"plan_path":args[1],"plan_sha256":args[3],"self_sha256":args[5]}),
+        p,
+        invocation,
+        cgroup,
+        cmd,
+        bindings,
         storage,
     )
 }
@@ -1577,6 +1589,21 @@ mod tests {
         assert!(outcome.unwrap_err().to_string().contains("storage admission rejected"));
         assert!(!t.path().join("scratch/runtime/accounts-state").exists());
         assert!(fs::read_dir(t.path().join("receipts")).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn no_entry_capability_dispatch_never_reaches_replay_or_guard() {
+        struct Capability;
+        impl StorageHooks for Capability {
+            fn capability_only(&self)->bool {true}
+            fn capability_result(&self,_p:&Plan,_inv:&str,_bindings:&Value,_cmd:&Command)->Result<()> {Ok(())}
+            fn before_spawn(&self,_p:&Plan,_inv:&str)->Result<Value> {panic!("capability reached spawn gate")}
+            fn guard(&self,_p:&Plan,_inv:&str,_child:u32,_elapsed:Duration,_draining:bool)->Result<()> {panic!("capability reached guard")}
+        }
+        let p=fixture_plan();let mut cmd=command(&p);
+        execute_prepared(&Capability,&p,&"a".repeat(32),Path::new("/not-a-cgroup"),&mut cmd,&json!({})).unwrap();
+        assert!(!DiskStorage.capability_only());
+        assert!(DiskStorage.capability_result(&p,&"a".repeat(32),&json!({}),&cmd).is_err());
     }
 
     #[test]
