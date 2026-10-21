@@ -51,11 +51,11 @@ struct Plan {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct Metadata {
-    slot: u64,
-    parent_slot: u64,
-    final_poh_hash: String,
-    previous_poh_hash: String,
+pub(crate) struct Metadata {
+    pub(crate) slot: u64,
+    pub(crate) parent_slot: u64,
+    pub(crate) final_poh_hash: String,
+    pub(crate) previous_poh_hash: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -226,7 +226,7 @@ fn validate_service(properties: &str, invocation: &str, pid: u32) -> Result<()> 
     Ok(())
 }
 
-fn authenticate(unit: &str) -> Result<String> {
+pub(crate) fn authenticate(unit: &str) -> Result<String> {
     let invocation = env::var("INVOCATION_ID").context("persistent systemd service required")?;
     let result = Command::new("/usr/bin/systemctl")
         .args([
@@ -520,6 +520,116 @@ fn resume_targets(
     Ok(complete)
 }
 
+/// Independently authenticate a completed fixed-census collector before native
+/// acquisition. This grants no native/replay/publication authority. Every target
+/// and original RPC binding is reread; completion or checkpoint presence alone
+/// cannot substitute for this check.
+#[allow(dead_code)] // Shared with the native consumer, not called by collection.
+pub(crate) fn validate_complete_collection(
+    plan_path: &Path,
+    plan_sha: &str,
+    complete_path: &Path,
+    complete_sha: &str,
+) -> Result<Vec<Metadata>> {
+    let binding = BoundFile {
+        path: plan_path.into(),
+        sha256: plan_sha.into(),
+    };
+    let plan: Plan = serde_json::from_slice(&read_bound(&binding)?)?;
+    validate_plan(&plan)?;
+    private_dir(&plan.root)?;
+    ensure!(
+        complete_path == plan.root.join("complete.json"),
+        "wrong completion path"
+    );
+    let census: Value = serde_json::from_slice(&read_bound(&plan.census)?)?;
+    let targets = target_map(&census)?;
+    let complete: Value = serde_json::from_slice(&read_bound(&BoundFile {
+        path: complete_path.into(),
+        sha256: complete_sha.into(),
+    })?)?;
+    validate_completion_header(&complete, &binding, &plan)?;
+    let verified = resume_targets(&plan, plan_sha, &targets)?;
+    ensure!(verified.len() == TARGETS, "incomplete verified target set");
+    let declared = complete["target_receipts"]
+        .as_array()
+        .context("missing target bindings")?;
+    validate_declared_targets(declared, &verified)?;
+    let mut metadata = Vec::with_capacity(TARGETS);
+    for (entry, (&slot, bound)) in declared.iter().zip(&verified) {
+        let entry: BoundFile = serde_json::from_value(entry.clone())?;
+        ensure!(
+            entry.path == bound.path && entry.sha256 == bound.sha256,
+            "changed,dropped,reordered or substituted target binding"
+        );
+        let receipt: TargetReceipt = serde_json::from_slice(&read_bound(bound)?)?;
+        ensure!(receipt.metadata.slot == slot, "target key changed");
+        metadata.push(receipt.metadata);
+    }
+    // Recheck the two top-level immutable objects after the complete reread.
+    read_bound(&binding)?;
+    read_bound(&BoundFile {
+        path: complete_path.into(),
+        sha256: complete_sha.into(),
+    })?;
+    Ok(metadata)
+}
+
+#[allow(dead_code)] // Shared with the native consumer.
+fn validate_declared_targets(
+    declared: &[Value],
+    verified: &BTreeMap<u64, BoundFile>,
+) -> Result<()> {
+    ensure!(
+        declared.len() == verified.len(),
+        "incomplete declared target set"
+    );
+    for (entry, bound) in declared.iter().zip(verified.values()) {
+        let entry: BoundFile = serde_json::from_value(entry.clone())?;
+        ensure!(
+            entry.path == bound.path && entry.sha256 == bound.sha256,
+            "changed,dropped,reordered or substituted target binding"
+        );
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Shared with the native consumer.
+fn validate_completion_header(complete: &Value, binding: &BoundFile, plan: &Plan) -> Result<()> {
+    ensure!(
+        complete["schema"] == "jetstreamer-epoch140-finalized-gap-metadata-collection-v1"
+            && complete["plan"]["path"].as_str() == binding.path.to_str()
+            && complete["plan"]["sha256"] == binding.sha256
+            && complete["census"]["path"].as_str() == plan.census.path.to_str()
+            && complete["census"]["sha256"] == CENSUS_SHA
+            && complete["unit"] == plan.unit
+            && complete["invocation_id"]
+                .as_str()
+                .is_some_and(|v| v.len() == 32
+                    && v.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+            && complete["first_slot"] == FIRST
+            && complete["last_slot"] == LAST
+            && complete["verified_targets"] == TARGETS
+            && complete["finalized_parent_and_hash_metadata_complete"] == true,
+        "wrong complete collector scope/owner/bindings"
+    );
+    for key in [
+        "hidden_poh_hashes_recovered",
+        "source_obscuration_proven",
+        "canonical_root_qualified",
+        "replay_launch_authorized",
+        "publication_authorized",
+        "r2_mutations",
+    ] {
+        ensure!(
+            complete[key] == false,
+            "collector authority mismatch: {key}"
+        );
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
     let check = args.len() == 6 && args[5] == "--check-only";
@@ -773,6 +883,78 @@ mod tests {
     }
 
     #[test]
+    fn completion_consumer_requires_all_scope_owner_and_authority_bindings() {
+        let p = plan();
+        let binding = BoundFile {
+            path: "/sealed/plan.json".into(),
+            sha256: "a".repeat(64),
+        };
+        let good = json!({"schema":"jetstreamer-epoch140-finalized-gap-metadata-collection-v1",
+            "plan":binding,"census":p.census,"unit":p.unit,"invocation_id":"a".repeat(32),
+            "first_slot":FIRST,"last_slot":LAST,"verified_targets":TARGETS,
+            "finalized_parent_and_hash_metadata_complete":true,"hidden_poh_hashes_recovered":false,
+            "source_obscuration_proven":false,"canonical_root_qualified":false,
+            "replay_launch_authorized":false,"publication_authorized":false,"r2_mutations":false});
+        validate_completion_header(&good, &binding, &p).unwrap();
+        for key in good.as_object().unwrap().keys() {
+            let mut changed = good.clone();
+            changed[key] = Value::Null;
+            assert!(
+                validate_completion_header(&changed, &binding, &p).is_err(),
+                "accepted absent {key}"
+            );
+        }
+        for (pointer, value) in [
+            ("/plan/sha256", json!("b".repeat(64))),
+            ("/plan/path", json!("/different/plan.json")),
+            ("/census/sha256", json!("b".repeat(64))),
+            ("/census/path", json!("/different/census.json")),
+            ("/verified_targets", json!(TARGETS - 1)),
+            ("/publication_authorized", json!(true)),
+            ("/invocation_id", json!("A".repeat(32))),
+        ] {
+            let mut changed = good.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                validate_completion_header(&changed, &binding, &p).is_err(),
+                "accepted {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_consumer_rejects_dropped_reordered_and_substituted_checkpoints() {
+        let verified = BTreeMap::from([
+            (
+                104,
+                BoundFile {
+                    path: "/private/targets/target-104.json".into(),
+                    sha256: "a".repeat(64),
+                },
+            ),
+            (
+                108,
+                BoundFile {
+                    path: "/private/targets/target-108.json".into(),
+                    sha256: "b".repeat(64),
+                },
+            ),
+        ]);
+        let good: Vec<_> = verified.values().map(|v| json!(v)).collect();
+        validate_declared_targets(&good, &verified).unwrap();
+        let mut swapped = good.clone();
+        swapped.swap(0, 1);
+        assert!(validate_declared_targets(&swapped, &verified).is_err());
+        assert!(validate_declared_targets(&good[..1], &verified).is_err());
+        let mut duplicate = good.clone();
+        duplicate[1] = duplicate[0].clone();
+        assert!(validate_declared_targets(&duplicate, &verified).is_err());
+        let mut changed = good;
+        changed[0]["sha256"] = json!("c".repeat(64));
+        assert!(validate_declared_targets(&changed, &verified).is_err());
+    }
+
+    #[test]
     fn canonical_request_partial_rpc_errors_and_exact_parent_are_required() {
         let targets = BTreeMap::from([(104, 101), (108, 105)]);
         let req = request(&[104, 108]);
@@ -837,8 +1019,10 @@ mod tests {
     }
 
     fn fixture(mode: &str) -> Child {
+        let namespace = module_path!().split_once("::").unwrap().1;
+        let fixture = format!("{namespace}::transport_fixture");
         Command::new(env::current_exe().unwrap())
-            .args(["--exact", "tests::transport_fixture", "--nocapture"])
+            .args(["--exact", &fixture, "--nocapture"])
             .env("JETSTREAMER_METADATA_TEST_FIXTURE", mode)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

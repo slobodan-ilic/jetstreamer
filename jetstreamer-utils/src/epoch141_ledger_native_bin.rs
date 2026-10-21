@@ -1,6 +1,9 @@
 //! Private exact-target native candidates, never trusted boundaries/publication.
 #[allow(dead_code)]
 mod epoch141_ledger_common;
+#[allow(dead_code)]
+#[path = "epoch140_gap_metadata_fetch_bin.rs"]
+mod finalized;
 
 use {
     anyhow::{Context, Result, ensure},
@@ -11,13 +14,17 @@ use {
     },
     jetstreamer_utils::{
         horizon_ledger_bzip::BoundBzipCollection,
-        horizon_ledger_native::{NativeQuery, NativeResolution, resolve_native_candidates},
+        horizon_ledger_native::{
+            NativeQuery, NativeReadBudget, NativeResolution, resolve_native_candidates,
+            with_native_read_session,
+        },
         horizon_legacy_recovery::{
             LegacySlotScope, ResolvedLegacyRecord, plan_v1_4_25_scope_queries,
         },
     },
     serde::Deserialize,
     serde_json::{Value, json},
+    sha2::{Digest, Sha256},
     std::{
         collections::BTreeMap,
         env,
@@ -32,6 +39,9 @@ use {
 const AUDIT_SHA: &str = "0dd1f9d3148752ca7cc91fcda66e5c7838558318b5749b7a252022536b16c986";
 const OUTPUT_RESERVATION: u64 = 256 * 1024 * 1024;
 const MAX_OUTPUT: usize = 224 * 1024 * 1024;
+const FULL_CENSUS_SHA: &str = "11a6049bc9378b4e3e063e765ce2b908b621f5d7845a49d372aca509d6d37a9f";
+const FULL_OUTPUT_RESERVATION: u64 = 32 * 1024 * 1024 * 1024;
+const FULL_OUTPUT_LIMIT: u64 = 24 * 1024 * 1024 * 1024;
 const PAIRS: [(u64, u64); 11] = [
     (60911771, 60911776),
     (60911791, 60911796),
@@ -71,6 +81,47 @@ struct Plan {
     output_receipt: PathBuf,
     minimum_free_bytes: u64,
     maximum_runtime_seconds: u64,
+    finalized_collection_plan: Option<Bound>,
+    finalized_collection_receipt: Option<Bound>,
+    unit: Option<String>,
+}
+
+fn profile(plan: &Plan) -> Result<bool> {
+    match plan.schema.as_str() {
+        "jetstreamer-epoch141-ledger-native-plan-v1" => {
+            ensure!(
+                plan.gap_audit.sha256 == AUDIT_SHA
+                    && plan.finalized_collection_plan.is_none()
+                    && plan.finalized_collection_receipt.is_none()
+                    && plan.unit.is_none(),
+                "legacy profile cannot acquire a broader scope"
+            );
+            Ok(false)
+        }
+        "jetstreamer-epoch141-ledger-native-full-census-plan-v2" => {
+            ensure!(
+                plan.gap_audit.sha256 == FULL_CENSUS_SHA
+                    && plan.finalized_collection_plan.is_some()
+                    && plan.finalized_collection_receipt.is_some()
+                    && plan.unit.as_deref().is_some_and(|s| s
+                        .starts_with("horizon-epoch141-native-full-census-")
+                        && s.ends_with(".service")
+                        && s.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))),
+                "full native profile requires explicit fixed census,completed metadata and exact unit"
+            );
+            Ok(true)
+        }
+        _ => anyhow::bail!("unknown native profile"),
+    }
+}
+
+fn output_reservation(plan: &Plan) -> Result<u64> {
+    Ok(if profile(plan)? {
+        FULL_OUTPUT_RESERVATION
+    } else {
+        OUTPUT_RESERVATION
+    })
 }
 
 fn now() -> Result<u64> {
@@ -186,7 +237,7 @@ fn targets(audit: &Value) -> Result<Vec<LegacySlotScope>> {
 fn admission(plan: &Plan, receipt: &Value, manifest: &Value, exe: &Path, sha: &str) -> Result<()> {
     let required = plan
         .minimum_free_bytes
-        .checked_add(OUTPUT_RESERVATION)
+        .checked_add(output_reservation(plan)?)
         .context("peak overflow")?;
     ensure!(
         receipt["schema"] == "jetstreamer-historical-performance-admission-receipt-v1"
@@ -238,11 +289,9 @@ fn private_directory(path: &Path) -> Result<fs::Metadata> {
     Ok(m)
 }
 fn paths(plan: &Plan) -> Result<()> {
+    profile(plan)?;
     ensure!(
-        plan.schema == "jetstreamer-epoch141-ledger-native-plan-v1"
-            && plan.minimum_free_bytes > 0
-            && (60..=43200).contains(&plan.maximum_runtime_seconds)
-            && plan.gap_audit.sha256 == AUDIT_SHA,
+        plan.minimum_free_bytes > 0 && (60..=43200).contains(&plan.maximum_runtime_seconds),
         "wrong native plan/bounds/audit"
     );
     let database = private_directory(&plan.database_directory)?;
@@ -348,6 +397,208 @@ fn bounded_write(path: &Path, value: &Value) -> Result<usize> {
     Ok(bytes)
 }
 
+fn run_full_census(
+    plan: &Plan,
+    bound: &BoundBzipCollection,
+    scopes: &[LegacySlotScope],
+    invocation: &str,
+    values: &BTreeMap<String, String>,
+    start: Instant,
+    free: u64,
+) -> Result<()> {
+    ensure!(scopes.len() == 18_283, "full native census incomplete");
+    ensure!(
+        free >= plan
+            .minimum_free_bytes
+            .checked_add(FULL_OUTPUT_RESERVATION)
+            .context("full initial reserve overflow")?,
+        "full native output reservation unavailable"
+    );
+    let output_parent = plan.output_receipt.parent().context("result parent")?;
+    let batches = output_parent.join("target-candidates");
+    fs::DirBuilder::new().mode(0o700).create(&batches)?;
+    File::open(output_parent)?.sync_all()?;
+    bounded_write(
+        &plan.metadata_receipt,
+        &json!({
+            "schema":"jetstreamer-epoch141-native-full-census-intent-v2",
+            "invocation_id":invocation,"plan_sha256":values["--plan-sha256"],
+            "census_sha256":FULL_CENSUS_SHA,"target_count":scopes.len(),
+            "output_reservation_bytes":FULL_OUTPUT_RESERVATION,
+            "output_limit_bytes":FULL_OUTPUT_LIMIT,"native_session_complete":false,
+            "publication_authorized":false,"replay_launch_authorized":false,"r2_mutations":false
+        }),
+    )?;
+    let logs = plan.log_directory.join("full-census");
+    fs::DirBuilder::new().mode(0o700).create(&logs)?;
+    File::open(&plan.log_directory)?.sync_all()?;
+    let mut last = Instant::now();
+    let mut callback = || {
+        if last.elapsed().as_secs() >= 1 {
+            guard(plan, start)?;
+            last = Instant::now();
+        }
+        Ok(())
+    };
+    let mut written = 1u64 << 20; // includes initial/intent/final-manifest overhead
+    let (receipts, session) = with_native_read_session(
+        &plan.database_directory,
+        &bound.collection,
+        &logs,
+        &plan.expected_families,
+        NativeReadBudget {
+            batches: 36_566,
+            queries: 16_777_216,
+            value_bytes: 8 * 1024 * 1024 * 1024,
+        },
+        &mut callback,
+        |reader, guard_callback| {
+            let mut receipts = Vec::with_capacity(scopes.len());
+            for (index, scope) in scopes.iter().enumerate() {
+                let first = reader.read_candidates(
+                    &[NativeQuery {
+                        family: "meta".into(),
+                        key: scope.slot.to_be_bytes().to_vec(),
+                    }],
+                    guard_callback,
+                )?;
+                let records: Vec<_> = first
+                    .iter()
+                    .map(|r| ResolvedLegacyRecord {
+                        family: &r.family,
+                        key: &r.key,
+                        value: r.value.as_deref(),
+                    })
+                    .collect();
+                let queries: Vec<_> = plan_v1_4_25_scope_queries(&records, &[*scope])
+                    .map_err(anyhow::Error::msg)?
+                    .into_iter()
+                    .map(|q| NativeQuery {
+                        family: q.family.into(),
+                        key: q.key,
+                    })
+                    .collect();
+                let complete = reader.read_candidates(&queries, guard_callback)?;
+                ensure!(
+                    complete.iter().all(|c| c.value.is_some())
+                        && complete.first().is_some_and(|c| c.family == first[0].family
+                            && c.key == first[0].key
+                            && c.value == first[0].value),
+                    "missing native target values or metadata changed"
+                );
+                let path = batches.join(format!("slot-{}.json", scope.slot));
+                let value = json!({
+                    "schema":"jetstreamer-epoch141-native-provisional-target-v2",
+                    "invocation_id":invocation,"plan_sha256":values["--plan-sha256"],
+                    "census_sha256":FULL_CENSUS_SHA,"slot":scope.slot,"parent_slot":scope.parent_slot,
+                    "metadata_unchanged":true,"all_records_present":true,
+                    "records":complete.iter().map(|r| json!({"family":r.family,
+                        "key_base64":STANDARD.encode(&r.key),"value_base64":r.value.as_ref().map(|v|STANDARD.encode(v))})).collect::<Vec<_>>(),
+                    "native_session_complete":false,"complete_census_revalidated_after_close":false,
+                    "source_completeness_proven":false,"live_state_proven":false,
+                    "hidden_poh_hashes_recovered":false,"publication_authorized":false,
+                    "replay_launch_authorized":false,"r2_mutations":false
+                });
+                let bytes = serde_json::to_vec_pretty(&value)?.len() as u64 + 1;
+                written = written.checked_add(bytes).context("full output overflow")?;
+                ensure!(
+                    written <= FULL_OUTPUT_LIMIT
+                        && guard(plan, start)?
+                            >= plan
+                                .minimum_free_bytes
+                                .checked_add(bytes)
+                                .context("write reserve overflow")?,
+                    "full native output budget/reserve unavailable"
+                );
+                bounded_write(&path, &value)?;
+                let content = fs::read(&path)?;
+                let sha = format!("{:x}", Sha256::digest(&content));
+                bound_file(&path, &sha, MAX_OUTPUT as u64, false)?;
+                receipts.push(json!({"path":path,"sha256":sha,"slot":scope.slot}));
+                if index == 0 || (index + 1).is_multiple_of(100) {
+                    eprintln!(
+                        "full-native-census verified_targets={} total={}",
+                        index + 1,
+                        scopes.len()
+                    );
+                }
+            }
+            Ok(receipts)
+        },
+    )?;
+    ensure!(
+        session.batches == 36_566 && receipts.len() == 18_283,
+        "incomplete full native session"
+    );
+    // Final completion is separate from all provisional batches. Rehash every
+    // durable output only after the native database closed and input revalidation
+    // succeeded, then bind all exact inputs again before the final commit.
+    for receipt in &receipts {
+        guard(plan, start)?;
+        bound_file(
+            Path::new(receipt["path"].as_str().context("target path")?),
+            receipt["sha256"].as_str().context("target hash")?,
+            MAX_OUTPUT as u64,
+            false,
+        )?;
+    }
+    for evidence in [
+        &plan.source_verification,
+        &plan.collection_receipt,
+        &plan.complete_census,
+        &plan.gap_audit,
+        plan.finalized_collection_plan
+            .as_ref()
+            .context("collector plan")?,
+        plan.finalized_collection_receipt
+            .as_ref()
+            .context("collector receipt")?,
+    ] {
+        bound_file(&evidence.path, &evidence.sha256, 32 * 1024 * 1024, false)?;
+    }
+    bound_file(
+        Path::new(&values["--plan"]),
+        &values["--plan-sha256"],
+        65536,
+        true,
+    )?;
+    let output = json!({
+        "schema":"jetstreamer-epoch141-native-full-census-candidates-v2",
+        "epoch":141,"first_slot":60911751u64,"last_slot":61328765u64,
+        "recorded_unix_seconds":now()?,"invocation_id":invocation,
+        "plan_sha256":values["--plan-sha256"],"self_sha256":values["--self-sha256"],
+        "source_verification_sha256":plan.source_verification.sha256,
+        "collection_sha256":plan.collection_receipt.sha256,"complete_census_sha256":plan.complete_census.sha256,
+        "gap_census_sha256":FULL_CENSUS_SHA,
+        "finalized_collection_plan_sha256":plan.finalized_collection_plan.as_ref().unwrap().sha256,
+        "finalized_collection_receipt_sha256":plan.finalized_collection_receipt.as_ref().unwrap().sha256,
+        "admission_sha256":values["--admission-sha256"],"target_count":receipts.len(),
+        "target_receipts":receipts,"native_session":session,"native_session_complete":true,
+        "output_bytes_before_final":written,"available_bytes_before":free,
+        "minimum_free_bytes":plan.minimum_free_bytes,"elapsed_seconds":start.elapsed().as_secs(),
+        "source_completeness_proven":false,"live_state_proven":false,"runtime_clock_authenticated":false,
+        "hidden_poh_hashes_recovered":false,"runtime_promotion_authorized":false,
+        "replay_launch_authorized":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false
+    });
+    let final_bytes = serde_json::to_vec_pretty(&output)?.len() as u64 + 1;
+    ensure!(
+        written
+            .checked_add(final_bytes)
+            .is_some_and(|n| n <= FULL_OUTPUT_LIMIT)
+            && guard(plan, start)?
+                >= plan
+                    .minimum_free_bytes
+                    .checked_add(final_bytes)
+                    .context("final reserve overflow")?,
+        "final full-native receipt exceeds output/reserve budget"
+    );
+    bounded_write(&plan.output_receipt, &output)?;
+    println!(
+        "full native candidate census durable; no hidden-PoH/root/replay/publication authority"
+    );
+    Ok(())
+}
+
 fn run() -> Result<()> {
     ensure!(
         unsafe { libc::geteuid() } == 0,
@@ -407,7 +658,31 @@ fn run() -> Result<()> {
         "collection compressed inode differs from verified source"
     );
     let audit = read_json(&plan.gap_audit, 4 * 1024 * 1024, false)?;
-    let scopes = targets(&audit)?;
+    let full = profile(&plan)?;
+    let scopes = if full {
+        let collector_plan = plan
+            .finalized_collection_plan
+            .as_ref()
+            .context("collector plan")?;
+        let completion = plan
+            .finalized_collection_receipt
+            .as_ref()
+            .context("collector completion")?;
+        finalized::validate_complete_collection(
+            &collector_plan.path,
+            &collector_plan.sha256,
+            &completion.path,
+            &completion.sha256,
+        )?
+        .iter()
+        .map(|m| LegacySlotScope {
+            slot: m.slot,
+            parent_slot: m.parent_slot,
+        })
+        .collect()
+    } else {
+        targets(&audit)?
+    };
     let manifest = read_json(&plan.admission_manifest, 4 * 1024 * 1024, true)?;
     ensure!(
         fs::symlink_metadata(&plan.admission_manifest.path)?.mode() & 0o077 == 0,
@@ -428,6 +703,30 @@ fn run() -> Result<()> {
     ensure!(age <= 300, "native admission older than300seconds");
     let start = Instant::now();
     let free = guard(&plan, start)?;
+    if full {
+        ensure!(
+            free >= plan
+                .minimum_free_bytes
+                .checked_add(FULL_OUTPUT_RESERVATION)
+                .context("full reserve overflow")?,
+            "full native output reservation unavailable"
+        );
+    }
+    if full {
+        let unit = plan.unit.as_deref().context("native unit")?;
+        let check_unit;
+        let unit = if values.contains_key("--check-only") {
+            check_unit = format!(
+                "{}-check.service",
+                unit.strip_suffix(".service")
+                    .context("native unit suffix")?
+            );
+            check_unit.as_str()
+        } else {
+            unit
+        };
+        finalized::authenticate(unit)?;
+    }
     if values.contains_key("--check-only") {
         println!("native local bindings passed; no native open, output or mutation");
         return Ok(());
@@ -445,6 +744,9 @@ fn run() -> Result<()> {
         "available_bytes":free,"minimum_free_bytes":plan.minimum_free_bytes,"trip":false,
         "publication_authorized":false,"remote_mutations":false,"r2_mutations":false}),
     )?;
+    if full {
+        return run_full_census(&plan, &bound, &scopes, &invocation, &values, start, free);
+    }
     let mut last = Instant::now();
     let mut callback = || {
         if last.elapsed().as_secs() >= 1 {
@@ -691,6 +993,76 @@ mod tests {
                 .to_string()
                 .contains("runtime")
         );
+    }
+
+    fn full_plan() -> Plan {
+        let mut p = plan();
+        p.schema = "jetstreamer-epoch141-ledger-native-full-census-plan-v2".into();
+        p.gap_audit.sha256 = FULL_CENSUS_SHA.into();
+        p.finalized_collection_plan = Some(Bound {
+            path: "/sealed/collector-plan.json".into(),
+            sha256: "a".repeat(64),
+        });
+        p.finalized_collection_receipt = Some(Bound {
+            path: "/private/complete.json".into(),
+            sha256: "b".repeat(64),
+        });
+        p.unit = Some("horizon-epoch141-native-full-census-test.service".into());
+        p
+    }
+
+    #[test]
+    fn full_native_profile_is_explicit_and_cannot_relabel_the_old_audit() {
+        assert!(!profile(&plan()).unwrap());
+        assert!(profile(&full_plan()).unwrap());
+        assert_eq!(output_reservation(&plan()).unwrap(), OUTPUT_RESERVATION);
+        assert_eq!(
+            output_reservation(&full_plan()).unwrap(),
+            FULL_OUTPUT_RESERVATION
+        );
+        for change in 0..7 {
+            let mut p = full_plan();
+            match change {
+                0 => p.schema = "jetstreamer-epoch141-ledger-native-plan-v1".into(),
+                1 => p.gap_audit.sha256 = AUDIT_SHA.into(),
+                2 => p.finalized_collection_plan = None,
+                3 => p.finalized_collection_receipt = None,
+                4 => p.unit = None,
+                5 => p.unit = Some("other.service".into()),
+                _ => p.unit = Some("horizon-epoch141-native-full-census-/escape.service".into()),
+            }
+            assert!(
+                profile(&p).is_err(),
+                "accepted profile substitution {change}"
+            );
+        }
+        assert!(
+            targets(&json!({"schema":"jetstreamer-horizon-finalized-paged-gap-census-v1"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn full_native_admission_cannot_reuse_the_small_legacy_output_allowance() {
+        let p = full_plan();
+        let exe = Path::new("/sealed/native");
+        let sha = "5".repeat(64);
+        let files = json!([{"path":exe,"sha256":sha,"uid":0,"mode":"0555"}]);
+        for (reservation, accepted) in
+            [(OUTPUT_RESERVATION, false), (FULL_OUTPUT_RESERVATION, true)]
+        {
+            let required = p.minimum_free_bytes + reservation;
+            let manifest = json!({"schema":"jetstreamer-historical-performance-admission-v1",
+                "filesystem":"/home/sol","minimum_free_bytes":required,"files":files});
+            let receipt = json!({"schema":"jetstreamer-historical-performance-admission-receipt-v1",
+                "admitted":true,"manifest":p.admission_manifest.path,"manifest_sha256":p.admission_manifest.sha256,
+                "services_started":false,"services_installed":false,"remote_mutations":false,"r2_mutations":false,
+                "evidence":{"minimum_free_bytes":required,"filesystem":"/home/sol","files":files}});
+            assert_eq!(
+                admission(&p, &receipt, &manifest, exe, &sha).is_ok(),
+                accepted
+            );
+        }
     }
     #[test]
     #[ignore = "root-only disposable private receipt qualification, not actual-source native sandbox"]

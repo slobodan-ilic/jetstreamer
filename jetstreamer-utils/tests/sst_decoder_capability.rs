@@ -362,6 +362,130 @@ fn native_readonly_resolves_manifest_and_wal() {
         result.candidates[3].value.as_deref(),
         Some(b"wal-only-value".as_slice())
     );
+    // Stream bounded batches through one native open. Old SST values and WAL
+    // tombstones must resolve exactly as in the one-shot API, including repeated
+    // cross-batch keys used by a two-stage metadata/shred consumer.
+    use jetstreamer_utils::horizon_ledger_native::{NativeReadBudget, with_native_read_session};
+    let batch_logs = |name: &str| {
+        let logs = root.path().join(name);
+        fs::create_dir(&logs).unwrap();
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
+        logs
+    };
+    let budget = NativeReadBudget {
+        batches: 3,
+        queries: 8,
+        value_bytes: 1024,
+    };
+    let (values, summary) = with_native_read_session(
+        &collected,
+        &census,
+        &batch_logs("session-logs"),
+        &families,
+        budget,
+        &mut || Ok(()),
+        |reader, guard| {
+            let mut values = reader.read_candidates(&queries[..2], guard)?;
+            values.extend(reader.read_candidates(&queries[2..], guard)?);
+            let repeated = reader.read_candidates(&queries[2..], guard)?;
+            assert_eq!(repeated[0].value, values[2].value);
+            Ok(values)
+        },
+    )
+    .unwrap();
+    assert_eq!(summary.batches, 3);
+    assert_eq!(summary.queries, 6);
+    assert_eq!(
+        summary.value_bytes,
+        2 * (b"new-wal-value".len() + b"wal-only-value".len()) as u64
+    );
+    assert!(summary.complete_census_revalidated);
+    assert!(
+        !summary.source_completeness_proven
+            && !summary.live_state_proven
+            && !summary.publication_authorized
+    );
+    for (actual, original) in values.iter().zip(&result.candidates) {
+        assert_eq!(actual.family, original.family);
+        assert_eq!(actual.key, original.key);
+        assert_eq!(actual.value, original.value);
+    }
+    let mutated = with_native_read_session(
+        &collected,
+        &census,
+        &batch_logs("session-mutated-after-read"),
+        &families,
+        budget,
+        &mut || Ok(()),
+        |reader, guard| {
+            reader.read_candidates(&queries, guard)?;
+            fs::write(collected.join("unexpected-after-read"), b"new member")?;
+            Ok(())
+        },
+    );
+    assert!(
+        mutated.is_err(),
+        "post-read input change produced final success"
+    );
+    fs::remove_file(collected.join("unexpected-after-read")).unwrap();
+    for case in 0..8 {
+        let mut limited = budget;
+        match case {
+            0 => limited.batches = 1,
+            1 => limited.queries = 3,
+            2 => limited.value_bytes = 1,
+            _ => (),
+        }
+        let rejected = with_native_read_session(
+            &collected,
+            &census,
+            &batch_logs(&format!("session-rejected-{case}")),
+            &families,
+            limited,
+            &mut || Ok(()),
+            |reader, guard| {
+                match case {
+                    0..=2 => {
+                        reader.read_candidates(&queries, guard)?;
+                        reader.read_candidates(&queries, guard)?;
+                    }
+                    3 => {
+                        // Suppressing an invalid batch cannot produce a final
+                        // success or allow a subsequent successful read.
+                        assert!(reader.read_candidates(&[], guard).is_err());
+                        assert!(reader.read_candidates(&queries, guard).is_err());
+                    }
+                    4 => { /* empty session must fail */ }
+                    5 => {
+                        reader.read_candidates(&queries, guard)?;
+                        anyhow::bail!("consumer failed after provisional output");
+                    }
+                    6 => {
+                        assert!(
+                            reader
+                                .read_candidates(&queries, &mut || anyhow::bail!("guard trip"))
+                                .is_err()
+                        );
+                    }
+                    _ => {
+                        let duplicate = [
+                            jetstreamer_utils::horizon_ledger_native::NativeQuery {
+                                family: "data_shred".into(),
+                                key: key(2),
+                            },
+                            jetstreamer_utils::horizon_ledger_native::NativeQuery {
+                                family: "data_shred".into(),
+                                key: key(2),
+                            },
+                        ];
+                        assert!(reader.read_candidates(&duplicate, guard).is_err());
+                    }
+                }
+                Ok(())
+            },
+        );
+        assert!(rejected.is_err(), "accepted invalid session {case}");
+    }
     // Bind the complete two-stage logical query set through all eleven
     // synthetic chains, with full census rehashing around each native read.
     use jetstreamer_utils::horizon_ledger_native::{
@@ -417,6 +541,86 @@ fn native_readonly_resolves_manifest_and_wal() {
             .iter()
             .all(|c| !c.source_completeness_proven && !c.publication_authorized)
     );
+    // The full-census driver uses two bounded reads per target, not one giant
+    // query/value allocation. Exercise that exact topology through entry/PoH
+    // decoding too; final results exist only after session revalidation.
+    let (batched_chains, accounting) = with_native_read_session(
+        &collected,
+        &census,
+        &batch_logs("per-target-session"),
+        &families,
+        NativeReadBudget {
+            batches: 22,
+            queries: 100,
+            value_bytes: 1024 * 1024,
+        },
+        &mut || Ok(()),
+        |reader, guard| {
+            let mut recovered = Vec::new();
+            for scope in &scopes {
+                let first = reader.read_candidates(
+                    &[NativeQuery {
+                        family: "meta".into(),
+                        key: scope.slot.to_be_bytes().to_vec(),
+                    }],
+                    guard,
+                )?;
+                let first_records: Vec<_> = first
+                    .iter()
+                    .map(|r| ResolvedLegacyRecord {
+                        family: &r.family,
+                        key: &r.key,
+                        value: r.value.as_deref(),
+                    })
+                    .collect();
+                let queries: Vec<_> =
+                    plan_v1_4_25_shred_queries(&first_records, std::slice::from_ref(scope))
+                        .map_err(anyhow::Error::msg)?
+                        .into_iter()
+                        .map(|q| NativeQuery {
+                            family: q.family.into(),
+                            key: q.key,
+                        })
+                        .collect();
+                let complete = reader.read_candidates(&queries, guard)?;
+                let complete_records: Vec<_> = complete
+                    .iter()
+                    .map(|r| ResolvedLegacyRecord {
+                        family: &r.family,
+                        key: &r.key,
+                        value: r.value.as_deref(),
+                    })
+                    .collect();
+                recovered.extend(
+                    recover_v1_4_25_records(
+                        &first_records,
+                        &complete_records,
+                        std::slice::from_ref(scope),
+                        18,
+                        || guard().map_err(|e| e.to_string()),
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                );
+            }
+            Ok(recovered)
+        },
+    )
+    .unwrap();
+    assert_eq!(accounting.batches, 22);
+    assert_eq!(accounting.queries, 33);
+    assert_eq!(batched_chains.len(), chains.len());
+    for (batched, original) in batched_chains.iter().zip(&chains) {
+        assert_eq!(batched.boundaries, original.boundaries);
+        assert_eq!(batched.executed_hashes, original.executed_hashes);
+        assert_eq!(
+            batched.source_completeness_proven,
+            original.source_completeness_proven
+        );
+        assert_eq!(
+            batched.publication_authorized,
+            original.publication_authorized
+        );
+    }
     let rejected_logs = root.path().join("rejected-resolution-logs");
     fs::create_dir(&rejected_logs).unwrap();
     fs::set_permissions(&rejected_logs, fs::Permissions::from_mode(0o700)).unwrap();

@@ -57,6 +57,132 @@ pub struct NativeResolution {
     pub publication_authorized: bool,
 }
 
+/// Explicit aggregate envelope for one read-only native session.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeReadBudget {
+    /// Maximum nonempty batches, at most 65,536.
+    pub batches: usize,
+    /// Maximum aggregate exact lookups, at most 16,777,216.
+    pub queries: usize,
+    /// Maximum aggregate returned value bytes, at most 32 GiB.
+    pub value_bytes: u64,
+}
+
+/// A bounded reader; no native mutation handle is exposed.
+///
+/// Values read through this handle remain provisional until its enclosing
+/// `with_native_read_session` returns successfully after closing and rehashing
+/// the complete database. Durable batch outputs must say diagnostic/provisional;
+/// only a subsequent final receipt may bind the completed session summary.
+pub struct NativeReadSession {
+    database: DB,
+    families: BTreeSet<String>,
+    budget: NativeReadBudget,
+    batches: usize,
+    queries: usize,
+    value_bytes: u64,
+    poisoned: bool,
+}
+
+/// Completed read-only session accounting, never source/publication authority.
+#[derive(Debug, Serialize)]
+pub struct NativeReadSummary {
+    /// Exact full family census used by every batch.
+    pub families: Vec<String>,
+    /// Number of retained live SST references checked at native open.
+    pub live_sst_references: usize,
+    /// Number of nonempty batches completed.
+    pub batches: usize,
+    /// Total exact lookups completed, including deliberate metadata rechecks.
+    pub queries: usize,
+    /// Total returned value bytes across all batches.
+    pub value_bytes: u64,
+    /// Entire immutable file census rehashed before and after native close.
+    pub complete_census_revalidated: bool,
+    /// Always false: backup completeness is independently owed.
+    pub source_completeness_proven: bool,
+    /// Always false: original historical liveness is independently owed.
+    pub live_state_proven: bool,
+    /// Always false: no PoH, canonical root, or publication gate is performed.
+    pub publication_authorized: bool,
+}
+
+impl NativeReadSession {
+    /// Read one independently bounded exact-key batch in caller order.
+    ///
+    /// Every batch retains the legacy 65,536-query/64-MiB/1-MiB-per-value
+    /// ceilings. Aggregate budgets additionally cap the entire session. Repeated
+    /// keys across batches are permitted for explicit metadata rechecks; duplicate
+    /// keys within a batch remain forbidden. Any error invalidates the session.
+    pub fn read_candidates(
+        &mut self,
+        queries: &[NativeQuery],
+        guard: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<NativeCandidate>> {
+        ensure!(!self.poisoned, "previous native batch failed");
+        self.poisoned = true;
+        ensure!(
+            !queries.is_empty() && queries.len() <= 65_536,
+            "native query bound exceeded"
+        );
+        self.batches = self.batches.checked_add(1).context("batch overflow")?;
+        self.queries = self
+            .queries
+            .checked_add(queries.len())
+            .context("query overflow")?;
+        ensure!(
+            self.batches <= self.budget.batches && self.queries <= self.budget.queries,
+            "aggregate native query/batch budget exceeded"
+        );
+        let mut keys = BTreeSet::new();
+        for query in queries {
+            ensure!(
+                self.families.contains(&query.family)
+                    && !query.key.is_empty()
+                    && query.key.len() <= 512
+                    && keys.insert((query.family.clone(), query.key.clone())),
+                "unsafe/duplicate native query"
+            );
+        }
+        let mut candidates = Vec::with_capacity(queries.len());
+        let mut read_options = ReadOptions::default();
+        read_options.set_verify_checksums(true);
+        let mut returned_bytes = 0u64;
+        for query in queries {
+            guard()?;
+            let cf = self
+                .database
+                .cf_handle(&query.family)
+                .context("opened family absent")?;
+            let pinned = self
+                .database
+                .get_pinned_cf_opt(cf, &query.key, &read_options)?;
+            if let Some(value) = &pinned {
+                returned_bytes = returned_bytes
+                    .checked_add(value.len() as u64)
+                    .context("native result overflow")?;
+                self.value_bytes = self
+                    .value_bytes
+                    .checked_add(value.len() as u64)
+                    .context("aggregate native result overflow")?;
+                ensure!(
+                    value.len() <= 1024 * 1024
+                        && returned_bytes <= 64 * 1024 * 1024
+                        && self.value_bytes <= self.budget.value_bytes,
+                    "native result byte bound exceeded"
+                );
+            }
+            candidates.push(NativeCandidate {
+                family: query.family.clone(),
+                key: query.key.clone(),
+                value: pinned.map(|value| value.to_vec()),
+            });
+        }
+        self.poisoned = false;
+        Ok(candidates)
+    }
+}
+
 fn plain_basename(name: &str) -> bool {
     let path = Path::new(name);
     !name.is_empty()
@@ -241,9 +367,53 @@ pub fn resolve_native_candidates(
     queries: &[NativeQuery],
     mut guard: impl FnMut() -> Result<()>,
 ) -> Result<NativeResolution> {
+    let (candidates, summary) = with_native_read_session(
+        path,
+        census,
+        log_path,
+        expected_families,
+        NativeReadBudget {
+            batches: 1,
+            queries: 65_536,
+            value_bytes: 64 * 1024 * 1024,
+        },
+        &mut guard,
+        |reader, guard| reader.read_candidates(queries, guard),
+    )?;
+    Ok(NativeResolution {
+        families: summary.families,
+        candidates,
+        live_sst_references: summary.live_sst_references,
+        complete_census_revalidated: summary.complete_census_revalidated,
+        source_completeness_proven: false,
+        live_state_proven: false,
+        publication_authorized: false,
+    })
+}
+
+/// Execute bounded batches inside one immutable, read-only native database open.
+///
+/// Rehashes every retained file before open and after close, enforces exact full
+/// column-family and live-SST membership, and returns no successful final summary
+/// if the callback, guard, or revalidation fails. Callback outputs may be streamed
+/// to private provisional no-clobber records; those records must never claim the
+/// session completed before this function returns. Persistent callers still owe
+/// fresh admission, output budgets, service identity and hard resource ceilings.
+#[allow(clippy::too_many_arguments)]
+pub fn with_native_read_session<T, G: FnMut() -> Result<()>>(
+    path: &Path,
+    census: &DiagnosticCollection,
+    log_path: &Path,
+    expected_families: &[String],
+    budget: NativeReadBudget,
+    guard: &mut G,
+    consume: impl FnOnce(&mut NativeReadSession, &mut G) -> Result<T>,
+) -> Result<(T, NativeReadSummary)> {
     ensure!(
-        !queries.is_empty() && queries.len() <= 65_536,
-        "native query bound exceeded"
+        (1..=65_536).contains(&budget.batches)
+            && (1..=16_777_216).contains(&budget.queries)
+            && (1..=32 * 1024 * 1024 * 1024).contains(&budget.value_bytes),
+        "invalid aggregate native read budget"
     );
     let expected: BTreeSet<_> = expected_families.iter().cloned().collect();
     ensure!(
@@ -253,17 +423,7 @@ pub fn resolve_native_candidates(
             && expected.iter().all(|f| plain_basename(f)),
         "invalid/duplicate native family allowlist"
     );
-    let mut keys = BTreeSet::new();
-    for query in queries {
-        ensure!(
-            expected.contains(&query.family)
-                && !query.key.is_empty()
-                && query.key.len() <= 512
-                && keys.insert((query.family.clone(), query.key.clone())),
-            "unsafe/duplicate native query"
-        );
-    }
-    let before_files = verify_census(path, census, &mut guard)?;
+    let before_files = verify_census(path, census, guard)?;
     private_directory(log_path)?;
     ensure!(
         !log_path.starts_with(path)
@@ -299,32 +459,28 @@ pub fn resolve_native_candidates(
             "native live file reference absent from exact retained census"
         );
     }
-    let mut candidates = Vec::with_capacity(queries.len());
-    let mut read_options = ReadOptions::default();
-    read_options.set_verify_checksums(true);
-    let mut returned_bytes = 0usize;
-    for query in queries {
-        guard()?;
-        let cf = database
-            .cf_handle(&query.family)
-            .context("opened family absent")?;
-        let pinned = database.get_pinned_cf_opt(cf, &query.key, &read_options)?;
-        if let Some(value) = &pinned {
-            returned_bytes = returned_bytes
-                .checked_add(value.len())
-                .context("native result overflow")?;
-            ensure!(
-                value.len() <= 1024 * 1024 && returned_bytes <= 64 * 1024 * 1024,
-                "native result byte bound exceeded"
-            );
-        }
-        let value = pinned.map(|value| value.to_vec());
-        candidates.push(NativeCandidate {
-            family: query.family.clone(),
-            key: query.key.clone(),
-            value,
-        });
-    }
+    let mut session = NativeReadSession {
+        database,
+        families: expected.clone(),
+        budget,
+        batches: 0,
+        queries: 0,
+        value_bytes: 0,
+        poisoned: false,
+    };
+    let result = consume(&mut session, guard)?;
+    ensure!(
+        !session.poisoned,
+        "callback suppressed a native batch failure"
+    );
+    let NativeReadSession {
+        database,
+        batches,
+        queries,
+        value_bytes,
+        ..
+    } = session;
+    ensure!(batches > 0, "native session performed no reads");
     drop(database);
     guard()?;
     let after_directory = fs::symlink_metadata(path)?;
@@ -343,18 +499,23 @@ pub fn resolve_native_candidates(
         "database directory identity changed"
     );
     ensure!(
-        before_files == verify_census(path, census, &mut guard)?,
+        before_files == verify_census(path, census, guard)?,
         "retained file identities changed across native resolution"
     );
-    Ok(NativeResolution {
-        families: expected.into_iter().collect(),
-        candidates,
-        live_sst_references: live.len(),
-        complete_census_revalidated: true,
-        source_completeness_proven: false,
-        live_state_proven: false,
-        publication_authorized: false,
-    })
+    Ok((
+        result,
+        NativeReadSummary {
+            families: expected.into_iter().collect(),
+            batches,
+            queries,
+            value_bytes,
+            live_sst_references: live.len(),
+            complete_census_revalidated: true,
+            source_completeness_proven: false,
+            live_state_proven: false,
+            publication_authorized: false,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -419,6 +580,64 @@ mod tests {
         fs::write(&path, b"changed-wal").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
         assert!(verify_census(root.path(), &census, &mut || Ok(())).is_err());
+    }
+
+    #[test]
+    fn invalid_session_budgets_fail_before_any_guard_or_native_open() {
+        let (root, census) = fixture();
+        for budget in [
+            NativeReadBudget {
+                batches: 0,
+                queries: 1,
+                value_bytes: 1,
+            },
+            NativeReadBudget {
+                batches: 65_537,
+                queries: 1,
+                value_bytes: 1,
+            },
+            NativeReadBudget {
+                batches: 1,
+                queries: 0,
+                value_bytes: 1,
+            },
+            NativeReadBudget {
+                batches: 1,
+                queries: 16_777_217,
+                value_bytes: 1,
+            },
+            NativeReadBudget {
+                batches: 1,
+                queries: 1,
+                value_bytes: 0,
+            },
+            NativeReadBudget {
+                batches: 1,
+                queries: 1,
+                value_bytes: 32 * 1024 * 1024 * 1024 + 1,
+            },
+        ] {
+            let mut guard_calls = 0;
+            let result = with_native_read_session(
+                root.path(),
+                &census,
+                root.path(),
+                &["default".into()],
+                budget,
+                &mut || {
+                    guard_calls += 1;
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("aggregate native read budget")
+            );
+            assert_eq!(guard_calls, 0);
+        }
     }
 
     #[test]

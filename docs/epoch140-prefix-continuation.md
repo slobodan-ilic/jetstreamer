@@ -223,3 +223,63 @@ live-state completeness, a terminal root, prefix qualification or publication.
 The retained ledger reports data through slot 61,344,045, covering the planned
 61,328,765 root, but its bounds do not replace complete native MANIFEST/WAL/CF
 validation and exact entry-chain recovery for every target.
+
+## Complete-census native candidate acquisition (not yet operationally qualified)
+
+The native runner has a distinct
+`jetstreamer-epoch141-ledger-native-full-census-plan-v2` profile. The existing
+`jetstreamer-epoch141-ledger-native-plan-v1` remains exactly 11-target-bound;
+neither a wider census nor new collection fields can be passed as that profile.
+The new profile keeps every existing source, complete-retention, independent
+tar-census, column-family, admission, private-path and output binding. Its
+`gap_audit` must bind the fixed complete paged census SHA above. It additionally
+requires `finalized_collection_plan` and `finalized_collection_receipt`
+`{path,sha256}` bindings, plus an exact service `unit` in the
+`horizon-epoch141-native-full-census-*.service` namespace.
+
+The metadata consumer requires the actual collector `complete.json`, all
+18,283 ordered target bindings, and the fixed census/plan/owner/authority fields.
+It independently rehashes every target checkpoint and original finalized RPC
+request/response and repeats the exact parent/hash checks. A partial collection,
+mere checkpoint presence, changed digest, duplicate or reordered binding is not
+admissible. The native check unit is the exact production name with `-check`
+before `.service`; both modes authenticate their own MainPID/invocation and
+non-restarting service policy. Check-only still performs no native database open
+or receipt writes.
+
+The complete profile uses one read-only native database session, not 18,283
+full-database rehashes. It hashes the complete retained census before open and
+again after close, requires the complete native column-family allowlist and
+every live SST reference, and retains checksum-verified logical reads with WAL,
+version and tombstone resolution. For each target it reads complete SlotMeta,
+plans every contiguous data shred using the unchanged bounded v1.4.25 decoder,
+then reads all those shreds plus an identical SlotMeta recheck. Each batch retains
+the 65,536-query, 64-MiB-return and 1-MiB-per-value ceilings. The entire session
+allows at most 36,566 batches, 16,777,216 exact lookups and 8 GiB returned values;
+these are hard ceilings, not a claim that the retained source fits. Any suppressed
+batch failure poisons the session and prevents a successful final summary.
+
+Fresh admission must separately reserve 32 GiB above the existing protected
+filesystem floor. Actual combined private output is capped at 24 GiB, with the
+legacy 224-MiB per-record bound retained. Logs and results must be root-private
+on the campaign `/home/sol` filesystem, disjoint from retained inputs and the
+compressed source. Use the existing CLI, separately bound executable/plan and
+fresh admission hashes, persistent non-restarting systemd execution, hard
+memory/CPU/task/time ceilings and the required least-privilege traversal
+capabilities. Do not admit it merely because the old 256-MiB profile fit.
+
+Each `target-candidates/slot-N.json` is explicitly provisional, immutable
+no-clobber diagnostic output, not a completed session. The distinct final v2
+receipt appears only after all targets succeed, native close and complete input
+rehashing pass, every output is independently reread, and all top-level inputs
+are rebound. A failure preserves provisional outputs without a final completion
+claim. A new attempt needs fresh isolated logs/results and fresh admission; no
+automatic restart or in-place output replacement is supported.
+
+Even a complete candidate receipt does not decode/authenticate PoH clocks,
+recover hidden boundaries, prove original backup completeness or historical
+liveness, qualify a canonical root, or authorize replay, assembly, publication,
+sidecars or R2 mutation. Source tests are not actual-source sandbox qualification.
+Keep this profile dormant until the live metadata collection and ledger retention
+complete and a sealed exact-package check, fresh admission and independent
+operational qualification have passed.
