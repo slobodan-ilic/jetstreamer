@@ -120,6 +120,47 @@ or fleet capability attestations. This source correction neither deploys a
 monitor nor starts a benchmark; all independent capability, fresh-admission,
 owned-worker first-fire and publication gates above still apply.
 
+The owned RAM guard now writes `receipts/ram-guard-first-worker.json` once,
+only after a complete pre-target check observes the single hash-bound worker
+and its owned node in the exact cgroup/process group, passes the resource/VMA
+checks, and reauthenticates the supervisor. Startup grace (zero workers) and
+post-target drainage cannot emit this proof. It binds invocation, supervisor,
+node and worker PIDs, worker file identity/digest, RAM root identity, sample
+values and time. Creation is no-clobber with mode0400 and file/directory fsync;
+a write failure follows the ordinary guard stop-intent path. Later checks do
+not renew or replace the first proof. This remains metadata on persistent
+tmpfs: it is not a durable root-storage receipt, launch/admission evidence,
+full cold-epoch qualification, retention permission or publication authority.
+An independent collector must retain and bind actual live evidence before
+an unattended benchmark can be considered protected. Policy-test fixture
+files must never be used as operational first-fire attestations.
+
+`jetstreamer-epoch203-ram-launch-attest` is a dormant root collector, not a
+launcher. Invoke it only through an independently sealed plan/binary with
+`PLAN --plan-sha256 HEX --self-sha256 HEX`. The strict plan schema is
+`jetstreamer-private-epoch203-ram-launch-attest-plan-v1`; fields are `unit`,
+`invocation_id`, `run_root`, `worker_sha256`, `supervisor_binary`,
+`supervisor_plan`, `setpriv`, `first_worker`, and `output` (plus `schema`).
+Each file binding is `{ "path": "/absolute/path", "sha256": "..." }`.
+Precreate the exact root-owned mode0700 output directory
+`/var/lib/jetstreamer/horizon-203-ram-launch-ATTEMPT`; output is `launch.json`.
+The first-worker binding must name the exact RAM root's
+`receipts/ram-guard-first-worker.json`, not a copied test receipt.
+
+The collector independently checks the real running oneshot invocation and
+exact setpriv/supervisor/plan command, sealed executable hashes, persistent
+mount generation/geometry, fresh (at most120seconds old) positive guard proof,
+source and copied worker hashes/identities, live node/worker ownership and
+process groups, start ticks, cgroups and privilege drops. It rechecks the owner,
+processes, mount and proof before atomic no-clobber publication with file and
+directory fsync. It retains the full guard JSON in the root-durable launch
+receipt consumed by the explicit auxiliary fleet role. `launched:true` means
+the exact process was positively observed already running; the collector
+itself never starts it. This does not independently qualify observer/fleet
+capability, authorize a launch, prove a full cold peak, remove artifacts or
+grant publication authority. The source is not an operationally qualified
+deployment, and no real launch receipt exists merely because its tests pass.
+
 ## Persistent-storage capability probe
 
 `jetstreamer-epoch203-ram-storage-probe` now implements the storage/sandbox

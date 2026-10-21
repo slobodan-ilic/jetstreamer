@@ -395,7 +395,7 @@ fn directory(root: &Path) -> Result<u64> {
     Ok(m.dev())
 }
 
-fn validate_process_status(status: &str) -> Result<()> {
+pub(crate) fn validate_process_status(status: &str) -> Result<()> {
     for key in ["Uid:", "Gid:"] {
         let entries: Vec<_> = status.lines().filter_map(|l| l.strip_prefix(key)).collect();
         ensure!(

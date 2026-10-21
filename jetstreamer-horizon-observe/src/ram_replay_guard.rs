@@ -340,6 +340,7 @@ pub struct OwnedRamGuard {
     next: Instant,
     worker: Option<Worker>,
     stop_pin: Option<(String, Instant)>,
+    first_worker_proof_written: bool,
 }
 
 impl OwnedRamGuard {
@@ -381,6 +382,7 @@ impl OwnedRamGuard {
             next: Instant::now(),
             worker: None,
             stop_pin: None,
+            first_worker_proof_written: false,
         };
         g.authenticate()?;
         check_sample(g.sample()?, true)?;
@@ -518,6 +520,10 @@ impl OwnedRamGuard {
             found = Some(vma_count(&proc.join("maps"))?);
         }
         ensure!(pids.contains(&me), "guard absent from cgroup");
+        ensure!(
+            draining || found.is_none() || pids.contains(&child),
+            "owned node absent during positive pre-target worker sample"
+        );
         match found {
             Some(vmas) => Ok(vmas),
             None if draining
@@ -533,7 +539,10 @@ impl OwnedRamGuard {
 
     fn write_metadata(&self, name: &str, value: &Value) -> Result<()> {
         ensure!(
-            matches!(name, "ram-guard-start.json" | "ram-guard-stop.json"),
+            matches!(
+                name,
+                "ram-guard-start.json" | "ram-guard-stop.json" | "ram-guard-first-worker.json"
+            ),
             "invalid guard metadata name"
         );
         let parent = self.binding.run_root.join("receipts");
@@ -548,6 +557,70 @@ impl OwnedRamGuard {
         f.write_all(b"\n")?;
         f.sync_all()?;
         File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    // Called only after the complete owned-cgroup/resource/VMA checks pass.
+    // Grace and drainage checks never prove the first live worker fire. This
+    // fsync is tmpfs retention, not durable root-storage or launch authority.
+    fn record_first_worker_sample(
+        &mut self,
+        child: u32,
+        elapsed: Duration,
+        draining: bool,
+        vmas: u64,
+        sample: Sample,
+    ) -> Result<()> {
+        if self.first_worker_proof_written || draining || vmas == 0 {
+            return Ok(());
+        }
+        check_sample(sample, false)?;
+        ensure!(vmas <= VMA_MAX, "first worker exceeds VMA ceiling");
+        let worker = self
+            .worker
+            .as_ref()
+            .context("positive sample lacks owned worker")?;
+        ensure!(
+            child > 1
+                && child != std::process::id()
+                && worker.pid > 1
+                && worker.pid != child
+                && worker.pid != std::process::id()
+                && worker
+                    .path
+                    .starts_with(self.binding.run_root.join("scratch"))
+                && worker
+                    .path
+                    .file_name()
+                    .is_some_and(|s| s == "historical-worker"),
+            "first worker identity is not the owned private worker"
+        );
+        let millis: u64 = elapsed
+            .as_millis()
+            .try_into()
+            .context("guard elapsed overflow")?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let proof = json!({
+            "schema":"jetstreamer-private-epoch203-ram-guard-first-worker-v1",
+            "unit":self.binding.unit,"invocation_id":self.binding.invocation_id,
+            "supervisor_pid":std::process::id(),"child_pid":child,
+            "worker_pid":worker.pid,"worker_executable":worker.path,
+            "worker_sha256":self.binding.worker_sha256,"worker_file_identity":worker.identity,
+            "node":self.binding.node,"run_root":self.binding.run_root,
+            "root_device":self.dev,"root_inode":self.root_inode,
+            "written_unix_seconds":now,"elapsed_millis":millis,
+            "worker_vmas":vmas,"host_available_bytes":sample.host_available,
+            "tmpfs_available_bytes":sample.ram_available,"memory_current_bytes":sample.memory_current,
+            "memory_limit_events":sample.memory_limit_events,"archive_physical_bytes":sample.archive_physical,
+            "owned_process_census_verified":true,"pre_target_worker_observed":true,
+            "grace_only":false,"draining":false,"guard_trip":false,
+            "durable_root_copy_verified":false,"replay_launch_authorized":false,
+            "full_cold_epoch_peak_qualified":false,"retirement_authorized":false,
+            "runtime_promotion_authorized":false,"publication_authorized":false,
+            "remote_mutations":false,"r2_mutations":false
+        });
+        self.write_metadata("ram-guard-first-worker.json", &proof)?;
+        self.first_worker_proof_written = true;
         Ok(())
     }
 
@@ -618,6 +691,7 @@ impl OwnedRamGuard {
             }
             let vmas = self.worker_census(child, elapsed, draining)?;
             self.authenticate()?;
+            self.record_first_worker_sample(child, elapsed, draining, vmas, s)?;
             Ok(
                 json!({"host_available_bytes":s.host_available,"tmpfs_available_bytes":s.ram_available,
                 "memory_current_bytes":s.memory_current,"archive_physical_bytes":s.archive_physical,"worker_vmas":vmas}),
@@ -657,6 +731,153 @@ fn validate_target_stop(v: &Value, inv: &str, child: u32, now: u64) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Filesystem policy fixture only: no process is executed and none of these
+    // temporary bytes is an operational guard/capability attestation.
+    fn proof_fixture(root: &Path) -> OwnedRamGuard {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["scratch", "receipts"] {
+            let path = root.join(name);
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = root.join("scratch/historical-worker");
+        fs::write(&path, b"not an executable; policy fixture only").unwrap();
+        let identity = stat_identity(&fs::metadata(&path).unwrap());
+        OwnedRamGuard {
+            binding: Binding {
+                unit: "horizon-203-ram-resource-baseline-fixture.service".into(),
+                invocation_id: "a".repeat(32),
+                run_root: root.into(),
+                node: "/sealed/node".into(),
+                worker_sha256: "b".repeat(64),
+            },
+            dev: fs::metadata(root).unwrap().dev(),
+            root_inode: fs::metadata(root).unwrap().ino(),
+            started: Instant::now(),
+            next: Instant::now(),
+            stop_pin: None,
+            first_worker_proof_written: false,
+            worker: Some(Worker {
+                pid: 125,
+                path,
+                identity,
+            }),
+        }
+    }
+
+    #[test]
+    fn first_worker_proof_excludes_grace_and_drain_and_requires_bounded_owned_identity() {
+        let t = tempfile::tempdir().unwrap();
+        let mut guard = proof_fixture(t.path());
+        guard
+            .record_first_worker_sample(123, Duration::from_secs(1), false, 0, sample())
+            .unwrap();
+        guard
+            .record_first_worker_sample(123, Duration::from_secs(1), true, 10, sample())
+            .unwrap();
+        assert!(!guard.first_worker_proof_written);
+        assert!(
+            !t.path()
+                .join("receipts/ram-guard-first-worker.json")
+                .exists()
+        );
+        let mut bad = sample();
+        bad.memory_limit_events = 1;
+        assert!(
+            guard
+                .record_first_worker_sample(123, Duration::from_secs(1), false, 10, bad)
+                .is_err()
+        );
+        assert!(
+            guard
+                .record_first_worker_sample(
+                    123,
+                    Duration::from_secs(1),
+                    false,
+                    VMA_MAX + 1,
+                    sample()
+                )
+                .is_err()
+        );
+        guard.worker.as_mut().unwrap().pid = 123;
+        assert!(
+            guard
+                .record_first_worker_sample(123, Duration::from_secs(1), false, 10, sample())
+                .is_err()
+        );
+        guard.worker = None;
+        assert!(
+            guard
+                .record_first_worker_sample(123, Duration::from_secs(1), false, 10, sample())
+                .is_err()
+        );
+        assert!(!guard.first_worker_proof_written);
+        assert!(
+            !t.path()
+                .join("receipts/ram-guard-first-worker.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn first_worker_proof_is_private_no_clobber_and_does_not_renew_or_grant_authority() {
+        let t = tempfile::tempdir().unwrap();
+        let mut guard = proof_fixture(t.path());
+        let result = guard.record_first_worker_sample(
+            123,
+            Duration::from_millis(12345),
+            false,
+            10,
+            sample(),
+        );
+        if unsafe { libc::geteuid() } != 1000 || unsafe { libc::getegid() } != 1000 {
+            assert!(result.is_err());
+            assert!(!guard.first_worker_proof_written);
+            return;
+        }
+        result.unwrap();
+        assert!(guard.first_worker_proof_written);
+        let path = t.path().join("receipts/ram-guard-first-worker.json");
+        let bytes = fs::read(&path).unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["invocation_id"], "a".repeat(32));
+        assert_eq!(v["child_pid"], 123);
+        assert_eq!(v["worker_pid"], 125);
+        assert_eq!(v["elapsed_millis"], 12345);
+        assert_eq!(v["worker_vmas"], 10);
+        for key in [
+            "grace_only",
+            "draining",
+            "guard_trip",
+            "durable_root_copy_verified",
+            "replay_launch_authorized",
+            "full_cold_epoch_peak_qualified",
+            "retirement_authorized",
+            "runtime_promotion_authorized",
+            "publication_authorized",
+            "remote_mutations",
+            "r2_mutations",
+        ] {
+            assert_eq!(v[key], false, "{key}");
+        }
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o400);
+        guard
+            .record_first_worker_sample(123, Duration::from_secs(60), false, 20, sample())
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        // Even an interrupted/recreated guard must not overwrite earlier bytes.
+        guard.first_worker_proof_written = false;
+        assert!(
+            guard
+                .record_first_worker_sample(123, Duration::from_secs(61), false, 30, sample())
+                .is_err()
+        );
+        assert!(!guard.first_worker_proof_written);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
     fn sample() -> Sample {
         Sample {
             host_available: START_MEMORY,
@@ -779,6 +1000,7 @@ mod tests {
             next: Instant::now(),
             worker: None,
             stop_pin: None,
+            first_worker_proof_written: false,
         };
         let capture = json!({"scratch":{"physical_bytes":4096},"accounts_state":{"regular_files":1},"cgroup":{}});
         let cp = receipts.join("target-capture.json");
@@ -844,6 +1066,7 @@ mod tests {
             next: Instant::now(),
             worker: None,
             stop_pin: None,
+            first_worker_proof_written: false,
         };
         if unsafe { libc::geteuid() } != 1000 || unsafe { libc::getegid() } != 1000 {
             assert!(guard.intent(123, "fixture").is_err());
