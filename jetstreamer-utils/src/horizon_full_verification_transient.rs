@@ -154,7 +154,7 @@ fn validate_state(
         return Err("not the exact zero-restart transient invocation in the required state".into());
     }
     let effective = field(fields, "ExecStart")?;
-    let expected = format!("argv[]={}; ignore_errors=no ;", exact_command_line(plan));
+    let expected = format!("argv[]={} ; ignore_errors=no ;", exact_command_line(plan));
     if effective.matches("argv[]=").count() != 1 || !effective.contains(&expected) {
         return Err("effective systemd argv differs from the bound verifier command".into());
     }
@@ -443,7 +443,7 @@ mod tests {
             "ExecMainStatus=0\nExecMainCode=1\nNRestarts=0\nInvocationID={}\n",
             "FragmentPath=/run/systemd/transient/{}\nMainPID=0\nExecMainPID=42\n",
             "ExecMainExitTimestampMonotonic=500\nType=oneshot\nRemainAfterExit=yes\nRestart=no\nDropInPaths=\n",
-            "ExecStart={{ path={} ; argv[]={}; ignore_errors=no ; start_time=x ; stop_time=y ; pid=42 ; code=exited ; status=0 }}\n"
+            "ExecStart={{ path={} ; argv[]={} ; ignore_errors=no ; start_time=x ; stop_time=y ; pid=42 ; code=exited ; status=0 }}\n"
         ), INVOCATION, UNIT, VERIFIER, exact_command_line(plan)).as_bytes()).unwrap()
     }
 
