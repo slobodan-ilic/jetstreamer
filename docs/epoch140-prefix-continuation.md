@@ -133,3 +133,32 @@ larger compatible verification cohort. The retained 11-target gap audit covers
 only 60,911,751..60,912,005; a wider execution interval needs its own complete
 gap census and exact-state recovery. Never extrapolate that bounded evidence
 to an entire later epoch or use the earlier cut root to erase a required gate.
+
+## Post-cut root and complete gap census
+
+The retained root preflight at
+`/usr/local/lib/jetstreamer/deploy-epochs136-147-target4-20261011-v2/preflight-136-147-target4-v4.json`
+(whole-file SHA-256
+`ec62e2ce730a28033e5626e7afdb59c2b6e73a2ce188ae1040a77a7a09e396c3`)
+names the first post-cut root at slot **61,328,765**, with accounts hash
+`8LfMXtdKmPEvMcBzEz2XZ56HZ8pUPGSaWGA6mYG4dAFY` and snapshot generation
+`1634786682225857`. This is 417,014 replay slots after the restart cut, not
+248 slots. It lies within the v1.4.25 candidate envelope but is not a qualified
+continuation endpoint merely because a retained planning report lists it.
+Fresh cloud identity and exact-worker capability remain independent gates.
+
+Before recovery, census the entire 60,911,751..61,328,765 inclusive interval.
+The Rust `jetstreamer-horizon-gap-audit` offers a first-stage `--census-only`
+mode for that purpose. It binds immutable finalized `getBlocks` request and
+response bytes through a separately sealed plan, validates every integer and
+the exact endpoints, and writes a private no-clobber `gap-census.json`.
+Use the distinct `jetstreamer-horizon-finalized-gap-census-plan-v1` plan schema
+with no `rpc_batches`; the original full-audit schema cannot select this mode.
+
+Its `jetstreamer-horizon-finalized-gap-census-v1` receipt contains gap
+**candidates** and expected boundary counts, not independent target-parent
+checks or hidden PoH hashes. It explicitly denies full-audit completion,
+replay, runtime promotion and publication. Obtain finalized metadata for all
+listed post-gap blocks, bind their exact parents and visible hashes, then
+complete the ordinary audit/recovery path. A small earlier 11-target receipt
+must not be broadened or relabeled to cover this wider interval.

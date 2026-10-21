@@ -300,11 +300,71 @@ fn write_receipt(path: &Path, receipt: &Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_mode(plan: &Plan, census_only: bool) -> Result<()> {
+    if census_only {
+        ensure!(
+            plan.schema == "jetstreamer-horizon-finalized-gap-census-plan-v1"
+                && plan.rpc_batches.is_empty()
+                && plan
+                    .output
+                    .file_name()
+                    .is_some_and(|name| name == "gap-census.json"),
+            "census-only requires its distinct schema/output and no block metadata batches"
+        );
+    } else {
+        ensure!(
+            plan.schema == "jetstreamer-horizon-finalized-gap-audit-plan-v1",
+            "wrong audit plan schema"
+        );
+        ensure!(
+            !plan.rpc_batches.is_empty() && plan.rpc_batches.len() <= 64,
+            "invalid batch count"
+        );
+    }
+    Ok(())
+}
+
+// A large execution interval can have thousands of parent-gap candidates.
+// Preserve the complete list before requesting individual finalized blocks.
+// This first stage deliberately cannot produce the full audit's receipt shape.
+fn census_receipt(
+    binding: &BoundFile,
+    plan: &Plan,
+    present: &[u64],
+    pairs: &[(u64, u64)],
+) -> Result<Value> {
+    let skipped: u64 = pairs.iter().map(|(parent, slot)| slot - parent - 1).sum();
+    ensure!(
+        present.len() as u64 + skipped == plan.last_slot - plan.first_slot + 1,
+        "interval count mismatch"
+    );
+    Ok(json!({
+        "schema":"jetstreamer-horizon-finalized-gap-census-v1",
+        "plan":binding,"first_slot":plan.first_slot,"last_slot":plan.last_slot,
+        "block_list_request":plan.block_list_request,"block_list":plan.block_list,
+        "present_slots":present.len(),"skipped_slots":skipped,
+        "post_gap_targets":pairs.len(),
+        "expected_tick_boundaries":skipped + pairs.len() as u64,
+        "gap_candidates":pairs.iter().map(|(parent,slot)| json!({
+            "parent_slot":parent,"slot":slot,"skipped_slots":slot-parent-1,
+            "expected_tick_boundaries":slot-parent
+        })).collect::<Vec<_>>(),
+        "finalized_getblocks_only":true,"target_getblock_metadata_complete":false,
+        "independent_target_parent_checks_passed":false,"full_gap_audit_complete":false,
+        "source_obscuration_proven":false,"hidden_poh_hashes_recovered":false,
+        "bulk_download_authorized":false,"replay_launch_authorized":false,
+        "runtime_promotion_authorized":false,"publication_authorized":false,"r2_mutations":false
+    }))
+}
+
 fn run() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
+    let census_only = args.len() == 6 && args[5] == "--census-only";
     ensure!(
-        args.len() == 5 && args[1] == "--plan-sha256" && args[3] == "--self-sha256",
-        "usage: jetstreamer-horizon-gap-audit PLAN --plan-sha256 HEX --self-sha256 HEX"
+        (args.len() == 5 || census_only)
+            && args[1] == "--plan-sha256"
+            && args[3] == "--self-sha256",
+        "usage: jetstreamer-horizon-gap-audit PLAN --plan-sha256 HEX --self-sha256 HEX [--census-only]"
     );
     ensure!(
         valid_sha(&args[4]) && digest(&fs::read("/proc/self/exe")?) == args[4],
@@ -316,18 +376,22 @@ fn run() -> Result<()> {
         sha256: args[2].clone(),
     };
     let plan: Plan = serde_json::from_slice(&read_bound(&plan_binding)?)?;
-    ensure!(
-        plan.schema == "jetstreamer-horizon-finalized-gap-audit-plan-v1",
-        "wrong plan schema"
-    );
-    ensure!(
-        !plan.rpc_batches.is_empty() && plan.rpc_batches.len() <= 64,
-        "invalid batch count"
-    );
+    validate_mode(&plan, census_only)?;
     let blocks: Value = serde_json::from_slice(&read_bound(&plan.block_list)?)?;
     let block_request: Value = serde_json::from_slice(&read_bound(&plan.block_list_request)?)?;
     check_block_list_request(plan.first_slot, plan.last_slot, &block_request, &blocks)?;
     let (present, pairs) = target_pairs(plan.first_slot, plan.last_slot, &blocks)?;
+    if census_only {
+        write_receipt(
+            &plan.output,
+            &census_receipt(&plan_binding, &plan, &present, &pairs)?,
+        )?;
+        println!(
+            "{}",
+            json!({"output":plan.output,"post_gap_targets":pairs.len(),"full_gap_audit_complete":false})
+        );
+        return Ok(());
+    }
     let targets = pairs.iter().map(|p| p.1).collect();
     let mut successes = BTreeMap::new();
     let mut retained_rpc_errors = 0;
@@ -374,6 +438,100 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn census_plan() -> Plan {
+        let bound = || BoundFile {
+            path: PathBuf::from("/immutable/input.json"),
+            sha256: "a".repeat(64),
+        };
+        Plan {
+            schema: "jetstreamer-horizon-finalized-gap-census-plan-v1".into(),
+            first_slot: 100,
+            last_slot: 108,
+            block_list_request: bound(),
+            block_list: bound(),
+            rpc_batches: Vec::new(),
+            output: PathBuf::from("/private/gap-census.json"),
+        }
+    }
+
+    #[test]
+    fn census_never_substitutes_for_complete_metadata_audit() {
+        let binding = BoundFile {
+            path: PathBuf::from("/immutable/census-plan.json"),
+            sha256: "b".repeat(64),
+        };
+        let plan = census_plan();
+        validate_mode(&plan, true).unwrap();
+        assert!(validate_mode(&plan, false).is_err());
+        let (present, pairs) = target_pairs(
+            100,
+            108,
+            &json!({"jsonrpc":"2.0","result":[100,101,104,105,108]}),
+        )
+        .unwrap();
+        let receipt = census_receipt(&binding, &plan, &present, &pairs).unwrap();
+        assert_eq!(
+            receipt["schema"],
+            "jetstreamer-horizon-finalized-gap-census-v1"
+        );
+        assert_eq!(receipt["present_slots"], 5);
+        assert_eq!(receipt["skipped_slots"], 4);
+        assert_eq!(receipt["post_gap_targets"], 2);
+        assert_eq!(receipt["expected_tick_boundaries"], 6);
+        assert_eq!(receipt["gap_candidates"][0]["parent_slot"], 101);
+        assert_eq!(receipt["gap_candidates"][1]["slot"], 108);
+        assert!(receipt.get("gaps").is_none());
+        assert!(receipt.get("rpc_batches").is_none());
+        for key in [
+            "target_getblock_metadata_complete",
+            "independent_target_parent_checks_passed",
+            "full_gap_audit_complete",
+            "hidden_poh_hashes_recovered",
+            "publication_authorized",
+            "replay_launch_authorized",
+            "runtime_promotion_authorized",
+            "r2_mutations",
+        ] {
+            assert_eq!(receipt[key], false, "{key}");
+        }
+        assert!(census_receipt(&binding, &plan, &present[..4], &pairs).is_err());
+    }
+
+    #[test]
+    fn census_requires_explicit_distinct_schema_output_and_empty_metadata() {
+        let mut plan = census_plan();
+        plan.output = PathBuf::from("/private/gap-audit.json");
+        assert!(validate_mode(&plan, true).is_err());
+        plan.output = PathBuf::from("/private/gap-census.json");
+        plan.schema = "jetstreamer-horizon-finalized-gap-audit-plan-v1".into();
+        assert!(validate_mode(&plan, true).is_err());
+        assert!(validate_mode(&plan, false).is_err());
+        plan.rpc_batches.push(Batch {
+            request: BoundFile {
+                path: "/request".into(),
+                sha256: "a".repeat(64),
+            },
+            response: BoundFile {
+                path: "/response".into(),
+                sha256: "b".repeat(64),
+            },
+        });
+        validate_mode(&plan, false).unwrap();
+        plan.schema = "jetstreamer-horizon-finalized-gap-census-plan-v1".into();
+        assert!(validate_mode(&plan, true).is_err());
+    }
+
+    #[test]
+    fn census_supports_complete_wide_interval_without_invented_gap_hashes() {
+        let blocks: Vec<_> = (100..=432_100).filter(|slot| slot % 10 != 9).collect();
+        let (present, pairs) =
+            target_pairs(100, 432_100, &json!({"jsonrpc":"2.0","result":blocks})).unwrap();
+        assert_eq!(present.len() + pairs.len(), 432_001);
+        assert_eq!(pairs.len(), 43_200);
+        assert!(pairs.iter().all(|(parent, slot)| slot - parent == 2));
+    }
+
     fn request(slot: u64) -> Value {
         json!([{"jsonrpc":"2.0","id":slot,"method":"getBlock","params":[slot,{"commitment":"finalized","transactionDetails":"none","rewards":false,"maxSupportedTransactionVersion":0}]}])
     }
