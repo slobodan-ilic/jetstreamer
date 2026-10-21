@@ -1,5 +1,10 @@
 # Dormant epoch-203 shrink-budget comparison
 
+For the separately scoped, not-yet-deployed RAM-backed experiment preparation,
+see [epoch203-ram-resource-design.md](epoch203-ram-resource-design.md). Its offline
+geometry checker does not make this disk-backed runner admissible or authorize
+a replay launch.
+
 The opt-in `epoch203-shrink-budget-resource` feature builds
 `jetstreamer-epoch203-bounded-resource` with the reviewed bounded runner and
 the v1.6.16 shrink-budget candidate worker `4aeca563…`. It pins parent
