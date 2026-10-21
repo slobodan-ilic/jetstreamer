@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, process::Command as ProcessCommand};
 
 const SCHEMA: &str = "jetstreamer-horizon-campaign-fleet-v1";
 const PRIVATE_225_READER: &str = "/var/lib/jetstreamer/horizon-qualification225-reader-b261913-v1/jetstreamer-qualification-verify";
+mod ram_auxiliary;
 
 #[derive(Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -351,6 +352,8 @@ struct Plan {
     #[serde(default)]
     diagnostics: Vec<DiagnosticClaim>,
     #[serde(default)]
+    epoch203_ram_auxiliary: Option<ram_auxiliary::Claim>,
+    #[serde(default)]
     pipeline_claims: Vec<PipelineClaim>,
     // One event-driven bounded admission may update the active list using the
     // same observer. This is not authority for another resource observation.
@@ -366,6 +369,13 @@ fn validate_same_sample_admission(
     guard_plan: &Value,
     now: u64,
 ) -> Result<()> {
+    ensure!(
+        plan.epoch203_ram_auxiliary.is_none()
+            && previous
+                .get("auxiliary_diagnostics")
+                .is_none_or(|r| r.as_array().is_some_and(Vec::is_empty)),
+        "ordinary admission transition cannot drop or add a RAM auxiliary owner"
+    );
     ensure!(
         previous["schema"] == SCHEMA
             && previous["first_epoch"] == plan.first_epoch
@@ -1610,6 +1620,20 @@ pub(super) async fn run() -> Result<()> {
         }
         names.insert(claim.unit.clone());
     }
+    let auxiliary_launch = if let Some(claim) = &plan.epoch203_ram_auxiliary {
+        ram_auxiliary::validate_scope(&plan, &observer, claim)?;
+        let launch = ram_auxiliary::checked_launch(claim)?;
+        names.insert(claim.unit.clone());
+        Some(launch)
+    } else {
+        ensure!(
+            observer
+                .get("epoch203_ram_auxiliary")
+                .is_none_or(|rows| rows.as_array().is_some_and(Vec::is_empty)),
+            "observer auxiliary owner omitted from fleet plan"
+        );
+        None
+    };
     let mut pipeline_units = BTreeMap::new();
     let mut pipeline_epoch_units = BTreeSet::new();
     if plan.admission_transition_guard.is_some() {
@@ -1652,6 +1676,7 @@ pub(super) async fn run() -> Result<()> {
         );
     }
     let before = census(&names, plan.first_epoch, plan.last_epoch)?;
+    ram_auxiliary::validate_census(plan.epoch203_ram_auxiliary.as_ref(), &before)?;
     let mut terminal_replays = Vec::new();
     for (epoch, gate) in &plan.gates {
         if let Some(stop) = &gate.reserve_stop {
@@ -1887,6 +1912,15 @@ pub(super) async fn run() -> Result<()> {
         entries.push(json!({"epoch":epoch,"state":state,"next_action":next,"status":status,"gate_evidence":gate.evidence.iter().map(|e|json!({"path":e.path,"sha256":e.sha256})).collect::<Vec<_>>()}));
         remote_entries.push(remote);
     }
+    let mut auxiliary_diagnostics = Vec::new();
+    if let (Some(claim), Some(launch)) = (&plan.epoch203_ram_auxiliary, &auxiliary_launch) {
+        let entry =
+            ram_auxiliary::observe(claim, launch, &observer, &before[&claim.unit], &active)?;
+        if entry["live"] == true {
+            active.push(entry.clone());
+        }
+        auxiliary_diagnostics.push(entry);
+    }
     let after = census(&names, plan.first_epoch, plan.last_epoch)?;
     ensure!(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() - sample_seconds <= 1800,
@@ -1902,6 +1936,7 @@ pub(super) async fn run() -> Result<()> {
     let mut receipt = receipt;
     receipt["pipelines"] = json!(pipelines);
     receipt["terminal_replays"] = json!(terminal_replays);
+    receipt["auxiliary_diagnostics"] = json!(auxiliary_diagnostics);
     persist(&plan.output, &receipt)?;
     println!("{}", plan.output.display());
     Ok(())

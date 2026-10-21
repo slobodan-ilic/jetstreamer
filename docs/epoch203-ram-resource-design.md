@@ -410,3 +410,24 @@ auxiliary fleet/launch evidence and real observer/fleet/retention capability
 qualification are still required; neither source tests nor this documentation
 are an attestation. Keep deployed observer and R2 binaries unchanged until the
 full contract is qualified, and retain the single30-minute control cadence.
+
+The fleet plan now has its own optional `epoch203_ram_auxiliary` object with
+`unit`, `invocation_id`, `run_root` and hash-bound `launch_receipt`. Its separate
+`auxiliary_diagnostics` result array cannot replace the primary diagnostic,
+ordinary epoch state, production status binding or remote-ready evidence.
+Live ownership requires the matching separate observer role, stable before/after
+invocations, zero restarts, an exact sealed setpriv/supervisor/plan command and
+three distinct primary entry producers (legacy per-epoch duplicates do not
+consume extra lanes). A fourth primary or an omitted/unbound RAM supervisor
+fails closed. Ordinary/diagnostic overlap rules remain unchanged; delivery
+overlap, mutable-tree aliasing and same-sample admission tricks are rejected.
+
+The private launch schema is
+`jetstreamer-private-epoch203-ram-resource-launch-v1`. It binds the fixed profile,
+parent/worker/snapshot, target/root, persistent tmpfs and immutable supervisor,
+plan and setpriv files. It denies ordinary replay, full-cold peak qualification,
+runtime promotion, canonical sidecars, publication, retirement and all remote
+mutation. This is a policy implementation, not a real launch receipt: a reviewed
+launcher/collector and actual observer/fleet/retention capability evidence are
+still missing. Unit-test fixtures must never be published as those receipts.
+The fleet binary remains undeployed until those independent qualifications pass.
