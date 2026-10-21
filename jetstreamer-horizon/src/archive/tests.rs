@@ -1363,6 +1363,68 @@ fn read_all(bytes: &[u8], start_slot: u64, max_slots: u64, verify: bool) -> Vec<
     collector.slots
 }
 
+#[test]
+fn bounded_bucket_prefix_does_not_emit_the_tail_and_can_continue_in_place() {
+    let (source, expected, _) = write_archive(
+        1000,
+        6,
+        ArchiveWriterConfig {
+            bucket_slots: 4,
+            ..Default::default()
+        },
+    );
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(source)).unwrap();
+    let mut collector = Collector::default();
+    let mut called = false;
+    assert_eq!(
+        reader
+            .read_bucket_prefix_with_header(0, 2, &mut collector, |header, _| {
+                assert_eq!(header.first_slot, 1000);
+                called = true;
+                Ok(())
+            })
+            .unwrap(),
+        2
+    );
+    assert!(called);
+    assert_eq!(collector.slots, expected[..2]);
+    assert_eq!(reader.bucket_loads(), 1);
+    assert_eq!(reader.read_slots(1002, 2, &mut collector).unwrap(), 2);
+    assert_eq!(reader.bucket_loads(), 1);
+    assert_eq!(collector.slots, expected[..4]);
+    assert_eq!(reader.read_bucket(1, &mut collector).unwrap(), 2);
+    assert_eq!(collector.slots, expected);
+}
+
+#[test]
+fn zero_length_bucket_selection_checks_header_without_emitting_frames() {
+    let (source, expected, _) = write_archive(
+        1000,
+        2,
+        ArchiveWriterConfig {
+            bucket_slots: 4,
+            ..Default::default()
+        },
+    );
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(source)).unwrap();
+    let mut collector = Collector::default();
+    let mut called = false;
+    assert_eq!(
+        reader
+            .read_bucket_prefix_with_header(0, 0, &mut collector, |_, _| {
+                called = true;
+                Ok(())
+            })
+            .unwrap(),
+        0
+    );
+    assert!(called);
+    assert!(collector.slots.is_empty());
+    reader.read_slots(1000, 2, &mut collector).unwrap();
+    assert_eq!(reader.bucket_loads(), 1);
+    assert_eq!(collector.slots, expected);
+}
+
 fn archive_semantic_sha256(bytes: &[u8]) -> [u8; 32] {
     let mut reader = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
     let mut digest = SemanticDigest::new();

@@ -244,6 +244,26 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
         V: SlotVisitor,
         F: FnOnce(&BucketHeader, &mut V) -> Result<(), ArchiveFormatError>,
     {
+        self.read_bucket_prefix_with_header(index, u64::MAX, visitor, before_slots)
+    }
+
+    /// Validates and loads an indexed bucket, then emits at most
+    /// `maximum_slots` frames from its beginning. The header callback runs
+    /// before any frame is emitted. The complete stored bucket is still
+    /// checksum-checked/decompressed, but frames beyond the explicit selection
+    /// are not decoded or delivered. This does not change the archive's range
+    /// or prove that a selected prefix is an ordinary complete archive.
+    pub fn read_bucket_prefix_with_header<V, F>(
+        &mut self,
+        index: usize,
+        maximum_slots: u64,
+        visitor: &mut V,
+        before_slots: F,
+    ) -> Result<u64, ArchiveFormatError>
+    where
+        V: SlotVisitor,
+        F: FnOnce(&BucketHeader, &mut V) -> Result<(), ArchiveFormatError>,
+    {
         if index >= self.index.len() {
             return Err(ArchiveFormatError::BucketOutOfRange {
                 index,
@@ -265,7 +285,7 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
         before_slots(bucket_header, visitor)?;
 
         let mut visited = 0u64;
-        while self.decoder.slots_remaining() > 0 {
+        while self.decoder.slots_remaining() > 0 && visited < maximum_slots {
             // Every valid slot is >= 0, so every decoded frame is emitted
             // while the bucket boundary remains hard.
             if self.decoder.decode_slot_frame(0, visitor)? {

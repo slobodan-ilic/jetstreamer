@@ -101,3 +101,35 @@ The small no-clobber result and its directory are individually fsynced.
 Failure preserves all previous evidence and has no automatic retry authority.
 Actual suffix-worker restart validation, selected-range assembly/provenance,
 normal full/plugin/root gates and canonical import remain outstanding.
+
+## Selected-range assembly primitive (not an operational approval)
+
+`merge_checkpoint_restart_with_retained_prefix` is a separate library entry
+point for one selected original prefix plus one independently restarted
+suffix. Its first `RuntimeSegmentSource::retained_prefix` binds the **whole**
+unchanged original container hash, the selected checkpoint blockhash and a
+`RetainedPrefixSelection` with original/selected slot counts and the independent
+digest of original selected wire events. Source header, V2 provenance and epoch
+metadata retain their original range. No prefix-only manifest is fabricated.
+
+The source container must cover the entire destination range. Only its proper
+prefix is decoded into the first generation; an explicit bounded bucket reader
+stops at the cut even inside a bucket. Epoch, pre, transaction and post writes
+are checked and normalized in their original event order. The original tail
+is excluded, but remains committed by the whole source digest. The source
+selection's event digest is checked before moving to the suffix. Independent
+raw/native cursors remain represented by the V4 handoff and normalization maps.
+
+Ordinary V3 and complete-source V4 assembly reject selected-prefix inputs.
+The new entry point requires two generations, a proper first-source selection,
+a complete second source, and an explicit V4 assembly profile ending in
+`/retained-prefix-selection-v1`. It writes no file or receipt itself and grants
+no canonical admission, replay, root, plugin, sidecar or publication authority.
+
+For epoch 140, 248 slots describe only the remaining **epoch-140 output** after
+the cut. That count is not permission to stop at the epoch end without the
+ordinary trusted-terminal-root obligation. The dedicated replay may need a
+larger compatible verification cohort. The retained 11-target gap audit covers
+only 60,911,751..60,912,005; a wider execution interval needs its own complete
+gap census and exact-state recovery. Never extrapolate that bounded evidence
+to an entire later epoch or use the earlier cut root to erase a required gate.

@@ -17,8 +17,8 @@ use super::{
     ARCHIVE_PROVENANCE_VERSION_V1, ArchiveFormatError, ArchiveProvenance, ArchiveProvenanceError,
     ArchiveProvenanceV2, ArchiveProvenanceV3, ArchiveProvenanceV4, ArchiveReader, ArchiveStats,
     ArchiveWriter, ArchiveWriterConfig, BlockNotification, BucketHeader, ChainMismatchPolicy,
-    Consumption, EntryRecord, EpochMeta, FORMAT_VERSION_V2, RuntimeSegmentProvenance, SlotKind,
-    SlotVisitor, WriteVersionNormalization,
+    Consumption, EntryRecord, EpochMeta, FORMAT_VERSION_V2, RuntimeSegmentProvenance,
+    SemanticDigest, SlotKind, SlotVisitor, WriteVersionNormalization,
 };
 
 /// Counters from one verified multi-segment assembly.
@@ -48,6 +48,21 @@ pub struct RuntimeSegmentSource<R> {
     reader: R,
     expected_sha256: [u8; 32],
     expected_terminal_last_blockhash: Hash,
+    retained_prefix: Option<RetainedPrefixSelection>,
+}
+
+/// Explicit selected extent of a larger, unchanged source container. This is
+/// not a shortened archive header or an ordinary segment manifest. The whole
+/// container digest remains independently bound by [`RuntimeSegmentSource`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedPrefixSelection {
+    /// Original complete container range, starting at the first segment slot.
+    pub original_slot_count: u64,
+    /// Proper prefix selected for the first V4 generation.
+    pub selected_slot_count: u64,
+    /// Independent semantic digest of selected ORIGINAL wire events, including
+    /// the original epoch-metadata range and unnormalized raw write versions.
+    pub semantic_sha256: [u8; 32],
 }
 
 impl<R> RuntimeSegmentSource<R> {
@@ -62,6 +77,25 @@ impl<R> RuntimeSegmentSource<R> {
             reader,
             expected_sha256,
             expected_terminal_last_blockhash,
+            retained_prefix: None,
+        }
+    }
+
+    /// Binds a selected prefix without copying or relabeling the larger source.
+    /// `selected_terminal_last_blockhash` is the selected checkpoint, NOT the
+    /// original container's final block. Only the separate retained-prefix V4
+    /// entry point accepts this source; ordinary V3/V4 assembly rejects it.
+    pub fn retained_prefix(
+        reader: R,
+        whole_source_sha256: [u8; 32],
+        selected_terminal_last_blockhash: Hash,
+        selection: RetainedPrefixSelection,
+    ) -> Self {
+        Self {
+            reader,
+            expected_sha256: whole_source_sha256,
+            expected_terminal_last_blockhash: selected_terminal_last_blockhash,
+            retained_prefix: Some(selection),
         }
     }
 }
@@ -69,6 +103,16 @@ impl<R> RuntimeSegmentSource<R> {
 /// Failure from [`merge_runtime_segments`].
 #[derive(Debug, thiserror::Error)]
 pub enum MultiSegmentMergeError {
+    #[error("source archive {index} has an invalid retained-prefix selection: {reason}")]
+    InvalidRetainedPrefixSelection { index: usize, reason: &'static str },
+    #[error(
+        "source archive {index} selected-prefix semantic digest differs (expected {expected:?}, actual {actual:?})"
+    )]
+    RetainedPrefixSemanticMismatch {
+        index: usize,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
     #[error("invalid destination V3 provenance: {0}")]
     InvalidDestinationProvenance(#[source] ArchiveProvenanceError),
     #[error("received {actual} source archives for {expected} runtime segments")]
@@ -248,6 +292,7 @@ where
         writer_config,
         provenance,
         ArchiveProvenance::V3(provenance.clone()),
+        false,
     )
 }
 
@@ -275,6 +320,42 @@ where
         writer_config,
         &provenance.base,
         ArchiveProvenance::V4(provenance.clone()),
+        false,
+    )
+}
+
+/// Assembles an explicitly selected prefix of a larger original V2 container
+/// followed by one independently restarted V2 suffix. The original container
+/// must cover the complete destination range, while only its proper prefix is
+/// copied. The full source hash, original header/provenance/epoch metadata,
+/// selected event digest, raw-write range and handoff checkpoint all remain
+/// separately checked. The output must carry an explicit V4 assembly profile
+/// ending in `/retained-prefix-selection-v1`.
+///
+/// This API does not authorize a restart, canonical root, final verification,
+/// import, sidecar, publication or retirement. Callers must bind a separately
+/// qualified selected-range receipt; an ordinary prefix-only manifest cannot
+/// describe the larger source container.
+pub fn merge_checkpoint_restart_with_retained_prefix<R, W>(
+    sources: Vec<RuntimeSegmentSource<R>>,
+    sink: W,
+    writer_config: ArchiveWriterConfig,
+    provenance: &ArchiveProvenanceV4,
+) -> Result<(W, MultiSegmentMergeStats), MultiSegmentMergeError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    provenance
+        .validate()
+        .map_err(MultiSegmentMergeError::InvalidDestinationProvenance)?;
+    merge_validated_segments(
+        sources,
+        sink,
+        writer_config,
+        &provenance.base,
+        ArchiveProvenance::V4(provenance.clone()),
+        true,
     )
 }
 
@@ -284,6 +365,7 @@ fn merge_validated_segments<R, W>(
     writer_config: ArchiveWriterConfig,
     provenance: &ArchiveProvenanceV3,
     destination: ArchiveProvenance,
+    allow_retained_prefix: bool,
 ) -> Result<(W, MultiSegmentMergeStats), MultiSegmentMergeError>
 where
     R: Read + Seek,
@@ -295,6 +377,7 @@ where
             actual: sources.len(),
         });
     }
+    validate_retained_prefix_policy(&sources, provenance, allow_retained_prefix)?;
 
     let requested_end = provenance
         .requested_slot_start
@@ -304,7 +387,8 @@ where
     let (first_index, first_source) = sources
         .next()
         .expect("validated provenance contains at least two runtime segments");
-    let (first_source, first_terminal_hash) = verify_source_digest(first_source, first_index)?;
+    let (first_source, first_terminal_hash, first_selection) =
+        verify_source_digest(first_source, first_index)?;
     validate_source_terminal_evidence(first_index, first_terminal_hash, provenance)?;
     let mut first_reader = prepare_source(
         first_source,
@@ -312,6 +396,7 @@ where
         &provenance.runtime_segments[first_index],
         provenance,
         None,
+        first_selection,
     )?;
     let epoch = first_reader.header().epoch;
     let mut writer = ArchiveWriter::new_with_provenance(
@@ -339,12 +424,13 @@ where
         provenance.requested_slot_start,
         provenance.requested_slot_count,
         &mut destination_epoch_written,
+        first_selection,
     )?;
     slots_merged += slots;
     account_updates_rebased += updates;
 
     for (index, source) in sources {
-        let (source, terminal_hash) = verify_source_digest(source, index)?;
+        let (source, terminal_hash, selection) = verify_source_digest(source, index)?;
         validate_source_terminal_evidence(index, terminal_hash, provenance)?;
         let mut reader = prepare_source(
             source,
@@ -352,6 +438,7 @@ where
             &provenance.runtime_segments[index],
             provenance,
             Some(epoch),
+            selection,
         )?;
         let (slots, updates) = merge_one_source(
             &mut reader,
@@ -364,6 +451,7 @@ where
             provenance.requested_slot_start,
             provenance.requested_slot_count,
             &mut destination_epoch_written,
+            selection,
         )?;
         slots_merged = slots_merged.checked_add(slots).ok_or(
             MultiSegmentMergeError::DecodedSlotCountMismatch {
@@ -401,10 +489,58 @@ where
     ))
 }
 
+fn validate_retained_prefix_policy<R>(
+    sources: &[RuntimeSegmentSource<R>],
+    p: &ArchiveProvenanceV3,
+    allow: bool,
+) -> Result<(), MultiSegmentMergeError> {
+    let bad =
+        |index, reason| MultiSegmentMergeError::InvalidRetainedPrefixSelection { index, reason };
+    if !allow {
+        for (index, source) in sources.iter().enumerate() {
+            if source.retained_prefix.is_some() {
+                return Err(bad(
+                    index,
+                    "ordinary assembly requires complete source archives",
+                ));
+            }
+        }
+        return Ok(());
+    }
+    if sources.len() != 2
+        || !p
+            .assembly_profile
+            .ends_with("/retained-prefix-selection-v1")
+    {
+        return Err(bad(
+            0,
+            "selected-prefix assembly requires two generations and its explicit V4 profile",
+        ));
+    }
+    let Some(selection) = sources[0].retained_prefix else {
+        return Err(bad(0, "missing first-source selection"));
+    };
+    if sources[1].retained_prefix.is_some() {
+        return Err(bad(1, "only the first generation may select a prefix"));
+    }
+    if selection.selected_slot_count == 0
+        || selection.selected_slot_count >= selection.original_slot_count
+        || selection.original_slot_count != p.requested_slot_count
+        || selection.selected_slot_count != p.runtime_segments[0].slot_count
+        || selection.semantic_sha256 == [0; 32]
+    {
+        return Err(bad(
+            0,
+            "selected extent or semantic evidence differs from the declared generations",
+        ));
+    }
+    Ok(())
+}
+
 fn verify_source_digest<R: Read + Seek>(
     mut source: RuntimeSegmentSource<R>,
     index: usize,
-) -> Result<(R, Hash), MultiSegmentMergeError> {
+) -> Result<(R, Hash, Option<RetainedPrefixSelection>), MultiSegmentMergeError> {
     source
         .reader
         .seek(SeekFrom::Start(0))
@@ -433,7 +569,11 @@ fn verify_source_digest<R: Read + Seek>(
         .reader
         .seek(SeekFrom::Start(0))
         .map_err(|error| MultiSegmentMergeError::SourceDigestIo { index, error })?;
-    Ok((source.reader, source.expected_terminal_last_blockhash))
+    Ok((
+        source.reader,
+        source.expected_terminal_last_blockhash,
+        source.retained_prefix,
+    ))
 }
 
 fn validate_source_terminal_evidence(
@@ -460,6 +600,7 @@ fn prepare_source<R: Read + Seek>(
     segment: &RuntimeSegmentProvenance,
     destination: &ArchiveProvenanceV3,
     expected_epoch: Option<u64>,
+    selection: Option<RetainedPrefixSelection>,
 ) -> Result<ArchiveReader<R>, MultiSegmentMergeError> {
     let mut reader = ArchiveReader::open(source)
         .map_err(|error| MultiSegmentMergeError::SourceArchive { index, error })?;
@@ -470,11 +611,12 @@ fn prepare_source<R: Read + Seek>(
             actual: header.format_version,
         });
     }
-    if header.slot_start != segment.slot_start || header.slot_count != segment.slot_count {
+    let expected_container_count = selection.map_or(segment.slot_count, |s| s.original_slot_count);
+    if header.slot_start != segment.slot_start || header.slot_count != expected_container_count {
         return Err(MultiSegmentMergeError::SourceRangeMismatch {
             index,
             expected_start: segment.slot_start,
-            expected_count: segment.slot_count,
+            expected_count: expected_container_count,
             actual_start: header.slot_start,
             actual_count: header.slot_count,
         });
@@ -603,6 +745,7 @@ fn merge_one_source<R, W>(
     destination_slot_start: u64,
     destination_slot_count: u64,
     destination_epoch_written: &mut bool,
+    selection: Option<RetainedPrefixSelection>,
 ) -> Result<(u64, u64), MultiSegmentMergeError>
 where
     R: Read + Seek,
@@ -618,10 +761,22 @@ where
         writer,
         chain,
     );
+    if let Some(selection) = selection {
+        visitor.source_slot_count = selection.original_slot_count;
+        visitor.prefix_semantic = Some((SemanticDigest::new(), selection.semantic_sha256));
+    }
     let mut slots = 0u64;
     for bucket in 0..reader.bucket_count() {
+        if selection.is_some() && slots == segment.slot_count {
+            break;
+        }
+        let maximum = if selection.is_some() {
+            segment.slot_count - slots
+        } else {
+            u64::MAX
+        };
         let visited = reader
-            .read_bucket_with_header(bucket, &mut visitor, |header, visitor| {
+            .read_bucket_prefix_with_header(bucket, maximum, &mut visitor, |header, visitor| {
                 visitor.on_bucket_header(header);
                 Ok(())
             })
@@ -674,6 +829,7 @@ struct MergeVisitor<'a, W: Write> {
     writer: &'a mut ArchiveWriter<W>,
     chain: &'a mut Option<Hash>,
     error: Option<MultiSegmentMergeError>,
+    prefix_semantic: Option<(SemanticDigest, [u8; 32])>,
 }
 
 impl<'a, W: Write> MergeVisitor<'a, W> {
@@ -708,6 +864,7 @@ impl<'a, W: Write> MergeVisitor<'a, W> {
             writer,
             chain,
             error: None,
+            prefix_semantic: None,
         }
     }
 
@@ -824,6 +981,21 @@ impl<'a, W: Write> MergeVisitor<'a, W> {
                 actual,
             });
         }
+        if let Some((digest, expected)) = self.prefix_semantic {
+            let actual = digest
+                .finish()
+                .map_err(|e| MultiSegmentMergeError::SourceArchive {
+                    index: self.source_index,
+                    error: e.into(),
+                })?;
+            if actual != expected {
+                return Err(MultiSegmentMergeError::RetainedPrefixSemanticMismatch {
+                    index: self.source_index,
+                    expected,
+                    actual,
+                });
+            }
+        }
         Ok(self.account_updates)
     }
 }
@@ -833,6 +1005,9 @@ impl<W: Write> SlotVisitor for MergeVisitor<'_, W> {
         self.finish_slot_write_versions();
         if self.error.is_some() {
             return;
+        }
+        if let Some((digest, _)) = &mut self.prefix_semantic {
+            digest.on_slot_start(slot, kind);
         }
         self.current_slot = slot;
         self.current_is_block = kind == SlotKind::Block;
@@ -849,6 +1024,9 @@ impl<W: Write> SlotVisitor for MergeVisitor<'_, W> {
     fn on_epoch(&mut self, meta: &EpochMeta) {
         if self.error.is_some() {
             return;
+        }
+        if let Some((digest, _)) = &mut self.prefix_semantic {
+            digest.on_epoch(meta);
         }
         if !self.current_is_block {
             self.epoch_meta_mismatch("placement");
@@ -932,6 +1110,9 @@ impl<W: Write> SlotVisitor for MergeVisitor<'_, W> {
     }
 
     fn on_pre_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
+        if let Some((digest, _)) = &mut self.prefix_semantic {
+            digest.on_pre_account_update(slot, update);
+        }
         let Some(write_version) = self.accept_write_version(update.write_version, slot) else {
             return;
         };
@@ -944,6 +1125,9 @@ impl<W: Write> SlotVisitor for MergeVisitor<'_, W> {
     }
 
     fn on_transaction(&mut self, slot: u64, _tx_index: u32, tx: &Transaction) {
+        if let Some((digest, _)) = &mut self.prefix_semantic {
+            digest.on_transaction(slot, _tx_index, tx);
+        }
         if self.error.is_some() {
             return;
         }
@@ -967,6 +1151,9 @@ impl<W: Write> SlotVisitor for MergeVisitor<'_, W> {
     }
 
     fn on_post_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
+        if let Some((digest, _)) = &mut self.prefix_semantic {
+            digest.on_post_account_update(slot, update);
+        }
         let Some(write_version) = self.accept_write_version(update.write_version, slot) else {
             return;
         };
@@ -979,6 +1166,9 @@ impl<W: Write> SlotVisitor for MergeVisitor<'_, W> {
     }
 
     fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
+        if let Some((digest, _)) = &mut self.prefix_semantic {
+            digest.on_block(notification, entries);
+        }
         self.finish_slot_write_versions();
         if self.error.is_some() {
             return;
@@ -1470,6 +1660,212 @@ mod tests {
             ..first
         };
         ArchiveProvenanceV4 { base }
+    }
+
+    fn retained_prefix_fixture(
+        bucket_slots: u16,
+    ) -> (
+        ArchiveProvenanceV4,
+        Vec<RuntimeSegmentSource<Cursor<Vec<u8>>>>,
+    ) {
+        retained_prefix_fixture_with_order(bucket_slots, false)
+    }
+
+    fn retained_prefix_fixture_with_order(
+        bucket_slots: u16,
+        permuted: bool,
+    ) -> (
+        ArchiveProvenanceV4,
+        Vec<RuntimeSegmentSource<Cursor<Vec<u8>>>>,
+    ) {
+        let mut p = fixture_restart_provenance();
+        p.base.assembly_profile = "test/checkpoint/retained-prefix-selection-v1".into();
+        let mut original = source_provenance(&p.base, 0);
+        original.base.requested_slot_count = p.base.requested_slot_count;
+        let mut writer = ArchiveWriter::new_with_provenance(
+            Vec::new(),
+            EPOCH,
+            FIRST_SLOT,
+            2,
+            ArchiveWriterConfig {
+                bucket_slots,
+                compression: Compression::None,
+                ..Default::default()
+            },
+            &ArchiveProvenance::V2(original),
+        )
+        .unwrap();
+        writer
+            .preserve_initial_poh_anchor(FIRST_SLOT, hash(0x10))
+            .unwrap();
+        writer.begin_slot(FIRST_SLOT).unwrap();
+        let mut epoch = EpochMeta::new_boxed();
+        epoch.epoch = EPOCH;
+        epoch.start_slot = FIRST_SLOT;
+        epoch.slot_count = 2;
+        epoch.first_block_slot = FIRST_SLOT;
+        epoch.updates.push(&update(10, 1)).unwrap();
+        writer.write_epoch_meta(&epoch).unwrap();
+        writer
+            .write_orphan_update(&update(if permuted { 12 } else { 11 }, 2))
+            .unwrap();
+        let mut tx = Transaction::new_boxed();
+        tx.push_account_update(&update(if permuted { 11 } else { 12 }, 3))
+            .unwrap();
+        writer.write_transaction(&tx).unwrap();
+        writer.write_orphan_update(&update(13, 4)).unwrap();
+        let mut block = BlockMeta::new_boxed();
+        block.slot = FIRST_SLOT;
+        block.parent_slot = FIRST_SLOT - 1;
+        block.parent_blockhash = hash(0x10);
+        block.blockhash = hash(0x20);
+        writer.end_slot(&block, &[]).unwrap();
+        // This discarded old tail deliberately differs from the restarted
+        // suffix, and lies outside the selected raw-write mapping.
+        writer.begin_slot(FIRST_SLOT + 1).unwrap();
+        writer.write_orphan_update(&update(9999, 5)).unwrap();
+        block.slot += 1;
+        block.parent_slot += 1;
+        block.parent_blockhash = hash(0x20);
+        block.blockhash = hash(0x99);
+        writer.end_slot(&block, &[]).unwrap();
+        let original = writer.finish().unwrap().0;
+        let mut reader = ArchiveReader::open(Cursor::new(&original)).unwrap();
+        let mut digest = SemanticDigest::new();
+        reader.read_slots(FIRST_SLOT, 1, &mut digest).unwrap();
+        let prefix = RuntimeSegmentSource::retained_prefix(
+            Cursor::new(original.clone()),
+            Sha256::digest(&original).into(),
+            hash(0x20),
+            RetainedPrefixSelection {
+                original_slot_count: 2,
+                selected_slot_count: 1,
+                semantic_sha256: digest.finish().unwrap(),
+            },
+        );
+        let suffix = fixture_sources(&p.base).remove(1);
+        let suffix_hash = Sha256::digest(&suffix).into();
+        (
+            p,
+            vec![
+                prefix,
+                RuntimeSegmentSource::new(Cursor::new(suffix), suffix_hash, hash(0x30)),
+            ],
+        )
+    }
+
+    fn merge_selected(
+        sources: Vec<RuntimeSegmentSource<Cursor<Vec<u8>>>>,
+        p: &ArchiveProvenanceV4,
+    ) -> Result<(Vec<u8>, MultiSegmentMergeStats), MultiSegmentMergeError> {
+        merge_checkpoint_restart_with_retained_prefix(
+            sources,
+            Vec::new(),
+            ArchiveWriterConfig {
+                bucket_slots: 1,
+                compression: Compression::None,
+                ..Default::default()
+            },
+            p,
+        )
+    }
+
+    #[test]
+    fn retained_prefix_merge_binds_original_extent_and_excludes_the_old_tail() {
+        for bucket_slots in [1, 2] {
+            let (p, sources) = retained_prefix_fixture(bucket_slots);
+            let (output, stats) = merge_selected(sources, &p).unwrap();
+            assert_eq!(stats.slots_merged, 2);
+            assert_eq!(stats.account_updates_rebased, 5);
+            let mut reader = ArchiveReader::open(Cursor::new(output)).unwrap();
+            assert_eq!(reader.provenance().unwrap(), Some(ArchiveProvenance::V4(p)));
+            assert!(reader.has_complete_slot_coverage().unwrap());
+            reader.verify_chain = true;
+            let mut collector = WriteVersionCollector::default();
+            for index in 0..reader.bucket_count() {
+                reader.read_bucket(index, &mut collector).unwrap();
+            }
+            assert_eq!(collector.versions, vec![1000, 1001, 1002, 1003, 1004]);
+            assert_eq!(collector.epochs, vec![(EPOCH, FIRST_SLOT, 2, FIRST_SLOT)]);
+        }
+    }
+
+    #[test]
+    fn retained_prefix_selection_cannot_enter_ordinary_v3_or_v4_assembly() {
+        let (p, s) = retained_prefix_fixture(2);
+        assert!(matches!(
+            merge_restarted(s, &p),
+            Err(MultiSegmentMergeError::InvalidRetainedPrefixSelection { index: 0, .. })
+        ));
+        let (p, s) = retained_prefix_fixture(2);
+        assert!(
+            merge_runtime_segments(s, Vec::new(), ArchiveWriterConfig::default(), &p.base).is_err()
+        );
+    }
+
+    #[test]
+    fn retained_prefix_digest_keeps_wire_permutations_before_normalization() {
+        let (p, s) = retained_prefix_fixture_with_order(2, true);
+        let (output, _) = merge_selected(s, &p).unwrap();
+        let mut reader = ArchiveReader::open(Cursor::new(output)).unwrap();
+        let mut collector = WriteVersionCollector::default();
+        for index in 0..reader.bucket_count() {
+            reader.read_bucket(index, &mut collector).unwrap();
+        }
+        assert_eq!(collector.versions, vec![1000, 1002, 1001, 1003, 1004]);
+    }
+
+    #[test]
+    fn retained_prefix_merge_requires_whole_source_hash_selected_digest_and_selected_terminal() {
+        let (p, mut s) = retained_prefix_fixture(2);
+        s[0].expected_sha256[0] ^= 1;
+        assert!(matches!(
+            merge_selected(s, &p),
+            Err(MultiSegmentMergeError::SourceDigestMismatch { index: 0, .. })
+        ));
+        let (p, mut s) = retained_prefix_fixture(2);
+        s[0].retained_prefix.as_mut().unwrap().semantic_sha256[0] ^= 1;
+        assert!(matches!(
+            merge_selected(s, &p),
+            Err(MultiSegmentMergeError::RetainedPrefixSemanticMismatch { index: 0, .. })
+        ));
+        let (p, mut s) = retained_prefix_fixture(2);
+        s[0].expected_terminal_last_blockhash = hash(0x99);
+        assert!(matches!(
+            merge_selected(s, &p),
+            Err(MultiSegmentMergeError::SourceTerminalEvidenceMismatch { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn retained_prefix_merge_rejects_selection_shape_and_container_relabeling() {
+        for mutation in 0..6 {
+            let (mut p, mut s) = retained_prefix_fixture(2);
+            match mutation {
+                0 => s[0].retained_prefix.as_mut().unwrap().original_slot_count = 3,
+                1 => s[0].retained_prefix.as_mut().unwrap().selected_slot_count = 2,
+                2 => s[0].retained_prefix.as_mut().unwrap().semantic_sha256 = [0; 32],
+                3 => s[1].retained_prefix = s[0].retained_prefix,
+                4 => s[0].retained_prefix = None,
+                5 => p.base.assembly_profile = "test/old-checkpoint-profile".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    merge_selected(s, &p),
+                    Err(MultiSegmentMergeError::InvalidRetainedPrefixSelection { .. })
+                ),
+                "mutation{mutation}"
+            );
+        }
+        let (p, mut s) = retained_prefix_fixture(2);
+        let shortened = fixture_sources(&p.base).remove(0);
+        s[0].expected_sha256 = Sha256::digest(&shortened).into();
+        s[0].reader = Cursor::new(shortened);
+        assert!(matches!(
+            merge_selected(s, &p),
+            Err(MultiSegmentMergeError::SourceRangeMismatch { index: 0, .. })
+        ));
     }
 
     fn merge_restarted(
