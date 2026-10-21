@@ -25,6 +25,14 @@ locks, archives, snapshots, receipts and every replay tree. Do not equate
 measured cache blocks with observed filesystem-free-space delta while replays
 continue allocating.
 
+A dangling system-service alias is not silently ignored. Require a stable
+alias target outside the cache plus two matching manager observations proving
+`not-found/inactive/dead`, PID0, no triggers and no cached executable hooks;
+retain those exact observations in the check receipt. A permission error,
+loaded unit, cached command, changing alias or alias into the dev cache still
+fails closed. This addresses genuinely uninstalled OS-service aliases without
+relaxing live/staged consumer checks.
+
 `jetstreamer-epoch203-ram-resource-plan` performs an offline, hash-bound
 geometry check. It reads only one immutable root-owned regular JSON input
 and prints planning JSON; it never samples resources, mounts a filesystem,

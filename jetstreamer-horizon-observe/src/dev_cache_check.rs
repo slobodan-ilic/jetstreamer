@@ -2,7 +2,7 @@
 use {
     crate::{
         process_references,
-        ram_artifact_retention::{Bound, bound_json, hash_file},
+        ram_artifact_retention::{Bound, bound_json, hash_file, properties},
     },
     anyhow::{Context, Result, ensure},
     serde::Deserialize,
@@ -136,7 +136,45 @@ fn cache_tree(target: &Path) -> Result<Value> {
         "physical_bytes":physical,"regular_files":regular,"symlinks_not_followed":links,"entries":entries}),
     )
 }
-fn staged_references(roots: &[&Path], target: &Path) -> Result<Vec<String>> {
+fn missing_unit_is_nonlaunchable(
+    unit: &str,
+    p: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    for (key, want) in [
+        ("Id", unit),
+        ("LoadState", "not-found"),
+        ("ActiveState", "inactive"),
+        ("SubState", "dead"),
+        ("MainPID", "0"),
+        ("Triggers", ""),
+        ("TriggeredBy", ""),
+    ] {
+        ensure!(
+            p.get(key).map(String::as_str) == Some(want),
+            "dangling alias may still launch: {key}"
+        );
+    }
+    for key in [
+        "ExecStart",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecCondition",
+        "ExecStop",
+        "ExecStopPost",
+        "ExecReload",
+    ] {
+        ensure!(
+            p.get(key).is_none_or(String::is_empty),
+            "missing unit retains cached command: {key}"
+        );
+    }
+    Ok(())
+}
+fn staged_references(
+    roots: &[&Path],
+    target: &Path,
+    missing: &mut Vec<Value>,
+) -> Result<Vec<String>> {
     let mut queue: Vec<_> = roots.iter().map(|p| (p.to_path_buf(), 0u32)).collect();
     let mut seen = BTreeSet::new();
     let mut refs = Vec::new();
@@ -147,12 +185,63 @@ fn staged_references(roots: &[&Path], target: &Path) -> Result<Vec<String>> {
             entries <= 65536 && depth <= 32,
             "unit census exceeded bound"
         );
-        match fs::symlink_metadata(&path) {
+        let metadata = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
-            Ok(_) => (),
+            Ok(m) => m,
         };
-        let canonical = path.canonicalize()?;
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && metadata.file_type().is_symlink() =>
+            {
+                let link = fs::read_link(&path)?;
+                ensure!(
+                    !process_references::encoded_reference(
+                        link.as_os_str().as_bytes(),
+                        target.as_os_str().as_bytes(),
+                        true
+                    ) && !link
+                        .as_os_str()
+                        .as_bytes()
+                        .windows(b"target/debug".len())
+                        .any(|b| b == b"target/debug"),
+                    "dangling alias targets dev cache"
+                );
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .context("nonUTF8 dangling unit")?;
+                ensure!(
+                    name.ends_with(".service")
+                        && !name.starts_with('-')
+                        && name.len() <= 255
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"-_.@\\".contains(&b)),
+                    "unsupported dangling alias"
+                );
+                let names = "Id,LoadState,ActiveState,SubState,MainPID,ExecStart,ExecStartPre,ExecStartPost,ExecCondition,ExecStop,ExecStopPost,ExecReload,Triggers,TriggeredBy";
+                let before = properties(name, names)?;
+                missing_unit_is_nonlaunchable(name, &before)?;
+                let after = fs::symlink_metadata(&path)?;
+                ensure!(
+                    fs::read_link(&path)? == link
+                        && metadata.dev() == after.dev()
+                        && metadata.ino() == after.ino()
+                        && metadata.ctime() == after.ctime()
+                        && metadata.ctime_nsec() == after.ctime_nsec()
+                        && properties(name, names)? == before,
+                    "dangling alias/manager changed during check"
+                );
+                missing.push(json!({"alias":path,"missing_target":link,"manager_state":before,"before_after_stable":true}));
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("resolve staged unit {}", path.display()));
+            }
+        };
         if canonical == Path::new("/dev/null") || !seen.insert(canonical.clone()) {
             continue;
         }
@@ -232,6 +321,7 @@ pub fn run() -> Result<()> {
         "Cargo.lock differs"
     );
     let tree = cache_tree(Path::new(TARGET))?;
+    let mut missing = Vec::new();
     let staged = staged_references(
         &[
             Path::new("/etc/systemd/system"),
@@ -239,6 +329,7 @@ pub fn run() -> Result<()> {
             Path::new("/home/ubuntu/.config/systemd/user"),
         ],
         Path::new(TARGET),
+        &mut missing,
     )?;
     let scan = process_references::scan(Path::new("/proc"), Path::new(TARGET))?;
     ensure!(
@@ -255,7 +346,7 @@ pub fn run() -> Result<()> {
     persist(
         &p.output,
         &json!({"schema":"jetstreamer-horizon-dev-cache-check-v1","self_sha256":a[5],"plan":{"path":pb.path,"sha256":pb.sha256},
-        "source_commit":p.source_commit,"cargo_lock_sha256":p.cargo_lock_sha256,"cache":tree,"process_scan":scan,"staged_unit_references":staged,
+        "source_commit":p.source_commit,"cargo_lock_sha256":p.cargo_lock_sha256,"cache":tree,"process_scan":scan,"staged_unit_references":staged,"missing_inactive_unit_aliases":missing,
         "retirement_authorized":false,"archive_deletion_authorized":false,"replay_scratch_deletion_authorized":false,"remote_mutations":false,"r2_mutations":false}),
     )?;
     println!("{}", p.output.display());
@@ -271,21 +362,21 @@ mod tests {
         let unit = t.path().join("test.service");
         fs::write(&unit, b"ExecStart=/cache/debug-sibling/worker\n").unwrap();
         assert!(
-            staged_references(&[t.path()], Path::new("/cache/debug"))
+            staged_references(&[t.path()], Path::new("/cache/debug"), &mut Vec::new())
                 .unwrap()
                 .is_empty()
         );
         fs::write(&unit, b"ExecStart=/cache/debug/worker\n").unwrap();
         std::os::unix::fs::symlink(&unit, t.path().join("alias.service")).unwrap();
         assert_eq!(
-            staged_references(&[t.path()], Path::new("/cache/debug"))
+            staged_references(&[t.path()], Path::new("/cache/debug"), &mut Vec::new())
                 .unwrap()
                 .len(),
             1
         );
         fs::write(&unit, b"ExecStart=target/debug/worker\n").unwrap();
         assert_eq!(
-            staged_references(&[t.path()], Path::new("/cache/debug"))
+            staged_references(&[t.path()], Path::new("/cache/debug"), &mut Vec::new())
                 .unwrap()
                 .len(),
             1
@@ -325,5 +416,50 @@ mod tests {
         assert_eq!(v["regular_files"], 1);
         fs::write(t.path().join("epoch-203.jet"), b"must block cleanup").unwrap();
         assert!(cache_tree(t.path()).is_err());
+    }
+
+    #[test]
+    fn dangling_unit_requires_positive_manager_absence_not_unreadable_or_cached_commands() {
+        let p = std::collections::BTreeMap::from([
+            ("Id".into(), "missing.service".into()),
+            ("LoadState".into(), "not-found".into()),
+            ("ActiveState".into(), "inactive".into()),
+            ("SubState".into(), "dead".into()),
+            ("MainPID".into(), "0".into()),
+            ("Triggers".into(), "".into()),
+            ("TriggeredBy".into(), "".into()),
+        ]);
+        missing_unit_is_nonlaunchable("missing.service", &p).unwrap();
+        for (key, value) in [
+            ("LoadState", "loaded"),
+            ("ActiveState", "active"),
+            ("MainPID", "123"),
+            ("ExecStart", "/cached/command"),
+            ("ExecStartPre", "/cached/hook"),
+            ("TriggeredBy", "future.timer"),
+        ] {
+            let mut bad = p.clone();
+            bad.insert(key.into(), value.into());
+            assert!(
+                missing_unit_is_nonlaunchable("missing.service", &bad).is_err(),
+                "{key}"
+            );
+        }
+        let mut bad = p;
+        bad.remove("LoadState");
+        assert!(missing_unit_is_nonlaunchable("missing.service", &bad).is_err());
+    }
+
+    #[test]
+    fn dangling_alias_to_cache_cannot_be_exempted_as_a_missing_system_service() {
+        let t = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            "/cache/debug/missing.service",
+            t.path().join("missing.service"),
+        )
+        .unwrap();
+        assert!(
+            staged_references(&[t.path()], Path::new("/cache/debug"), &mut Vec::new()).is_err()
+        );
     }
 }
