@@ -55,3 +55,49 @@ incremental peak while protecting all live growth claims, ongoing epoch-141
 ledger retention, and the century floor. Keep outputs private and sidecar-free
 until every independent gate passes. No replay, assembly or publication is
 authorized by this document or by passing library tests.
+
+## Read-only selected-prefix audit
+
+`jetstreamer-epoch140-prefix-audit` is a separate fixed-input audit of the
+original archive through 60,911,751. It makes no large prefix copy: its
+`jetstreamer-epoch140-private-selected-prefix-audit-v1` result explicitly binds
+the original 432,000-slot source and a distinct 431,752-slot selection. It is
+not a `HistoricalSegmentManifest`, a shortened archive, or a continuation
+approval. A future selected-range consumer must explicitly support that
+distinction rather than pass the whole original archive to a prefix-only
+manifest reader.
+
+The immutable plan binds the exact sealed full, anchored-chain, bootstrap
+journal, cut journal, raw-cut and native-restoration receipts by their actual
+digests. The tool rehashes the whole source before and after independently
+decoding the selected prefix, checks every selected slot and incoming bucket
+anchor, and verifies the exact complete raw-write range. Per-slot sorting is
+used only to detect missing/duplicate versions; the semantic event digest
+retains original wire order across epoch, pre, transaction and post phases.
+The original source's previously established full PoH proof remains separate;
+the audit does not pretend to perform another full PoH scan.
+
+Invoke a separately sealed root-owned executable and owner-only immutable plan:
+
+```text
+jetstreamer-epoch140-prefix-audit PLAN --plan-sha256 HEX --self-sha256 HEX [--check-only]
+```
+
+The strict plan schema is `jetstreamer-epoch140-private-prefix-audit-plan-v1`.
+It contains `unit`, six `{path, sha256}` bindings named `full`, `anchored`,
+`bootstrap`, `checkpoint`, `edge`, `native`, the `output` receipt path, and
+`minimum_free_bytes` / `minimum_available_memory_bytes`. Pre-create an empty
+root-only `epoch140-prefix-audit-UNIQUE` directory directly under this host's
+private campaign root; the result must be named `prefix-audit.json`.
+`--check-only` validates the exact profile, source identity/header and admission
+without a large source hash, decode or output. Prove that mode under the same
+sandbox before the real non-restarting persistent service. Real execution
+authenticates its exact systemd invocation and PID, retains a shared source
+lock, and enforces the reserve/runtime guard throughout reads. Use a bounded
+memory cgroup and a oneshot timeout longer than its six-hour internal bound.
+
+No input, archive, sidecar, existing manifest or remote object is modified.
+The small no-clobber result and its directory are individually fsynced.
+Failure preserves all previous evidence and has no automatic retry authority.
+Actual suffix-worker restart validation, selected-range assembly/provenance,
+normal full/plugin/root gates and canonical import remain outstanding.
