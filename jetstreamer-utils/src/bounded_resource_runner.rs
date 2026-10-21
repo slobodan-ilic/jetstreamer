@@ -28,14 +28,14 @@ use crate::profile::*;
 const GENESIS: &str = "133f7eaefcd59466f3b291aadd1b0d3522432072cf5b539445218c6c125ea945";
 static EXTERNAL_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BoundFile {
     pub(crate) path: PathBuf,
     pub(crate) sha256: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Plan {
     pub(crate) schema: String,
@@ -87,7 +87,7 @@ fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
-fn bound_file(path: &Path, expected: &str, maximum: u64) -> Result<()> {
+pub(crate) fn bound_file(path: &Path, expected: &str, maximum: u64) -> Result<()> {
     ensure!(
         digest(expected) && path.is_absolute() && path.canonicalize()? == path,
         "invalid bound file"
@@ -951,6 +951,7 @@ fn measure(
     Ok(())
 }
 
+#[allow(dead_code)] // Custom compile-bound storage entrypoints use main_with_storage.
 pub(crate) fn main() {
     main_with_storage(&DiskStorage);
 }

@@ -299,3 +299,58 @@ unit scope and all-empty-directory contract. Neither API accepts a JSON flag to
 relax the phase. Both pin the RAM root inode/device and actual namespace mount
 through their checks. The new replay phase has only component tests so far;
 it requires its own exact sealed supervisor capability proof before launch.
+
+## Dormant supervisor implementation
+
+`epoch203-ram-resource-supervisor` now builds
+`jetstreamer-epoch203-ram-resource` with baseline worker3f5e8efe. The separate
+`epoch203-ram-shrink-candidate` feature pins worker4aeca563 and distinct
+shrink unit/root namespaces. Both pin parent025757b9, the same87695515
+snapshot,16threads,87720000measurement target,88127580underlying root,
+192-GiB target scratch,16-GiB output and six-hour maximum. Baseline and
+candidate must run sequentially in equivalent fresh RAM environments. The
+retained baseline output was inspected read-only: its partial archive is
+5,893,849,884bytes, below the proposed16-GiB output ceiling. That diagnostic
+file size is not a canonical century sample or proof of a full-epoch peak.
+
+The CLI keeps the shared runner syntax:
+`PLAN --plan-sha256 HEX --self-sha256 HEX`. The strict outer envelope schema is
+`jetstreamer-private-epoch203-ram-supervisor-plan-v1`, containing `runner`,
+`sandbox`, and hash-bound `observer`, `fleet`, `snapshot_success`, `cpu_stop`,
+`cpu_launch` and `auxiliary_contract` inputs. `runner` uses schema
+`jetstreamer-private-epoch203-ram-bounded-runner-plan-v1`. The sandbox retains
+the v2storage plan fields and replay-specific unit/root. Evidence must be
+immutable, readable root-owned copies; do not relax the original private trees
+or copy credentials. The worker, parent, bootstrap, genesis, checkpoint and
+plan/self identities still pass the shared runner's independent hash gates.
+
+The supervisor uses the proven target-stop/capture/result path with RAM storage
+hooks. Missing prerequisite evidence is rejected before expensive input hashes
+and revalidated immediately before fork. It binds a no-more-than30-minute-old
+routine v2observation, matching complete fleet, exact three primary invocations,
+nine claims, unchanged six canonical floor samples, the actual real snapshot
+success and exact stopped225/released16-core chain. It additionally performs
+before/after live systemd discovery: any unbound/fifth entry owner, competing
+snapshot/auxiliary diagnostic or active delivery stage rejects admission.
+The three primary identities and stopped225unit are freshly checked. This
+is admission inspection, not an additional routine resource poll.
+
+Preparation and pre-fork authenticate the actual RAM sandbox. The child gets
+only explicit runtime environment, worker binding, PATH and RAM TMPDIR; inherited
+storage credentials and unbound temp overrides are cleared. The owned RAM guard
+is started only after these gates. Its evidence is included in the resource
+result, and rejection follows the existing owned-group failure path. The runner
+cannot import an archive, create a canonical checksum, publish or retire data.
+
+This implementation remains **unlaunched and unqualified**. In particular no
+qualified `auxiliary_contract` exists yet. It requires the exact RAM/private
+comparison scope, unchanged ordinary/diagnostic overlap rejection, max4entries/
+1auxiliary and independently qualified artifact lifecycle. A boolean alone is
+insufficient: all three observer/fleet/retention attestation receipts must bind
+the actual immutable verifier executable hashes, exact profile and worker,
+real passing non-simulated capability outcomes and denial of unrelated authority.
+Do not author those reports manually, reuse the old storage-only capability as
+them, or treat the synthetic in-memory unit-test fixtures as qualification.
+Implement and exercise the real observer/fleet auxiliary role and retained-
+artifact lifecycle, seal their actual capability evidence, qualify this exact
+supervisor package/environment and prove its real guard fire before deployment.
