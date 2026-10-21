@@ -34,7 +34,9 @@ struct Plan {
     run_root: PathBuf,
     mount_unit: String,
     mount_invocation_id: String,
-    mount_id: u64,
+    host_mount_id: u64,
+    mount_device: [u64; 2],
+    host_peer_group: u64,
 }
 
 fn canonical_hex(s: &str, len: usize) -> bool {
@@ -52,7 +54,7 @@ fn unit_name(s: &str, suffix: &str) -> bool {
 
 fn validate_plan(p: &Plan) -> Result<()> {
     ensure!(
-        p.schema == "jetstreamer-private-epoch203-ram-storage-probe-plan-v1",
+        p.schema == "jetstreamer-private-epoch203-ram-storage-probe-plan-v2",
         "wrong plan schema"
     );
     ensure!(
@@ -62,7 +64,10 @@ fn validate_plan(p: &Plan) -> Result<()> {
     ensure!(
         unit_name(&p.mount_unit, ".mount")
             && canonical_hex(&p.mount_invocation_id, 32)
-            && p.mount_id != 0,
+            && p.host_mount_id != 0
+            && p.mount_device[0] == 0
+            && p.mount_device[1] != 0
+            && p.host_peer_group != 0,
         "unbound persistent mount"
     );
     ensure!(
@@ -228,7 +233,12 @@ fn option_set(text: &str) -> Result<std::collections::BTreeSet<&str>> {
     Ok(set)
 }
 
-fn mountinfo(text: &str, root: &Path, mount_id: u64) -> Result<(u64, u64)> {
+fn mountinfo(
+    text: &str,
+    root: &Path,
+    device: [u64; 2],
+    host_peer_group: u64,
+) -> Result<(u64, u64)> {
     let root = root.to_str().context("RAM path is not UTF8")?;
     let mut found = None;
     for line in text.lines() {
@@ -242,11 +252,7 @@ fn mountinfo(text: &str, root: &Path, mount_id: u64) -> Result<(u64, u64)> {
             continue;
         }
         ensure!(
-            found.is_none()
-                && a[0].parse::<u64>()? == mount_id
-                && a[3] == "/"
-                && b[0] == "tmpfs"
-                && b[1] == "tmpfs",
+            found.is_none() && a[3] == "/" && b[0] == "tmpfs" && b[1] == "tmpfs",
             "foreign or multiply mounted RAM root"
         );
         let options = option_set(a[5])?;
@@ -265,7 +271,32 @@ fn mountinfo(text: &str, root: &Path, mount_id: u64) -> Result<(u64, u64)> {
             "RAM mount ownership/mode differs"
         );
         let (major, minor) = a[2].split_once(':').context("malformed mount device")?;
-        found = Some((major.parse()?, minor.parse()?));
+        ensure!(
+            [major.parse::<u64>()?, minor.parse::<u64>()?] == device,
+            "sandbox mount is not the bound host RAM device"
+        );
+        // ProtectHome/ReadWritePaths assign namespace-local mount IDs. Bind
+        // the inherited host source by device and propagation master, then
+        // pin the actual local ID/peer for the before/after race check.
+        let master: Vec<_> = a[6..]
+            .iter()
+            .filter_map(|s| s.strip_prefix("master:"))
+            .collect();
+        let shared: Vec<_> = a[6..]
+            .iter()
+            .filter_map(|s| s.strip_prefix("shared:"))
+            .collect();
+        ensure!(
+            master.len() == 1 && master[0].parse::<u64>()? == host_peer_group && shared.len() == 1,
+            "RAM source propagation binding differs"
+        );
+        let local_id = a[0].parse::<u64>()?;
+        let local_peer = shared[0].parse::<u64>()?;
+        ensure!(
+            local_id > 0 && local_peer > 0,
+            "invalid namespace mount identity"
+        );
+        found = Some((local_id, local_peer));
     }
     found.context("persistent RAM root not mounted in this namespace")
 }
@@ -395,7 +426,13 @@ fn authenticate(p: &Plan) -> Result<Value> {
         "Id,InvocationID,ActiveState,SubState,What,Where,Type,StopWhenUnneeded,BindsTo,PartOf";
     validate_mount(&show(&p.mount_unit, mount_props)?, p)?;
     let mount_before = bounded_text(Path::new("/proc/self/mountinfo"), 4 << 20)?;
-    let (major, minor) = mountinfo(&mount_before, &p.run_root, p.mount_id)?;
+    let namespace_mount = mountinfo(
+        &mount_before,
+        &p.run_root,
+        p.mount_device,
+        p.host_peer_group,
+    )?;
+    let [major, minor] = p.mount_device;
     let dev = directory(&p.run_root)?;
     ensure!(
         u64::from(libc::major(dev)) == major && u64::from(libc::minor(dev)) == minor,
@@ -445,14 +482,16 @@ fn authenticate(p: &Plan) -> Result<Value> {
     validate_mount(&show(&p.mount_unit, mount_props)?, p)?;
     let mount_after = bounded_text(Path::new("/proc/self/mountinfo"), 4 << 20)?;
     ensure!(
-        mountinfo(&mount_after, &p.run_root, p.mount_id)? == (major, minor)
+        mountinfo(&mount_after, &p.run_root, p.mount_device, p.host_peer_group)? == namespace_mount
             && directory(&p.run_root)? == dev,
         "persistent mount changed during probe"
     );
     Ok(
         json!({"invocation_id":inv,"unit":p.unit,"run_root":p.run_root,
         "mount_unit":p.mount_unit,"mount_invocation_id":p.mount_invocation_id,
-        "mount_id":p.mount_id,"mount_device":[major,minor],"tmpfs_capacity_bytes":TMPFS_SIZE,
+        "host_mount_id_from_plan":p.host_mount_id,"host_peer_group":p.host_peer_group,
+        "namespace_mount_id":namespace_mount.0,"namespace_peer_group":namespace_mount.1,
+        "mount_device":[major,minor],"tmpfs_capacity_bytes":TMPFS_SIZE,
         "tmpfs_available_bytes":available,"cgroup_limits":limits,
         "unprivileged_identity_verified":true,"producer_lifetime_teardown_disabled":true}),
     )
@@ -568,12 +607,14 @@ mod tests {
     use super::*;
     fn plan() -> Plan {
         Plan {
-            schema: "jetstreamer-private-epoch203-ram-storage-probe-plan-v1".into(),
+            schema: "jetstreamer-private-epoch203-ram-storage-probe-plan-v2".into(),
             unit: format!("{SERVICE_PREFIX}test.service"),
             run_root: Path::new(ROOT_PARENT).join("ram-resource-203-test"),
             mount_unit: "home-ubuntu-ram.mount".into(),
             mount_invocation_id: "a".repeat(32),
-            mount_id: 123,
+            host_mount_id: 123,
+            mount_device: [0, 71],
+            host_peer_group: 357,
         }
     }
     fn service(p: &Plan) -> String {
@@ -594,7 +635,7 @@ mod tests {
     }
     fn info(p: &Plan) -> String {
         format!(
-            "123 1 0:71 / {} rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=805306368k,mode=700,uid=1000,gid=1000\n",
+            "471 1 0:71 / {} rw,nosuid,nodev,relatime shared:392 master:357 - tmpfs tmpfs rw,size=805306368k,mode=700,uid=1000,gid=1000\n",
             p.run_root.display()
         )
     }
@@ -604,7 +645,10 @@ mod tests {
         validate_plan(&p).unwrap();
         validate_service(&service(&p), &p, &"b".repeat(32), 456).unwrap();
         validate_mount(&mount(&p), &p).unwrap();
-        assert_eq!(mountinfo(&info(&p), &p.run_root, 123).unwrap(), (0, 71));
+        assert_eq!(
+            mountinfo(&info(&p), &p.run_root, [0, 71], 357).unwrap(),
+            (471, 392)
+        );
     }
     #[test]
     fn ephemeral_mount_and_identity_substitution_fail() {
@@ -653,7 +697,8 @@ mod tests {
                 "accepted {a}"
             );
         }
-        assert!(mountinfo(&info(&p), &p.run_root, 124).is_err());
+        assert!(mountinfo(&info(&p), &p.run_root, [0, 72], 357).is_err());
+        assert!(mountinfo(&info(&p), &p.run_root, [0, 71], 358).is_err());
         for (a, b) in [
             (" - tmpfs ", " - ext4 "),
             ("mode=700", "mode=777"),
@@ -663,11 +708,19 @@ mod tests {
             ("rw,nosuid,nodev,relatime", "rw,relatime"),
         ] {
             assert!(
-                mountinfo(&info(&p).replace(a, b), &p.run_root, 123).is_err(),
+                mountinfo(&info(&p).replace(a, b), &p.run_root, [0, 71], 357).is_err(),
                 "accepted {a}"
             );
         }
-        assert!(mountinfo(&format!("{}{}", info(&p), info(&p)), &p.run_root, 123).is_err());
+        assert!(
+            mountinfo(
+                &format!("{}{}", info(&p), info(&p)),
+                &p.run_root,
+                [0, 71],
+                357
+            )
+            .is_err()
+        );
     }
     fn counters(key: &str) -> Result<String> {
         Ok(match key {
@@ -732,7 +785,7 @@ mod tests {
         p.mount_invocation_id = "A".repeat(32);
         assert!(validate_plan(&p).is_err());
         let mut p = plan();
-        p.mount_id = 0;
+        p.host_mount_id = 0;
         assert!(validate_plan(&p).is_err());
     }
     #[test]

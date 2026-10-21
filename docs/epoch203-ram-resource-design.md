@@ -123,12 +123,14 @@ The strict plan has these fields, with no others:
 
 ```json
 {
-  "schema": "jetstreamer-private-epoch203-ram-storage-probe-plan-v1",
+  "schema": "jetstreamer-private-epoch203-ram-storage-probe-plan-v2",
   "unit": "horizon-203-ram-storage-probe-ATTEMPT.service",
   "run_root": "/home/ubuntu/.jetstreamer-private/ram-resource-203-ATTEMPT",
   "mount_unit": "EXACT_SYSTEMD_ESCAPED_PATH.mount",
   "mount_invocation_id": "EXACT_32_LOWERCASE_HEX",
-  "mount_id": 123
+  "host_mount_id": 123,
+  "mount_device": [0, 67],
+  "host_peer_group": 357
 }
 ```
 
@@ -138,7 +140,9 @@ The mount must be a separately managed active `tmpfs` mount with
 empty mode0700 `scratch`, `output`, `ledger`, `tmp` and `receipts` children
 on the same device. Do not substitute a bind-mounted subtree or a service's
 `TemporaryFileSystem=` namespace. Probe plans bind its actual current
-invocation and mount ID; a changed or multiply mounted path fails closed.
+invocation, host device and propagation peer group. Mount IDs are namespace-local:
+the probe pins its own current namespace's mount ID and peer across the read,
+not the host's numeric mount ID. A changed or multiply mounted path fails closed.
 
 For the future exact probe service require `Type=oneshot`, `Restart=no`,
 `KillMode=control-group`, `Delegate=no`, `NoNewPrivileges=yes`,
@@ -175,3 +179,13 @@ and still requires the actual probe to prove all five capability sets zero.
 This correction must use a distinct sealed binary/plan and service invocation;
 the failed v1 attempt is not capability evidence. The independently managed
 empty RAM mount remains preserved and bound to its original mount invocation.
+
+The second sealed attempt (`horizon-203-ram-storage-probe-v2`, invocation
+`7e9921fd148546a289137be90d43bde9`) successfully crossed the privilege-drop
+gate, then rejected the host mount ID inside the service mount namespace.
+A read-only same-sandbox mountinfo diagnostic confirmed the reason: host
+mount322/device0:67/shared357 appears as mount471/device0:67/shared392/master357
+inside the protected namespace. Preserve the failure. The v2 **plan schema**
+separately records the host ID, binds device and propagation master, and requires
+the service's actual mount ID/peer to remain stable before/after. This is an
+explicit corrected identity model, not permission to accept arbitrary mounts.
