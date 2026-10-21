@@ -20,6 +20,9 @@ use {
     },
 };
 
+#[path = "horizon_full_verification_transient.rs"]
+mod transient;
+
 const PLAN_SCHEMA: &str = "jetstreamer-horizon-full-verification-evidence-plan-v1";
 const RECEIPT_SCHEMA: &str = "horizon-private-full-verification-v1";
 const SEAL_RECEIPT_SCHEMA: &str = "jetstreamer-sealed-deployment-receipt-v1";
@@ -32,6 +35,7 @@ struct Arguments {
     plan: PathBuf,
     plan_sha256: String,
     self_sha256: String,
+    check_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +50,8 @@ struct Plan {
     output_log: PathBuf,
     output_receipt: PathBuf,
     authority: Authority,
+    #[serde(default)]
+    transient: Option<transient::Profile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,7 +108,8 @@ struct SealMember {
     sha256: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Identity {
     device: u64,
     inode: u64,
@@ -220,7 +227,7 @@ struct Receipt<'a> {
 }
 
 fn usage(program: &str) -> String {
-    format!("usage: {program} PLAN.json --plan-sha256 HEX --self-sha256 HEX")
+    format!("usage: {program} PLAN.json --plan-sha256 HEX --self-sha256 HEX [--check-only (transient v2 only)]")
 }
 
 fn parse_arguments() -> Result<Arguments, String> {
@@ -246,6 +253,11 @@ fn parse_arguments() -> Result<Arguments, String> {
         .ok_or_else(|| usage(&program))?
         .into_string()
         .map_err(|_| "self SHA-256 is not UTF-8".to_string())?;
+    let check_only = match arguments.next() {
+        None => false,
+        Some(value) if value == "--check-only" => true,
+        Some(_) => return Err(usage(&program)),
+    };
     if arguments.next().is_some() {
         return Err(usage(&program));
     }
@@ -253,6 +265,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         plan: PathBuf::from(plan),
         plan_sha256,
         self_sha256,
+        check_only,
     })
 }
 
@@ -753,7 +766,12 @@ fn run() -> Result<(), String> {
     require_root_sealed_file(plan_identity, "plan")?;
     let plan: Plan = serde_json::from_slice(&plan_bytes)
         .map_err(|error| format!("invalid plan JSON: {error}"))?;
+    if plan.schema == transient::PLAN_SCHEMA {
+        return transient::run(&arguments, &plan);
+    }
     if plan.schema != PLAN_SCHEMA
+        || plan.transient.is_some()
+        || arguments.check_only
         || plan.epoch == 0
         || plan.unit.threads == 0
         || plan.unit.threads > 64
@@ -974,6 +992,7 @@ mod tests {
                 remote_mutations: false,
                 r2_mutations: false,
             },
+            transient: None,
         }
     }
 
