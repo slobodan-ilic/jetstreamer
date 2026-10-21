@@ -9,7 +9,7 @@ idempotent incident recording, not a generic gate-edit API or scratch-retirement
 authority. A newer reviewed task is never overwritten. The ordinary fresh
 observer, full fleet census, R2 inventory and status gates still run independently.
 
-## Offline successor preparation (201–300 only)
+## Offline successor preparation (explicit campaign profiles)
 
 After a cycle has an accepted `completion.json`, a separately sealed candidate
 may be invoked with the current sealed plan and its exact bindings:
@@ -23,11 +23,28 @@ remote observation. It consumes the exact accepted observer/model/estimate/
 fleet/status receipts, rejects a newer fleet, and preserves all owner IDs,
 diagnostic claims, gates, additional evidence and tool pins. It advances by
 exactly1800seconds and increments only the canonical observer generation.
-The existing 101–200 profile, an out-of-band observation, changed auxiliary
-scope or an inconsistent/partial completion fails closed for manual review.
+An out-of-band observation, changed auxiliary scope or an inconsistent/partial
+completion fails closed for manual review.
 
-Precreate root-owned mode0700
-`/var/lib/jetstreamer/horizon-next-preparations-v1`. The tool writes one
+The 101–200 profile has its own preparation root,
+`/var/lib/jetstreamer/horizon-next-preparations-101-200-v2`, owner-only `TIMESTAMP-v2`
+stages, and `jetstreamer-horizon-routine-next-preparation-101-200-v2` receipts.
+It accepts only this host's exact `sample-TIMESTAMP.json` observer namespace
+and its hash-bound manual `horizon-control-seven-HHMM-DATE-v1` config or a
+previously prepared config. Generated immutable destinations are
+`/var/lib/jetstreamer/horizon-next-observer-101-200-TIMESTAMP-v2` and
+`/var/lib/jetstreamer/horizon-routine-plan-101-200-TIMESTAMP-v2`; observer,
+cycle, estimate and fleet outputs retain the existing 101–200 namespaces.
+Private epoch-144 diagnostic owners stay unchanged and never become ETA claims.
+Previously added observational units must already occur in the accepted fleet
+template; the next supplemental list then names only the new metadata owner,
+while the template retains prior tracked units. This avoids an indefinitely
+growing bounded supplemental list without removing history. All other gates,
+tool pins and receipts are preserved. The 201–300 generation rules are unchanged.
+
+Precreate the selected profile's root with root ownership and mode0700:
+`/var/lib/jetstreamer/horizon-next-preparations-v1` for 201–300, or
+`/var/lib/jetstreamer/horizon-next-preparations-101-200-v2` for 101–200. The tool writes one
 no-clobber `TIMESTAMP-v1/` child containing `observer.json`, `cycle-plan.json`,
 their two separate deployment-sealer plans, and `preparation.json`. No
 preparation receipt means no completed preparation. Preserve an interrupted

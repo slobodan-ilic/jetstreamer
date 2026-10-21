@@ -1,10 +1,12 @@
-//! Offline successor preparation for the existing 201–300 routine profile.
+//! Offline successor preparation for the explicitly bounded routine profiles.
 //! No subprocesses, environment credentials, resource observation or deployment.
 use super::*;
 use std::os::unix::fs::DirBuilderExt;
 
 const ROOT: &str = "/var/lib/jetstreamer/horizon-next-preparations-v1";
 const OBSERVERS: &str = "/home/ubuntu/workspace/jetstreamer/.codex/tmp-readiness";
+const ROOT_101: &str = "/var/lib/jetstreamer/horizon-next-preparations-101-200-v2";
+const OBSERVERS_101: &str = "/var/lib/jetstreamer-horizon-observe-eleven-focus-20261017-v1";
 
 fn utc_string(seconds: u64) -> Result<String> {
     let seconds: libc::time_t = seconds.try_into()?;
@@ -25,10 +27,7 @@ fn utc_string(seconds: u64) -> Result<String> {
 }
 
 fn completion_bindings(p: &Plan, pb: &Bound, c: &Value) -> Result<()> {
-    ensure!(
-        !is_101(p)?,
-        "successor preparation currently requires explicit201-300profile"
-    );
+    is_101(p)?;
     ensure!(
         c["schema"] == "jetstreamer-horizon-routine-cycle-completion-v1"
             && c["sampled_at_utc"] == p.sample_target_utc
@@ -75,25 +74,65 @@ fn derive_next(
     config: &Value,
 ) -> Result<(Plan, Value, PathBuf, PathBuf)> {
     completion_bindings(p, pb, c)?;
+    let host101 = is_101(p)?;
+    let next_time = utc_string(
+        utc_seconds(&p.sample_target_utc)?
+            .checked_add(1800)
+            .context("time overflow")?,
+    )?;
     let old_stamp = stamp(&p.sample_target_utc);
-    let generation = p
-        .observer
-        .file_name()
-        .and_then(|s| s.to_str())
-        .and_then(|s| s.strip_prefix(&format!("horizon-live-resource-sample-{old_stamp}-v")))
-        .and_then(|s| s.strip_suffix(".json"))
-        .context("noncanonical observer generation")?;
-    let n: u32 = generation.parse()?;
-    ensure!(
-        n > 0
-            && n.to_string() == generation
-            && p.observer.parent() == Some(Path::new(OBSERVERS))
-            && p.observer_config.path
-                == Path::new("/var/lib/jetstreamer").join(format!(
-                    "horizon-next-observer-{old_stamp}-v{n}/observer.json"
-                )),
-        "observer config/output generation mismatch"
-    );
+    let next_stamp = stamp(&next_time);
+    let (observer_package, cycle_package, next_observer) = if host101 {
+        let legacy_config = Path::new("/usr/local/lib/jetstreamer").join(format!(
+            "horizon-control-seven-{}-{}-v1/observer-config.json",
+            &old_stamp[9..13],
+            &old_stamp[..8]
+        ));
+        let prepared_config = Path::new("/var/lib/jetstreamer").join(format!(
+            "horizon-next-observer-101-200-{old_stamp}-v2/observer.json"
+        ));
+        ensure!(
+            p.observer == Path::new(OBSERVERS_101).join(format!("sample-{old_stamp}.json"))
+                && (p.observer_config.path == legacy_config
+                    || p.observer_config.path == prepared_config),
+            "101observer/config is outside its exact manual or prepared namespace"
+        );
+        (
+            Path::new("/var/lib/jetstreamer")
+                .join(format!("horizon-next-observer-101-200-{next_stamp}-v2")),
+            Path::new("/var/lib/jetstreamer")
+                .join(format!("horizon-routine-plan-101-200-{next_stamp}-v2")),
+            Path::new(OBSERVERS_101).join(format!("sample-{next_stamp}.json")),
+        )
+    } else {
+        let generation = p
+            .observer
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix(&format!("horizon-live-resource-sample-{old_stamp}-v")))
+            .and_then(|s| s.strip_suffix(".json"))
+            .context("noncanonical observer generation")?;
+        let n: u32 = generation.parse()?;
+        ensure!(
+            n > 0
+                && n.to_string() == generation
+                && p.observer.parent() == Some(Path::new(OBSERVERS))
+                && p.observer_config.path
+                    == Path::new("/var/lib/jetstreamer").join(format!(
+                        "horizon-next-observer-{old_stamp}-v{n}/observer.json"
+                    )),
+            "observer config/output generation mismatch"
+        );
+        let n = n.checked_add(1).context("generation overflow")?;
+        (
+            Path::new("/var/lib/jetstreamer")
+                .join(format!("horizon-next-observer-{next_stamp}-v{n}")),
+            Path::new("/var/lib/jetstreamer").join(format!("horizon-routine-plan-{next_stamp}-v1")),
+            Path::new(OBSERVERS).join(format!(
+                "horizon-live-resource-sample-{next_stamp}-v{n}.json"
+            )),
+        )
+    };
     ensure!(
         config["schema"] == "jetstreamer-horizon-live-resource-sample-config-v2"
             && config["output"].as_str() == p.observer.to_str()
@@ -105,23 +144,10 @@ fn derive_next(
             && config.get("epoch203_ram_auxiliary").is_none(),
         "not an unchanged ordinary routine config"
     );
-    let next_time = utc_string(
-        utc_seconds(&p.sample_target_utc)?
-            .checked_add(1800)
-            .context("time overflow")?,
-    )?;
-    let next_stamp = stamp(&next_time);
-    let n = n.checked_add(1).context("generation overflow")?;
-    let observer_package =
-        Path::new("/var/lib/jetstreamer").join(format!("horizon-next-observer-{next_stamp}-v{n}"));
-    let cycle_package =
-        Path::new("/var/lib/jetstreamer").join(format!("horizon-routine-plan-{next_stamp}-v1"));
     let mut next_config = config.clone();
     next_config["not_before_utc"] = json!(next_time);
     next_config["previous_sample"] = json!(p.observer);
-    next_config["output"] = json!(Path::new(OBSERVERS).join(format!(
-        "horizon-live-resource-sample-{next_stamp}-v{n}.json"
-    )));
+    next_config["output"] = json!(next_observer);
     let observer_sha = sha(&encoded(&next_config)?);
     let mut next: Plan = serde_json::from_value(serde_json::to_value(p)?)?;
     next.sample_target_utc = next_time;
@@ -136,8 +162,12 @@ fn derive_next(
     next.previous_estimates = serde_json::from_value(c["estimates"].clone())?;
     next.previous_fleet = serde_json::from_value(c["fleet"].clone())?;
     next.cycle_unit = cycle_unit(&next)?;
-    next.cycle_directory = Path::new("/var/lib/jetstreamer/horizon-routine-cycles-v1")
-        .join(format!("{next_stamp}-v1"));
+    next.cycle_directory = if host101 {
+        Path::new("/var/lib/jetstreamer/horizon-routine-cycles-101-200-v2")
+            .join(format!("{next_stamp}-v2"))
+    } else {
+        Path::new("/var/lib/jetstreamer/horizon-routine-cycles-v1").join(format!("{next_stamp}-v1"))
+    };
     next.estimate_output = p
         .estimate_output
         .parent()
@@ -145,9 +175,34 @@ fn derive_next(
         .join(format!(
             "horizon-r2-status-estimates-{next_stamp}-cohort-gated-v5.json"
         ));
-    next.fleet_output = Path::new("/var/lib/jetstreamer/horizon-campaign-fleet")
-        .join(format!("{next_stamp}-rust-v1/fleet-ledger.json"));
+    next.fleet_output = if host101 {
+        Path::new(FLEET_ROOT_101).join(format!("fleet-{next_stamp}.json"))
+    } else {
+        Path::new("/var/lib/jetstreamer/horizon-campaign-fleet")
+            .join(format!("{next_stamp}-rust-v1/fleet-ledger.json"))
+    };
+    if let Some(scope) = &mut next.scope_101_200 {
+        // Prior additions are already in the bound accepted fleet template.
+        // Do not grow this bounded supplemental list forever across successors.
+        scope.additional_tracked_units = vec![next.cycle_unit.clone()];
+    }
     Ok((next, next_config, observer_package, cycle_package))
+}
+
+fn validate_folded_scope(p: &Plan, fleet_plan: &Value) -> Result<()> {
+    if let Some(scope) = &p.scope_101_200 {
+        let tracked = fleet_plan["tracked_units"]
+            .as_array()
+            .context("accepted fleet tracked census missing")?;
+        ensure!(
+            scope
+                .additional_tracked_units
+                .iter()
+                .all(|u| tracked.iter().any(|v| v.as_str() == Some(u.as_str()))),
+            "prior observational additions are absent from accepted fleet template"
+        );
+    }
+    Ok(())
 }
 fn encoded(value: &Value) -> Result<Vec<u8>> {
     let mut b = serde_json::to_vec_pretty(value)?;
@@ -190,6 +245,7 @@ pub(super) fn prepare(p: &Plan, pb: &Bound, self_sha: &str) -> Result<()> {
         derive_next(p, pb, &completion, &config)?;
     let model = bound_json(&next.model_template, true)?;
     let fleet_plan = bound_json(&next.fleet_template, true)?;
+    validate_folded_scope(p, &fleet_plan)?;
     let fleet = bound_json(&next.previous_fleet, false)?;
     let estimates = bound_json(&next.previous_estimates, false)?;
     let observer = bound_json(&next.previous_observer, false)?;
@@ -228,11 +284,17 @@ pub(super) fn prepare(p: &Plan, pb: &Bound, self_sha: &str) -> Result<()> {
             "status receipt is not the accepted observation"
         );
     }
-    let stage = Path::new(ROOT).join(format!("{}-v1", stamp(&next.sample_target_utc)));
-    private_dir(Path::new(ROOT))?;
+    let host101 = is_101(p)?;
+    let root = Path::new(if host101 { ROOT_101 } else { ROOT });
+    let stage = root.join(format!(
+        "{}-v{}",
+        stamp(&next.sample_target_utc),
+        if host101 { 2 } else { 1 }
+    ));
+    private_dir(root)?;
     absent(&stage)?;
     fs::DirBuilder::new().mode(0o700).create(&stage)?;
-    File::open(ROOT)?.sync_all()?;
+    File::open(root)?.sync_all()?;
     let observer_source = write_new(&stage.join("observer.json"), &next_config)?;
     ensure!(
         observer_source.sha256 == next.observer_config.sha256,
@@ -262,7 +324,7 @@ pub(super) fn prepare(p: &Plan, pb: &Bound, self_sha: &str) -> Result<()> {
             &cycle_source.sha256,
         ),
     )?;
-    let receipt = json!({"schema":"jetstreamer-horizon-routine-next-preparation-v1","self_sha256":self_sha,
+    let receipt = json!({"schema":if host101 { "jetstreamer-horizon-routine-next-preparation-101-200-v2" } else { "jetstreamer-horizon-routine-next-preparation-v1" },"self_sha256":self_sha,
         "current_plan":pb,"completion":{"path":completion_path,"sha256":sha(&bytes)},
         "next_sample_target_utc":next.sample_target_utc,"observer_source":observer_source,"cycle_source":cycle_source,
         "observer_seal_plan":observer_seal,"cycle_seal_plan":cycle_seal,
@@ -306,6 +368,155 @@ mod tests {
             "minimum_interval_seconds":1800,"output":p.observer,"previous_sample":"/old-sample",
             "replays":[{"owner":"unchanged"}],"diagnostic_replays":[{"owner":"also-unchanged"}]});
         (p, pb, c, config)
+    }
+
+    fn fixture_101() -> (Plan, Bound, Value, Value) {
+        let (mut p, pb, mut c, mut config) = fixture();
+        p.schema = PLAN_SCHEMA_101.into();
+        p.sample_target_utc = "2026-10-21T08:38:00Z".into();
+        p.scope_101_200 = Some(Scope101200 {
+            diagnostic_ranges: vec![DiagnosticClaim {
+                range: "144".into(),
+                controller_unit: "horizon-qualify-epoch144-loader-focus-20261016-v1.service".into(),
+                producer_unit: "horizon-qualify-epoch144-loader-focus-20261016-v1.service".into(),
+                expected_controller_invocation_id: "1".repeat(32),
+                expected_producer_invocation_id: "1".repeat(32),
+            }],
+            additional_tracked_units: vec!["horizon-old-observational-helper.service".into()],
+        });
+        p.expected_epochs = vec![198];
+        p.observer = Path::new(OBSERVERS_101).join("sample-20261021T083800Z.json");
+        p.observer_config.path = PathBuf::from(
+            "/usr/local/lib/jetstreamer/horizon-control-seven-0838-20261021-v1/observer-config.json",
+        );
+        p.cycle_directory = PathBuf::from(
+            "/var/lib/jetstreamer/horizon-routine-cycles-101-200-v2/20261021T083800Z-v2",
+        );
+        p.cycle_unit = cycle_unit(&p).unwrap();
+        p.estimate_output =
+            "/estimates/horizon-r2-status-estimates-20261021T083800Z-cohort-gated-v5.json".into();
+        p.fleet_output = Path::new(FLEET_ROOT_101).join("fleet-20261021T083800Z.json");
+        p.additional_gate_evidence = BTreeMap::from([("140".into(), vec![pb.clone()])]);
+        c["sampled_at_utc"] = json!(p.sample_target_utc);
+        c["observer"]["path"] = json!(p.observer);
+        c["model"]["path"] = json!(p.cycle_directory.join("sealed/eta-model.json"));
+        c["fleet_plan"]["path"] = json!(p.cycle_directory.join("sealed/fleet-plan.json"));
+        c["fleet"]["path"] = json!(p.fleet_output);
+        c["estimates"]["path"] = json!(p.estimate_output);
+        config["not_before_utc"] = json!(p.sample_target_utc);
+        config["output"] = json!(p.observer);
+        (p, pb, c, config)
+    }
+
+    #[test]
+    fn successor_101_preserves_private_diagnostics_and_exact_u64_without_promoting_them() {
+        let (p, pb, c, mut config) = fixture_101();
+        config["replays"][0]["append_log"] = json!({"path":"/append/log",
+            "device":u64::MAX-1,"inode":u64::MAX});
+        let diagnostics =
+            serde_json::to_value(&p.scope_101_200.as_ref().unwrap().diagnostic_ranges).unwrap();
+        let (next, cfg, op, cp) = derive_next(&p, &pb, &c, &config).unwrap();
+        assert_eq!(next.sample_target_utc, "2026-10-21T09:08:00Z");
+        assert_eq!(next.schema, PLAN_SCHEMA_101);
+        assert_eq!(next.expected_epochs, [198]);
+        assert_eq!(
+            next.observer,
+            Path::new(OBSERVERS_101).join("sample-20261021T090800Z.json")
+        );
+        assert_eq!(
+            next.fleet_output,
+            Path::new(FLEET_ROOT_101).join("fleet-20261021T090800Z.json")
+        );
+        assert_eq!(
+            next.cycle_directory,
+            Path::new("/var/lib/jetstreamer/horizon-routine-cycles-101-200-v2/20261021T090800Z-v2")
+        );
+        assert_eq!(
+            next.cycle_unit,
+            "horizon-routine-cycle-101-200-20261021T090800Z-v2.service"
+        );
+        assert_eq!(
+            op,
+            Path::new("/var/lib/jetstreamer/horizon-next-observer-101-200-20261021T090800Z-v2")
+        );
+        assert_eq!(
+            cp,
+            Path::new("/var/lib/jetstreamer/horizon-routine-plan-101-200-20261021T090800Z-v2")
+        );
+        let scope = next.scope_101_200.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_value(&scope.diagnostic_ranges).unwrap(),
+            diagnostics
+        );
+        assert_eq!(scope.additional_tracked_units, [next.cycle_unit.clone()]);
+        assert_eq!(cfg["replays"], config["replays"]);
+        assert_eq!(
+            cfg["replays"][0]["append_log"]["inode"].as_u64(),
+            Some(u64::MAX)
+        );
+        let reread: Value = serde_json::from_slice(&encoded(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            reread["replays"][0]["append_log"]["device"].as_u64(),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(
+            serde_json::to_value(&next.additional_gate_evidence).unwrap(),
+            serde_json::to_value(&p.additional_gate_evidence).unwrap()
+        );
+        assert_eq!(
+            next.fleet_template.path.to_str(),
+            c["fleet_plan"]["path"].as_str()
+        );
+    }
+
+    #[test]
+    fn successor_101_requires_prior_observational_additions_in_accepted_template() {
+        let (p, _, _, _) = fixture_101();
+        assert!(validate_folded_scope(&p, &json!({"tracked_units":[]})).is_err());
+        validate_folded_scope(
+            &p,
+            &json!({"tracked_units":["horizon-old-observational-helper.service"]}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn successor_101_rejects_foreign_namespaces_and_profile_scope_mismatch() {
+        let (mut p, pb, mut c, mut config) = fixture_101();
+        p.observer_config.path =
+            "/var/lib/jetstreamer/horizon-next-observer-20261021T083800Z-v204/observer.json".into();
+        assert!(
+            derive_next(&p, &pb, &c, &config)
+                .unwrap_err()
+                .to_string()
+                .contains("101observer/config")
+        );
+        let (mut p, _, _, _) = fixture_101();
+        p.observer =
+            Path::new(OBSERVERS).join("horizon-live-resource-sample-20261021T083800Z-v204.json");
+        c["observer"]["path"] = json!(p.observer);
+        config["output"] = json!(p.observer);
+        assert!(
+            derive_next(&p, &pb, &c, &config)
+                .unwrap_err()
+                .to_string()
+                .contains("101observer/config")
+        );
+        let (mut p, _, c, config) = fixture_101();
+        p.scope_101_200 = None;
+        assert!(derive_next(&p, &pb, &c, &config).is_err());
+    }
+
+    #[test]
+    fn successor_101_accepts_its_prepared_namespace_but_never_out_of_band_reason() {
+        let (mut p, pb, c, config) = fixture_101();
+        p.observer_config.path =
+            "/var/lib/jetstreamer/horizon-next-observer-101-200-20261021T083800Z-v2/observer.json"
+                .into();
+        derive_next(&p, &pb, &c, &config).unwrap();
+        let mut wrong = config;
+        wrong["observation_reason"] = json!("user-requested-status");
+        assert!(derive_next(&p, &pb, &c, &wrong).is_err());
     }
     #[test]
     fn successor_is_exact_thirty_minute_immutable_binding_without_changing_gates() {

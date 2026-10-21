@@ -25795,11 +25795,25 @@ mod early_snapshot_tests {
         let process_group = i32::try_from(leader.id().unwrap()).unwrap();
         let mut cleanup = ProcessGroupCleanup(process_group);
 
+        #[cfg(target_os = "linux")]
+        let descendant_executable = fs::canonicalize("/bin/sleep").unwrap();
         let descendant_pid = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let Ok(contents) = fs::read_to_string(&descendant_pid_path)
                     && let Ok(pid) = contents.trim().parse::<i32>()
                 {
+                    // Publishing $! proves fork, not exec. A signal delivered
+                    // while the background child still has the shell's TERM
+                    // disposition can race its exec and leave sleep running
+                    // until the production forced-kill grace period. Wait for
+                    // the actual target before exercising graceful shutdown.
+                    #[cfg(target_os = "linux")]
+                    if fs::read_link(format!("/proc/{pid}/exe")).ok().as_ref()
+                        != Some(&descendant_executable)
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
                     break pid;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
