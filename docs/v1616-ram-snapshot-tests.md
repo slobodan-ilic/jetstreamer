@@ -52,6 +52,14 @@ An error path also reaps that owned group. Existing producers, controllers and
 guards are never signaled. This diagnostic safety guard is not another replay
 observation loop; the campaign keeps its single 30-minute cadence.
 
+Capture this diagnostic's own cgroup CPU, memory events/statistics/peak,
+pressure and I/O counters before the child and before the supervisor exits.
+Store raw bounded counter contents in the intent/result and a best-effort
+pre-kill snapshot in any stop intent. Terminal capture failure preserves the
+actual child outcome but fails qualification closed. Do not infer memory
+throttling from a peak alone: terminal cgroups can disappear before external
+inspection. This capture never samples or changes another replay's cgroup.
+
 A successful child exit, unchanged input identities and no guard trip produce
 a private result, never a publication receipt. Preserve a failing invocation
 and its journal/intent; OOM or sandbox failure is not canonical divergence and

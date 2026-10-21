@@ -29,6 +29,20 @@ const SNAPSHOT_SHA: &str = "348cba573c9e737e77c512d2c7ceda7bc81db61be6f4dc02838d
 const GENESIS_SHA: &str = "133f7eaefcd59466f3b291aadd1b0d3522432072cf5b539445218c6c125ea945";
 const TEST_SHA: &str = "bfa7aadf5be9d895747b379c18354ecc312e50ba895341a5e46a21a6a085fd64";
 const FILTER: &str = "_v1_6_16_boundary_snapshot";
+const RESOURCE_FILES: [&str; 12] = [
+    "cpu.stat",
+    "cpu.max",
+    "cpu.pressure",
+    "memory.current",
+    "memory.peak",
+    "memory.high",
+    "memory.max",
+    "memory.events",
+    "memory.stat",
+    "memory.pressure",
+    "io.stat",
+    "io.pressure",
+];
 const TEST_NAMES: [&str; 2] = [
     "runtime::tests::initializes_and_checkpoints_v1_6_16_boundary_snapshot: test",
     "snapshot::tests::loads_and_verifies_v1_6_16_boundary_snapshot: test",
@@ -213,6 +227,27 @@ fn memory_available(text: &str) -> Result<u64> {
 }
 fn host_memory() -> Result<u64> {
     memory_available(&fs::read_to_string("/proc/meminfo")?)
+}
+fn resource_counters_at(cgroup: &Path) -> Result<Value> {
+    let mut counters = serde_json::Map::new();
+    for name in RESOURCE_FILES {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(cgroup.join(name))?;
+        let mut bytes = Vec::new();
+        file.take(65_537).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 65_536, "oversized cgroup counter {name}");
+        counters.insert(name.into(), json!(String::from_utf8(bytes)?));
+    }
+    Ok(Value::Object(counters))
+}
+fn resource_snapshot(p: &Plan) -> Result<Value> {
+    ensure!(
+        fs::read_to_string("/proc/self/cgroup")?.trim() == format!("0::/system.slice/{}", p.unit),
+        "foreign resource-counter cgroup"
+    );
+    resource_counters_at(&Path::new("/sys/fs/cgroup/system.slice").join(&p.unit))
 }
 fn ram_geometry() -> Result<u64> {
     let mut s: libc::statfs = unsafe { std::mem::zeroed() };
@@ -642,10 +677,11 @@ fn execute(p: &Plan, plan_hash: &str, self_hash: &str) -> Result<()> {
         host_memory()? >= START_MEMORY,
         "post-hash memory admission failed"
     );
+    let resources_before = resource_snapshot(p)?;
     write_new(
         &p.receipt_directory,
         "intent.json",
-        &json!({"schema":"jetstreamer-private-v1616-ram-snapshot-intent-v1","invocation_id":inv,"plan_sha256":plan_hash,"self_sha256":self_hash,"test_sha256":TEST_SHA,"snapshot_sha256":SNAPSHOT_SHA,"genesis_sha256":GENESIS_SHA,"maximum_memory_bytes":MEMORY_MAX,"tmpfs_bytes":TMPFS_SIZE,"entry_replay":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false}),
+        &json!({"schema":"jetstreamer-private-v1616-ram-snapshot-intent-v1","invocation_id":inv,"plan_sha256":plan_hash,"self_sha256":self_hash,"test_sha256":TEST_SHA,"snapshot_sha256":SNAPSHOT_SHA,"genesis_sha256":GENESIS_SHA,"maximum_memory_bytes":MEMORY_MAX,"tmpfs_bytes":TMPFS_SIZE,"resources_before":resources_before,"entry_replay":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false}),
     )?;
     unsafe {
         libc::signal(libc::SIGTERM, signal as *const () as libc::sighandler_t);
@@ -696,7 +732,7 @@ fn execute(p: &Plan, plan_hash: &str, self_hash: &str) -> Result<()> {
                 write_new(
                     &p.receipt_directory,
                     "stop-intent.json",
-                    &json!({"invocation_id":inv,"child_pid":child.0.id(),"reason":reason,"memory_available_bytes":memory,"tmpfs_free_bytes":free,"producer_signals_sent":false}),
+                    &json!({"invocation_id":inv,"child_pid":child.0.id(),"reason":reason,"memory_available_bytes":memory,"tmpfs_free_bytes":free,"cgroup_resources":resource_snapshot(p).ok(),"producer_signals_sent":false}),
                 )?;
                 ensure!(
                     unsafe { libc::kill(-(child.0.id() as i32), libc::SIGKILL) } == 0,
@@ -714,6 +750,9 @@ fn execute(p: &Plan, plan_hash: &str, self_hash: &str) -> Result<()> {
     if SIGNAL.load(Ordering::SeqCst) != 0 {
         trip.get_or_insert("external-signal");
     }
+    // Capture before this supervisor exits: systemd may remove the cgroup
+    // immediately afterwards. Preserve test failure even if telemetry fails.
+    let resources_after = resource_snapshot(p);
     for (path, m) in [
         (&p.test_binary.path, &test),
         (&p.snapshot.path, &snapshot),
@@ -727,8 +766,9 @@ fn execute(p: &Plan, plan_hash: &str, self_hash: &str) -> Result<()> {
     write_new(
         &p.receipt_directory,
         "result.json",
-        &json!({"schema":"jetstreamer-private-v1616-ram-snapshot-result-v1","invocation_id":inv,"plan_sha256":plan_hash,"self_sha256":self_hash,"test_sha256":TEST_SHA,"snapshot_sha256":SNAPSHOT_SHA,"genesis_sha256":GENESIS_SHA,"elapsed_millis":started.elapsed().as_millis(),"child_exit_code":status.code(),"child_success":status.success(),"trip":trip,"exact_ignored_test_count":2,"entry_replay":false,"full_peak_qualified":false,"runtime_promotion_authorized":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false}),
+        &json!({"schema":"jetstreamer-private-v1616-ram-snapshot-result-v1","invocation_id":inv,"plan_sha256":plan_hash,"self_sha256":self_hash,"test_sha256":TEST_SHA,"snapshot_sha256":SNAPSHOT_SHA,"genesis_sha256":GENESIS_SHA,"elapsed_millis":started.elapsed().as_millis(),"child_exit_code":status.code(),"child_success":status.success(),"trip":trip,"resources_before":resources_before,"resources_after":resources_after.as_ref().ok(),"resource_capture_error":resources_after.as_ref().err().map(|e|format!("{e:#}")),"exact_ignored_test_count":2,"entry_replay":false,"full_peak_qualified":false,"runtime_promotion_authorized":false,"publication_authorized":false,"remote_mutations":false,"r2_mutations":false}),
     )?;
+    resources_after?;
     ensure!(
         status.success() && trip.is_none(),
         "snapshot tests failed or resource guard tripped"
@@ -788,6 +828,32 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_resources_preserve_exact_kernel_counters_and_require_all_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in RESOURCE_FILES {
+            fs::write(dir.path().join(name), "high 123\noom 0\n").unwrap();
+        }
+        let counters = resource_counters_at(dir.path()).unwrap();
+        assert_eq!(counters.as_object().unwrap().len(), RESOURCE_FILES.len());
+        assert_eq!(counters["memory.events"], "high 123\noom 0\n");
+        fs::remove_file(dir.path().join("cpu.stat")).unwrap();
+        assert!(resource_counters_at(dir.path()).is_err());
+    }
+
+    #[test]
+    fn resource_capture_rejects_symlinks_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in RESOURCE_FILES {
+            fs::write(dir.path().join(name), "0\n").unwrap();
+        }
+        fs::write(dir.path().join("memory.stat"), vec![b'x'; 65_537]).unwrap();
+        assert!(resource_counters_at(dir.path()).is_err());
+        fs::remove_file(dir.path().join("memory.stat")).unwrap();
+        std::os::unix::fs::symlink("memory.events", dir.path().join("memory.stat")).unwrap();
+        assert!(resource_counters_at(dir.path()).is_err());
+    }
     #[test]
     fn plan_cannot_change_fixture_scope_or_grant_another_mode() {
         let value = json!({"schema":"jetstreamer-private-v1616-ram-snapshot-test-plan-v1","mode":"capability",
