@@ -287,3 +287,15 @@ RAM entry-replay or sandbox qualification. Integrate and seal the component,
 qualify actual worker/group behavior plus the complete fresh fleet/census and
 artifact lifecycle, and prove a real sandboxed guard fire before any launch is
 left unattended. Keep healthy jobs and deployed guards unchanged.
+
+The sandbox authenticator is also exported from that library for the future
+supervisor. `authenticate_replay` accepts only the replay-specific unit scope,
+an exact runner unit/root match and a compile-selected phase. Before preparation
+all mutable child directories must be empty; before spawn only the independently
+hash-checked mainnet genesis may exist in the ledger, with output/scratch/tmp/
+receipts still empty. This check must precede the guard's start receipt and any
+admission-intent write. The original probe CLI retains its narrower probe-only
+unit scope and all-empty-directory contract. Neither API accepts a JSON flag to
+relax the phase. Both pin the RAM root inode/device and actual namespace mount
+through their checks. The new replay phase has only component tests so far;
+it requires its own exact sealed supervisor capability proof before launch.

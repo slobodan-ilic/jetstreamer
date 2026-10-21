@@ -53,12 +53,16 @@ fn unit_name(s: &str, suffix: &str) -> bool {
 }
 
 fn validate_plan(p: &Plan) -> Result<()> {
+    validate_plan_scope(p, SERVICE_PREFIX)
+}
+
+fn validate_plan_scope(p: &Plan, prefix: &str) -> Result<()> {
     ensure!(
         p.schema == "jetstreamer-private-epoch203-ram-storage-probe-plan-v2",
         "wrong plan schema"
     );
     ensure!(
-        p.unit.starts_with(SERVICE_PREFIX) && unit_name(&p.unit, ".service"),
+        p.unit.starts_with(prefix) && unit_name(&p.unit, ".service"),
         "wrong probe unit"
     );
     ensure!(
@@ -348,6 +352,10 @@ fn show(unit: &str, props: &str) -> Result<String> {
 }
 
 fn bounded_text(path: &Path, limit: u64) -> Result<String> {
+    Ok(String::from_utf8(bounded_text_bytes(path, limit)?)?)
+}
+
+fn bounded_text_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     OpenOptions::new()
         .read(true)
@@ -356,7 +364,21 @@ fn bounded_text(path: &Path, limit: u64) -> Result<String> {
         .take(limit + 1)
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= limit, "oversized kernel evidence");
-    Ok(String::from_utf8(bytes)?)
+    Ok(bytes)
+}
+
+fn same_metadata(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev()
+        && a.ino() == b.ino()
+        && a.len() == b.len()
+        && a.mode() == b.mode()
+        && a.uid() == b.uid()
+        && a.gid() == b.gid()
+        && a.nlink() == b.nlink()
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+        && a.ctime() == b.ctime()
+        && a.ctime_nsec() == b.ctime_nsec()
 }
 
 fn directory(root: &Path) -> Result<u64> {
@@ -407,7 +429,33 @@ fn validate_process_status(status: &str) -> Result<()> {
     Ok(())
 }
 
-fn authenticate(p: &Plan) -> Result<Value> {
+/// Explicit compile-selected phases, never selected by a JSON plan field.
+#[derive(Clone, Copy)]
+pub enum ReplayPhase {
+    BeforePreparation,
+    BeforeSpawn,
+}
+
+/// Authenticate a future replay supervisor's actual persistent sandbox. This
+/// grants no CPU/fleet/resource admission and launches no child. The caller
+/// must have verified the hash-bound outer plan before passing these bytes.
+pub fn authenticate_replay(
+    bytes: &[u8],
+    unit: &str,
+    root: &Path,
+    phase: ReplayPhase,
+) -> Result<Value> {
+    ensure!(bytes.len() <= 65536, "oversized sandbox input");
+    let p: Plan = serde_json::from_slice(bytes)?;
+    validate_plan_scope(&p, "horizon-203-ram-resource-")?;
+    ensure!(
+        p.unit == unit && p.run_root == root,
+        "sandbox differs from bounded runner"
+    );
+    authenticate(&p, Some(phase))
+}
+
+fn authenticate(p: &Plan, phase: Option<ReplayPhase>) -> Result<Value> {
     ensure!(
         unsafe { libc::geteuid() } == 1000 && unsafe { libc::getegid() } == 1000,
         "probe must run as the unprivileged replay identity"
@@ -434,6 +482,7 @@ fn authenticate(p: &Plan) -> Result<Value> {
     )?;
     let [major, minor] = p.mount_device;
     let dev = directory(&p.run_root)?;
+    let root_inode = fs::symlink_metadata(&p.run_root)?.ino();
     ensure!(
         u64::from(libc::major(dev)) == major && u64::from(libc::minor(dev)) == minor,
         "RAM directory device does not match mount"
@@ -448,9 +497,54 @@ fn authenticate(p: &Plan) -> Result<Value> {
     for name in ["scratch", "output", "ledger", "tmp", "receipts"] {
         let path = p.run_root.join(name);
         ensure!(
-            directory(&path)? == dev && fs::read_dir(path)?.next().is_none(),
-            "RAM child directory is nonempty or on another filesystem"
+            directory(&path)? == dev,
+            "RAM child directory is on another filesystem"
         );
+        if name == "ledger" && matches!(phase, Some(ReplayPhase::BeforeSpawn)) {
+            let names: Vec<_> = fs::read_dir(&path)?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect::<std::io::Result<_>>()?;
+            ensure!(
+                names == [std::ffi::OsString::from("genesis.tar.bz2")],
+                "prepared ledger differs"
+            );
+            let genesis = path.join("genesis.tar.bz2");
+            let m = fs::symlink_metadata(&genesis)?;
+            ensure!(
+                m.is_file()
+                    && m.uid() == 1000
+                    && m.nlink() == 1
+                    && m.dev() == dev
+                    && m.mode() & 0o777 == 0o400
+                    && m.len() <= 10 << 20,
+                "unsafe copied genesis"
+            );
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&genesis)?;
+            ensure!(
+                same_metadata(&m, &file.metadata()?),
+                "copied genesis changed at open"
+            );
+            let mut bytes = Vec::new();
+            (&mut file).take((10 << 20) + 1).read_to_end(&mut bytes)?;
+            ensure!(
+                format!("{:x}", Sha256::digest(bytes))
+                    == "133f7eaefcd59466f3b291aadd1b0d3522432072cf5b539445218c6c125ea945",
+                "copied genesis differs"
+            );
+            let after = fs::symlink_metadata(&genesis)?;
+            ensure!(
+                same_metadata(&m, &after) && same_metadata(&m, &file.metadata()?),
+                "copied genesis changed"
+            );
+        } else {
+            ensure!(
+                fs::read_dir(path)?.next().is_none(),
+                "RAM child directory is nonempty"
+            );
+        }
     }
     let raw = std::ffi::CString::new(p.run_root.as_os_str().as_encoded_bytes())?;
     let mut s: libc::statfs = unsafe { std::mem::zeroed() };
@@ -483,7 +577,8 @@ fn authenticate(p: &Plan) -> Result<Value> {
     let mount_after = bounded_text(Path::new("/proc/self/mountinfo"), 4 << 20)?;
     ensure!(
         mountinfo(&mount_after, &p.run_root, p.mount_device, p.host_peer_group)? == namespace_mount
-            && directory(&p.run_root)? == dev,
+            && directory(&p.run_root)? == dev
+            && fs::symlink_metadata(&p.run_root)?.ino() == root_inode,
         "persistent mount changed during probe"
     );
     Ok(
@@ -580,7 +675,7 @@ pub fn run_probe() -> Result<()> {
     );
     let plan: Plan = serde_json::from_slice(&bound_input(Path::new(&args[0]), &args[2])?)?;
     validate_plan(&plan)?;
-    let report = authenticate(&plan)?;
+    let report = authenticate(&plan, None)?;
     let output = json!({
             "schema":"jetstreamer-private-epoch203-ram-storage-capability-v1",
             "plan_path":args[0],"plan_sha256":args[2],"self_sha256":args[4],"sandbox":report,
@@ -787,6 +882,54 @@ mod tests {
         let mut p = plan();
         p.host_mount_id = 0;
         assert!(validate_plan(&p).is_err());
+    }
+    #[test]
+    fn replay_api_scope_is_separate_from_the_probe_and_matches_the_runner() {
+        let mut p = plan();
+        p.unit = "horizon-203-ram-resource-baseline-test.service".into();
+        validate_plan_scope(&p, "horizon-203-ram-resource-").unwrap();
+        assert!(validate_plan(&p).is_err());
+        let bytes=serde_json::to_vec(&json!({"schema":p.schema,"unit":p.unit,"run_root":p.run_root,
+            "mount_unit":p.mount_unit,"mount_invocation_id":p.mount_invocation_id,"host_mount_id":p.host_mount_id,
+            "mount_device":p.mount_device,"host_peer_group":p.host_peer_group})).unwrap();
+        assert!(
+            authenticate_replay(
+                &bytes,
+                "wrong.service",
+                &p.run_root,
+                ReplayPhase::BeforePreparation
+            )
+            .is_err()
+        );
+        assert!(
+            authenticate_replay(
+                &bytes,
+                &p.unit,
+                Path::new("/unrelated"),
+                ReplayPhase::BeforeSpawn
+            )
+            .is_err()
+        );
+        assert!(
+            authenticate_replay(
+                &vec![b'x'; 65537],
+                &p.unit,
+                &p.run_root,
+                ReplayPhase::BeforePreparation
+            )
+            .is_err()
+        );
+        let mut bad: Value = serde_json::from_slice(&bytes).unwrap();
+        bad["phase"] = json!("weaken");
+        assert!(
+            authenticate_replay(
+                &serde_json::to_vec(&bad).unwrap(),
+                &p.unit,
+                &p.run_root,
+                ReplayPhase::BeforeSpawn
+            )
+            .is_err()
+        );
     }
     #[test]
     fn kernel_input_reader_is_bounded_and_does_not_follow_links() {
