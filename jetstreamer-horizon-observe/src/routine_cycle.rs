@@ -520,6 +520,54 @@ fn validate_observer_config(p: &Plan, model: &Value, config: &Value) -> Result<(
     Ok(())
 }
 
+const INCIDENT_225_SHA: &str = "fc51f75a6424fe41b0aaca503279f0e8a29a457c87c83579227c863e47101916";
+const STALE_225_ACTION_SHA: &str =
+    "31b7234d02f074a61910c8f0bd99553990af2ed24788fc5d36c07f9ed9bc78ca";
+const CORRECTED_225_ACTION: &str = "Keep epoch225 repair open after the exact reserve stop ac9aee3d47eb41e483a5e008ed43d030. The parent already reclaimed material scratch; only8192B scaffolding remains. No scratch deletion or new retirement tool is needed or authorized. Preserve the20.2GiB partial archive, immutable bootstrap/genesis, guard chain and failed unit. Qualify a fresh admissible recovery resource envelope before any restart; require natural parent success at the canonical root, independent full/current-plugin verification and separate225-only publication gates. The226diagnostic tail remains private. No automatic restart, newdiskadmission, canonicalsidecar, runtimepromotion or publication is authorized by this narrative correction.";
+
+/// Correct exactly one known stale task, not arbitrary gates or repair state.
+/// The immutable predecessor is retained and the incident stays open.
+fn correct_stale_225_action(fleet: &mut Value, evidence: &Bound, incident: &Value) -> Result<bool> {
+    if evidence.sha256 != INCIDENT_225_SHA
+        || evidence.path
+            != Path::new(
+                "/var/lib/jetstreamer/horizon-225-reserve-stop-incident-20261021-v1/incident.json",
+            )
+        || fleet["gates"]["225"]["state"] != "failed-needs-repair"
+        || fleet["gates"]["225"]["next_action"]
+            .as_str()
+            .map(|s| sha(s.as_bytes()))
+            .as_deref()
+            != Some(STALE_225_ACTION_SHA)
+    {
+        return Ok(false);
+    }
+    ensure!(
+        incident["schema"] == "jetstreamer-private-epoch225-reserve-stop-incident-v1"
+            && incident["epoch"] == 225
+            && incident["producer_invocation_id"] == "ac9aee3d47eb41e483a5e008ed43d030"
+            && incident["scratch"]["observed_physical_bytes_after_parent_exit"] == 8192
+            && incident["archive_deletion_authorized"] == false
+            && incident["scratch_deletion_authorized"] == false
+            && incident["replay_launch_authorized"] == false
+            && incident["publication_authorized"] == false
+            && incident["remote_mutations"] == false
+            && incident["r2_mutations"] == false,
+        "bound225incident does not support the non-destructive task correction"
+    );
+    fleet["gates"]["225"]["next_action"] = json!(CORRECTED_225_ACTION);
+    Ok(true)
+}
+
+fn apply_known_action_corrections(p: &Plan, fleet: &mut Value) -> Result<()> {
+    if let Some(evidence) = p.additional_gate_evidence.get("225") {
+        for e in evidence.iter().filter(|e| e.sha256 == INCIDENT_225_SHA) {
+            correct_stale_225_action(fleet, e, &bound_json(e, false)?)?;
+        }
+    }
+    Ok(())
+}
+
 fn derive(p: &Plan, model: &Value, fleet: &Value, observer: &Bound) -> Result<(Value, Value)> {
     let mut model = model.clone();
     let mut fleet = fleet.clone();
@@ -540,6 +588,7 @@ fn derive(p: &Plan, model: &Value, fleet: &Value, observer: &Bound) -> Result<(V
             }
         }
     }
+    apply_known_action_corrections(p, &mut fleet)?;
     Ok((model, fleet))
 }
 
@@ -744,6 +793,9 @@ fn execute(p: &Plan, plan_bound: &Bound, self_sha: &str, check_only: bool) -> Re
             bound_json(b, false)?;
         }
     }
+    // Validate the exact correction evidence during check-only as well; this
+    // is an in-memory preview, not a new fleet receipt or resource poll.
+    apply_known_action_corrections(p, &mut fleet.clone())?;
     private_dir(p.cycle_directory.parent().context("cycle parent missing")?)?;
     private_dir(
         p.estimate_output
@@ -1027,6 +1079,54 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact225scratch_task_correction_preserves_all_gates_and_open_repair() {
+        use super::*;
+        let old = "Reserve guard stopped exact ac9aee3d47eb41e483a5e008ed43d030 at filesystem2019662348288 below protected2019796866159 on2026-10-21T02:31:42Z; terminalexit1 at02:32:04. EOF followed guardSIGINT and is not new canonical divergence. Lastslot97274295; partial20.2GiB archive and retainedinputs preserved. Keeprepair open. Bind guardstopchain and source-review cursor-free bootstrap restart; qualify exact natural225 scratch retirement profile before cleanup. No existing generic/epoch213/singleton profile authorizes this layout. No automatic restart, newdiskadmission,canonicalsidecar,promotionorpublication; natural-parent0/fullspan never reached.";
+        assert_eq!(sha(old.as_bytes()), STALE_225_ACTION_SHA);
+        let evidence = Bound {
+            path:
+                "/var/lib/jetstreamer/horizon-225-reserve-stop-incident-20261021-v1/incident.json"
+                    .into(),
+            sha256: INCIDENT_225_SHA.into(),
+        };
+        let incident = json!({"schema":"jetstreamer-private-epoch225-reserve-stop-incident-v1","epoch":225,
+            "producer_invocation_id":"ac9aee3d47eb41e483a5e008ed43d030",
+            "scratch":{"observed_physical_bytes_after_parent_exit":8192},"archive_deletion_authorized":false,
+            "scratch_deletion_authorized":false,"replay_launch_authorized":false,"publication_authorized":false,
+            "remote_mutations":false,"r2_mutations":false});
+        let original = json!({"gates":{"203":{"state":"blocked-qualification"},"225":{
+            "state":"failed-needs-repair","next_action":old,"evidence":[{"sha256":INCIDENT_225_SHA}]}},
+            "tracked_units":["preserved-failed-unit"],"diagnostics":[{"epoch":203}],"first_epoch":201,"last_epoch":300});
+        let mut corrected = original.clone();
+        assert!(correct_stale_225_action(&mut corrected, &evidence, &incident).unwrap());
+        let mut expected = original.clone();
+        expected["gates"]["225"]["next_action"] = json!(CORRECTED_225_ACTION);
+        assert_eq!(corrected, expected);
+        assert!(!correct_stale_225_action(&mut corrected, &evidence, &incident).unwrap());
+        for (key, value) in [
+            ("epoch", json!(226)),
+            ("producer_invocation_id", json!("foreign")),
+            ("scratch_deletion_authorized", json!(true)),
+            ("replay_launch_authorized", json!(true)),
+        ] {
+            let mut bad = incident.clone();
+            bad[key] = value;
+            let mut fleet = original.clone();
+            assert!(correct_stale_225_action(&mut fleet, &evidence, &bad).is_err());
+            assert_eq!(fleet, original);
+        }
+        for (key, value) in [
+            ("state", json!("remote-ready")),
+            ("next_action", json!("newer reviewed action")),
+        ] {
+            let mut fleet = original.clone();
+            fleet["gates"]["225"][key] = value;
+            let before = fleet.clone();
+            assert!(!correct_stale_225_action(&mut fleet, &evidence, &incident).unwrap());
+            assert_eq!(fleet, before);
+        }
+    }
     use super::*;
 
     #[test]

@@ -1,6 +1,6 @@
 //! Authentication of the future RAM replay sandbox, never admission.
 //! Writes only one no-clobber private capability metadata receipt.
-mod ram_replay_sandbox;
+use jetstreamer_horizon_observe::ram_replay_sandbox;
 
 fn main() {
     if let Err(e) = ram_replay_sandbox::run_probe() {

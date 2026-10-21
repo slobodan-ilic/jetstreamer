@@ -20,6 +20,17 @@ history. Added repair evidence is append-only. A changed epoch boundary, produce
 handoff, user-requested observation, new admission or newer fleet requires a
 reviewed replacement plan; it never invents an ETA or relabels a phase.
 
+One narrowly pinned narrative correction is permitted: when the exact retained
+epoch225 reserve-stop incident (`fc51f75a…`) is supplied as added gate evidence,
+the exact old next-action digest (`31b7234d…`) in `failed-needs-repair` is replaced
+with the evidence-backed instruction that the parent already reclaimed material
+scratch and no deletion tool is needed. The incident must deny deletion, replay
+and publication, and bind the original producer plus8192B scaffolding. Only that
+text changes; state, evidence, tracked units, diagnostics, admission and integrity
+gates remain untouched. A newer action or state is never overwritten. Immutable
+prior fleets remain history. Check-only validates the same correction evidence
+in memory; it does not write a new fleet or take another resource observation.
+
 The helper claims a unique private cycle directory, fsyncs an intent, authors
 and seals the updated model and fleet plan through the Rust deployment sealer,
 delegates ETA calculation, publishes every exact status through the existing
