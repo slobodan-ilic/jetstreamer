@@ -20,6 +20,231 @@ fn writer_defaults_to_measured_archival_zstd_level() {
 }
 
 #[test]
+fn transaction_decode_reuse_preserves_every_field_across_presence_transitions() {
+    std::thread::Builder::new()
+        .stack_size(128 * 1024 * 1024)
+        .spawn(transaction_decode_reuse_presence_transitions_inner)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn transaction_decode_reuse_presence_transitions_inner() {
+    use crate::transactions::{
+        InnerInstruction, LogMessages, ReturnData, Reward, TransactionTokenBalance,
+    };
+    use crate::zero_vec::ZeroVec;
+
+    struct ExactTransactions {
+        expected: Vec<Vec<u8>>,
+        seen: usize,
+        digest: SemanticDigest,
+    }
+    impl SlotVisitor for ExactTransactions {
+        fn on_transaction(&mut self, slot: u64, index: u32, tx: &Transaction) {
+            let mut actual = Vec::new();
+            tx.encode_ext(&mut actual, None).unwrap();
+            assert_eq!(
+                actual, self.expected[self.seen],
+                "transaction {}",
+                self.seen
+            );
+            self.digest.on_transaction(slot, index, tx);
+            self.seen += 1;
+        }
+    }
+
+    for format in [ArchiveVersion::V1, ArchiveVersion::V2] {
+        let mut writer = ArchiveWriter::new(
+            Vec::new(),
+            0,
+            0,
+            4,
+            ArchiveWriterConfig {
+                format,
+                bucket_slots: 2,
+                compression: Compression::None,
+                diff_policy: lencode::diff::DiffPolicy::Adaptive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        let mut expected_digest = SemanticDigest::new();
+        let mut tx = Transaction::new_boxed();
+        let mut block = BlockMeta::new_boxed();
+        for slot in 0..4 {
+            writer.begin_slot(slot).unwrap();
+            // Some(populated) -> Some(different) -> Some(empty) -> None ->
+            // Some(populated) -> entirely empty. Repeat across slot/bucket resets.
+            for shape in 0u8..6 {
+                tx.clear();
+                if shape != 5 {
+                    tx.fee = u64::MAX - slot - u64::from(shape);
+                    tx.signatures.push(Signature::from([shape + 1; 64]));
+                    let message = tx.message.force_legacy_mut();
+                    message.header.num_required_signatures = 1;
+                    message
+                        .account_keys
+                        .push(Address::new_from_array([shape; 32]));
+                    message.recent_blockhash = Hash::new_from_array([shape + 2; 32]);
+                    if shape == 1 {
+                        let message = tx.message.force_v0_mut();
+                        message.header.num_required_signatures = 2;
+                        message.account_keys.push(Address::new_from_array([7; 32]));
+                    }
+                    tx.pre_balances.push(u64::MAX - 10);
+                    tx.post_balances.push(u64::from(shape));
+                    tx.loaded_writable_addresses
+                        .push(Address::new_from_array([3; 32]));
+                    tx.loaded_readonly_addresses
+                        .push(Address::new_from_array([4; 32]));
+                    tx.status.error_code = u16::from(shape);
+                    tx.status.instruction_index = shape;
+                    tx.status.custom_error_code = u32::from(shape) + 100;
+                    tx.status.error_message.extend_from_slice(&[shape; 7]);
+                    if shape != 3 {
+                        let logs = tx.log_messages.get_or_insert_with(LogMessages::default);
+                        tx.pre_token_balances = Some(ZeroVec::new());
+                        tx.post_token_balances = Some(ZeroVec::new());
+                        tx.rewards = Some(ZeroVec::new());
+                        let inner = tx.inner_instructions.get_or_insert();
+                        tx.return_data = Some(ReturnData::default());
+                        tx.compute_units_consumed = Some(u64::from(shape));
+                        tx.cost_units = Some(u64::MAX - u64::from(shape));
+                        if shape != 2 {
+                            logs.push(&[b'a' + shape; 19]).unwrap();
+                            logs.push(b"").unwrap();
+                            let token = TransactionTokenBalance {
+                                account_index: shape,
+                                mint: Address::new_from_array([shape; 32]),
+                                ..Default::default()
+                            };
+                            tx.pre_token_balances.as_mut().unwrap().push(token.clone());
+                            tx.post_token_balances.as_mut().unwrap().push(token);
+                            tx.rewards.as_mut().unwrap().push(Reward {
+                                lamports: -i64::from(shape),
+                                post_balance: u64::MAX,
+                                ..Default::default()
+                            });
+                            inner.push(InnerInstruction {
+                                outer_index: shape,
+                                stack_height: Some(u32::from(shape)),
+                                ..Default::default()
+                            });
+                            let data = tx.return_data.as_mut().unwrap();
+                            data.program_id = Address::new_from_array([shape + 9; 32]);
+                            data.data.extend_from_slice(&[shape; 11]);
+                        }
+                    }
+                    // Different record counts and payload lengths must not retain
+                    // writes from either the preceding transaction or bucket.
+                    for index in 0..shape % 3 {
+                        tx.push_account_update(&AccountUpdateView {
+                            pubkey: Address::new_from_array([index; 32]),
+                            lamports: u64::from(shape),
+                            owner: Address::new_from_array([8; 32]),
+                            executable: index == 1,
+                            rent_epoch: u64::MAX,
+                            write_version: u64::MAX - slot * 32 - u64::from(index),
+                            data: &[shape; 23],
+                        })
+                        .unwrap();
+                    }
+                }
+                let mut bytes = Vec::new();
+                tx.encode_ext(&mut bytes, None).unwrap();
+                expected.push(bytes);
+                expected_digest.on_transaction(slot, u32::from(shape), &tx);
+                writer.write_transaction(&tx).unwrap();
+            }
+            block.clear();
+            block.slot = slot;
+            writer.end_slot(&block, &[]).unwrap();
+        }
+        let bytes = writer.finish().unwrap().0;
+        let mut reader = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+        let mut visitor = ExactTransactions {
+            expected,
+            seen: 0,
+            digest: SemanticDigest::new(),
+        };
+        reader.read_slots(0, u64::MAX, &mut visitor).unwrap();
+        assert_eq!(visitor.seen, 24);
+        assert_eq!(
+            visitor.digest.finish().unwrap(),
+            expected_digest.finish().unwrap()
+        );
+    }
+}
+
+#[test]
+fn transaction_decode_reuse_does_not_emit_a_truncated_record() {
+    std::thread::Builder::new()
+        .stack_size(128 * 1024 * 1024)
+        .spawn(transaction_decode_reuse_truncated_record_inner)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn transaction_decode_reuse_truncated_record_inner() {
+    use crate::transactions::LogMessages;
+
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        0,
+        0,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(0).unwrap();
+    let mut tx = Transaction::new_boxed();
+    let logs = tx.log_messages.get_or_insert_with(LogMessages::default);
+    logs.push(b"first complete record").unwrap();
+    writer.write_transaction(&tx).unwrap();
+    let marker = b"unique second record truncated inside its log bytes";
+    let logs = tx.log_messages.as_mut().unwrap();
+    logs.clear();
+    logs.push(marker).unwrap();
+    writer.write_transaction(&tx).unwrap();
+    writer.end_slot(&BlockMeta::new_boxed(), &[]).unwrap();
+    let archive = writer.finish().unwrap().0;
+    let (mut header, mut payload) = decoded_bucket_payload(bucket_frames(&archive)[0]);
+    let position = payload
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .unwrap();
+    payload.truncate(position + marker.len() / 2);
+    header.uncompressed_len = payload.len() as u64;
+    header.stored_len = payload.len() as u64;
+    header.xxh64 = xxhash_rust::xxh64::xxh64(&payload, 0);
+    let mut frame = Vec::new();
+    header.encode_ext(&mut frame, None).unwrap();
+    frame.extend_from_slice(&payload);
+
+    #[derive(Default)]
+    struct TransactionCount(usize);
+    impl SlotVisitor for TransactionCount {
+        fn on_transaction(&mut self, _slot: u64, _index: u32, _tx: &Transaction) {
+            self.0 += 1;
+        }
+    }
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+    let mut count = TransactionCount::default();
+    assert!(
+        decoder
+            .decode_bucket(&frame, 0, u64::MAX, &mut count)
+            .is_err()
+    );
+    assert_eq!(count.0, 1, "the incomplete reused scratch must not escape");
+}
+
+#[test]
 fn historical_epoch_boundary_pre_updates_cover_epoch_201_reward_burst() {
     epoch_201_pre_update_count_roundtrip(70_318);
 }

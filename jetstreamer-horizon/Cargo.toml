@@ -65,3 +65,7 @@ harness = false
 [[bench]]
 name = "notification_types"
 harness = false
+
+[[bench]]
+name = "archive_transaction_logs"
+harness = false
