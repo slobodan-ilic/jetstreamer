@@ -294,12 +294,14 @@ fn observe_checked(
             && row["r2_mutations"] == false,
         "observer auxiliary role or owner differs"
     );
-    let live = current["ActiveState"] == "active";
+    // A running Type=oneshot supervisor remains activating/start until exit.
+    // This exception belongs only to the explicit, launch-bound auxiliary role.
+    let live = current["ActiveState"] == "active" || current["ActiveState"] == "activating";
     if live {
         ensure!(
             current["Id"] == claim.unit
                 && current["InvocationID"] == claim.invocation_id
-                && current["SubState"] == "running"
+                && auxiliary_live_phase(current)
                 && current["NRestarts"] == "0"
                 && current["ExecStart"] == launch["expected_exec_start"],
             "RAM auxiliary live command or invocation changed"
@@ -318,7 +320,7 @@ fn observe_checked(
             ensure!(
                 observation[field]["unit"] == claim.unit
                     && observation[field]["invocation_id"] == claim.invocation_id
-                    && live_binding(&observation[field], current),
+                    && auxiliary_live_binding(&observation[field], current),
                 "RAM auxiliary observation binding changed"
             );
         }
@@ -359,6 +361,35 @@ fn observe_checked(
     )
 }
 
+fn auxiliary_live_phase(current: &Value) -> bool {
+    current["MainPID"]
+        .as_str()
+        .and_then(|s| s.parse::<u32>().ok())
+        .is_some_and(|pid| pid > 0)
+        && (current["ActiveState"] == "active" && current["SubState"] == "running"
+            || current["Type"] == "oneshot"
+                && current["ActiveState"] == "activating"
+                && current["SubState"] == "start")
+}
+
+fn auxiliary_live_binding(observed: &Value, current: &Value) -> bool {
+    auxiliary_live_phase(current)
+        && current["NRestarts"] == "0"
+        && observed["unit"] == current["Id"]
+        && observed["invocation_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && current["InvocationID"] == id)
+        && observed["active_state"] == current["ActiveState"]
+        && observed["sub_state"] == current["SubState"]
+        && observed["main_pid"].as_u64().is_some_and(|pid| {
+            current["MainPID"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                == Some(pid)
+        })
+        && observed["restarts"] == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,7 +426,7 @@ mod tests {
             "ActiveState":"active","SubState":"running","NRestarts":"0",
             "ExecStart":launch["expected_exec_start"],"MainPID":"123"});
         let binding = json!({"unit":claim.unit,"invocation_id":claim.invocation_id,
-            "active_state":"active","restarts":0});
+            "active_state":"active","sub_state":"running","main_pid":123,"restarts":0});
         let observer = json!({"recorded_at_utc":"2026-10-21T05:29:36Z",
             "epoch203_ram_auxiliary":[{"range":"203-203","producer_unit":claim.unit,
                 "expected_producer_invocation_id":claim.invocation_id,"scratch_path":claim.run_root.join("scratch"),
@@ -520,6 +551,63 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn actual_oneshot_phase_is_live_only_for_exact_running_auxiliary_binding() {
+        let (claim, launch, mut observer, mut unit, active) = fixture();
+        unit["Type"] = json!("oneshot");
+        unit["ActiveState"] = json!("activating");
+        unit["SubState"] = json!("start");
+        for field in [
+            "controller_before",
+            "controller_after",
+            "producer_before",
+            "producer_after",
+        ] {
+            let binding = &mut observer["epoch203_ram_auxiliary"][0]["observation"][field];
+            binding["active_state"] = json!("activating");
+            binding["sub_state"] = json!("start");
+        }
+        let result =
+            observe_checked(&claim, &launch, &observer, &unit, &active, || Ok(())).unwrap();
+        assert_eq!(result["live"], true);
+        // Do not generalize the primary active/running gate.
+        assert!(!live_binding(
+            &observer["epoch203_ram_auxiliary"][0]["observation"]["producer_after"],
+            &unit
+        ));
+        for (field, value) in [
+            ("Type", "simple"),
+            ("SubState", "start-pre"),
+            ("SubState", "start-post"),
+            ("SubState", "exited"),
+            ("MainPID", "0"),
+            ("MainPID", "124"),
+            ("MainPID", "unreadable"),
+            ("NRestarts", "1"),
+            ("InvocationID", "replacement"),
+        ] {
+            let mut wrong = unit.clone();
+            wrong[field] = json!(value);
+            assert!(
+                observe_checked(&claim, &launch, &observer, &wrong, &active, || Ok(())).is_err(),
+                "{field}={value}"
+            );
+        }
+        for field in [
+            "controller_before",
+            "controller_after",
+            "producer_before",
+            "producer_after",
+        ] {
+            let mut wrong = observer.clone();
+            wrong["epoch203_ram_auxiliary"][0]["observation"][field]["main_pid"] = json!(124);
+            assert!(
+                observe_checked(&claim, &launch, &wrong, &unit, &active, || Ok(())).is_err(),
+                "{field}"
+            );
+        }
     }
 
     #[test]

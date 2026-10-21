@@ -674,7 +674,7 @@ fn systemctl_properties(unit: &str) -> Result<BTreeMap<String, String>> {
             .args([
                 "show",
                 unit,
-                "--property=Id,LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,MemoryCurrent,MemoryPeak,ControlGroup",
+                "--property=Id,LoadState,Type,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,MemoryCurrent,MemoryPeak,ControlGroup",
             ])
             .output()
             .with_context(|| format!("failed to run systemctl for {unit}"))?;
@@ -1115,7 +1115,36 @@ fn cross_sample_observation(
     }))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayRole {
+    Primary,
+    PrivateRamAuxiliary,
+}
+
+fn accepted_unit_phase(
+    active: &str,
+    sub: &str,
+    service_type: &str,
+    pid: u64,
+    role: ReplayRole,
+) -> bool {
+    (role == ReplayRole::Primary || pid > 0)
+        && ((active == "active" && sub == "running")
+            || (role == ReplayRole::PrivateRamAuxiliary
+                && service_type == "oneshot"
+                && active == "activating"
+                && sub == "start"))
+}
+
 fn observe_unit(unit: &str, expected_invocation: &str) -> Result<UnitObservation> {
+    observe_unit_for_role(unit, expected_invocation, ReplayRole::Primary)
+}
+
+fn observe_unit_for_role(
+    unit: &str,
+    expected_invocation: &str,
+    role: ReplayRole,
+) -> Result<UnitObservation> {
     let properties = systemctl_properties(unit)?;
     let control_group = PathBuf::from(required_property(&properties, "ControlGroup", unit)?);
     let cgroup = observe_cgroup(
@@ -1138,8 +1167,16 @@ fn observe_unit(unit: &str, expected_invocation: &str) -> Result<UnitObservation
         cgroup,
     };
     ensure!(observation.load_state == "loaded", "{unit} is not loaded");
-    ensure!(observation.active_state == "active", "{unit} is not active");
-    ensure!(observation.sub_state == "running", "{unit} is not running");
+    ensure!(
+        accepted_unit_phase(
+            &observation.active_state,
+            &observation.sub_state,
+            required_property(&properties, "Type", unit)?,
+            observation.main_pid,
+            role,
+        ),
+        "{unit} is not in the permitted live phase"
+    );
     ensure!(observation.restarts == 0, "{unit} has restarted");
     ensure!(
         observation.invocation_id == expected_invocation,
@@ -1333,6 +1370,14 @@ fn vm_max_map_count() -> Result<u64> {
 }
 
 fn stable_unit(before: &UnitObservation, after: &UnitObservation) -> bool {
+    stable_unit_for_role(before, after, ReplayRole::Primary)
+}
+
+fn stable_unit_for_role(
+    before: &UnitObservation,
+    after: &UnitObservation,
+    role: ReplayRole,
+) -> bool {
     before.invocation_id == after.invocation_id
         && before.control_group == after.control_group
         && before.cgroup.path == after.cgroup.path
@@ -1340,8 +1385,21 @@ fn stable_unit(before: &UnitObservation, after: &UnitObservation) -> bool {
         && before.restarts == 0
         && after.restarts == 0
         && after.load_state == "loaded"
-        && after.active_state == "active"
-        && after.sub_state == "running"
+        && (role == ReplayRole::Primary
+            || before.main_pid > 0
+                && before.main_pid == after.main_pid
+                && before.active_state == after.active_state
+                && before.sub_state == after.sub_state)
+        // Both captures independently authenticate Type=oneshot before accepting
+        // the private role's activating/start phase. No primary gate changes.
+        && (after.active_state == "active" && after.sub_state == "running"
+            || role == ReplayRole::PrivateRamAuxiliary
+                && before.active_state == "activating"
+                && after.active_state == "activating"
+                && before.sub_state == "start"
+                && after.sub_state == "start"
+                && before.main_pid > 0
+                && before.main_pid == after.main_pid)
 }
 
 fn stable_worker(before: &WorkerObservation, after: &WorkerObservation) -> bool {
@@ -1546,24 +1604,44 @@ fn observe_replay(
     started_unix: u64,
     progress_since_unix: u64,
 ) -> Result<ReplayObservation> {
-    let controller_before = observe_unit(
+    observe_replay_for_role(
+        replay,
+        previous_value,
+        started_unix,
+        progress_since_unix,
+        ReplayRole::Primary,
+    )
+}
+
+fn observe_replay_for_role(
+    replay: &ReplayConfig,
+    previous_value: &Value,
+    started_unix: u64,
+    progress_since_unix: u64,
+    role: ReplayRole,
+) -> Result<ReplayObservation> {
+    let controller_before = observe_unit_for_role(
         &replay.controller_unit,
         &replay.expected_controller_invocation_id,
+        role,
     )?;
-    let producer_before = observe_unit(
+    let producer_before = observe_unit_for_role(
         &replay.producer_unit,
         &replay.expected_producer_invocation_id,
+        role,
     )?;
     let worker_before = observe_worker(&replay.scratch_path, &replay.worker_executable_basename)?;
     let scratch_pass_1 = scan_scratch(&replay.scratch_path)?;
     let scratch_pass_2 = scan_scratch(&replay.scratch_path)?;
-    let controller_after = observe_unit(
+    let controller_after = observe_unit_for_role(
         &replay.controller_unit,
         &replay.expected_controller_invocation_id,
+        role,
     )?;
-    let producer_after = observe_unit(
+    let producer_after = observe_unit_for_role(
         &replay.producer_unit,
         &replay.expected_producer_invocation_id,
+        role,
     )?;
     let worker_after = observe_worker(&replay.scratch_path, &replay.worker_executable_basename)?;
     let producer_cgroup_counter_delta = counter_deltas(
@@ -1594,9 +1672,10 @@ fn observe_replay(
         conservative_observed_physical_bytes,
         &useful_work,
     )?;
-    let invocation_binding_stable = stable_unit(&controller_before, &controller_after)
-        && stable_unit(&producer_before, &producer_after)
-        && stable_worker(&worker_before, &worker_after);
+    let invocation_binding_stable =
+        stable_unit_for_role(&controller_before, &controller_after, role)
+            && stable_unit_for_role(&producer_before, &producer_after, role)
+            && stable_worker(&worker_before, &worker_after);
     ensure!(
         invocation_binding_stable,
         "{} invocation or worker changed during observation",
@@ -1744,8 +1823,13 @@ fn run(config: Config) -> Result<()> {
             &previous_value,
             "epoch203_ram_auxiliary",
             |replay, previous| {
-                let observation =
-                    observe_replay(replay, previous, started_unix, progress_since_unix)?;
+                let observation = observe_replay_for_role(
+                    replay,
+                    previous,
+                    started_unix,
+                    progress_since_unix,
+                    ReplayRole::PrivateRamAuxiliary,
+                )?;
                 for worker in [&observation.worker_before, &observation.worker_after] {
                     let bytes =
                         read_bounded(&worker.executable, 256 << 20, "RAM auxiliary worker")?;
@@ -1851,6 +1935,94 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oneshot_start_is_explicit_private_auxiliary_only() {
+        use ReplayRole::{Primary, PrivateRamAuxiliary};
+        assert!(accepted_unit_phase(
+            "activating",
+            "start",
+            "oneshot",
+            42,
+            PrivateRamAuxiliary
+        ));
+        assert!(!accepted_unit_phase(
+            "activating",
+            "start",
+            "oneshot",
+            42,
+            Primary
+        ));
+        assert!(accepted_unit_phase(
+            "active", "running", "simple", 42, Primary
+        ));
+        for (active, sub, ty, pid) in [
+            ("activating", "start", "simple", 42),
+            ("activating", "start-pre", "oneshot", 42),
+            ("activating", "start-post", "oneshot", 42),
+            ("activating", "start", "oneshot", 0),
+            ("active", "exited", "oneshot", 0),
+            ("active", "running", "simple", 0),
+            ("deactivating", "stop", "oneshot", 42),
+        ] {
+            assert!(!accepted_unit_phase(
+                active,
+                sub,
+                ty,
+                pid,
+                PrivateRamAuxiliary
+            ));
+        }
+    }
+
+    #[test]
+    fn private_oneshot_stability_requires_same_pid_phase_identity_and_cgroup() {
+        let before = UnitObservation {
+            unit: "horizon-203-ram-resource-baseline-test.service".into(),
+            invocation_id: "a".repeat(32),
+            load_state: "loaded".into(),
+            active_state: "activating".into(),
+            sub_state: "start".into(),
+            result: "success".into(),
+            restarts: 0,
+            main_pid: 42,
+            memory_current_bytes: 0,
+            memory_peak_bytes: 0,
+            control_group: "/system.slice/test.service".into(),
+            cgroup: CgroupObservation {
+                path: "/sys/fs/cgroup/system.slice/test.service".into(),
+                io_counters_available: true,
+                gauges: BTreeMap::new(),
+                counters: BTreeMap::new(),
+            },
+        };
+        assert!(stable_unit_for_role(
+            &before,
+            &before,
+            ReplayRole::PrivateRamAuxiliary
+        ));
+        assert!(!stable_unit(&before, &before));
+        for i in 0..8 {
+            let mut wrong = before.clone();
+            match i {
+                0 => wrong.main_pid = 43,
+                1 => wrong.main_pid = 0,
+                2 => wrong.invocation_id = "b".repeat(32),
+                3 => wrong.restarts = 1,
+                4 => wrong.control_group = "/different".into(),
+                5 => wrong.cgroup.path = "/different".into(),
+                6 => wrong.sub_state = "start-post".into(),
+                _ => {
+                    wrong.active_state = "active".into();
+                    wrong.sub_state = "running".into();
+                }
+            }
+            assert!(
+                !stable_unit_for_role(&before, &wrong, ReplayRole::PrivateRamAuxiliary),
+                "case{i}"
+            );
+        }
+    }
 
     #[test]
     fn observer_config_and_output_schemas_are_v2() {

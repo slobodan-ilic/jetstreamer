@@ -1110,7 +1110,7 @@ pub(super) fn unit(name: &str) -> Result<Value> {
         "invalid fleet unit name"
     );
     let result = ProcessCommand::new("systemctl").args([
-        "show", name, "--no-pager", "--property=Id,LoadState,ActiveState,SubState,InvocationID,NRestarts,Result,ExecMainStatus,ExecStart,ControlGroup,MainPID",
+        "show", name, "--no-pager", "--property=Id,LoadState,Type,ActiveState,SubState,InvocationID,NRestarts,Result,ExecMainStatus,ExecStart,ControlGroup,MainPID",
     ]).output()?;
     let mut values = serde_json::Map::new();
     for line in std::str::from_utf8(&result.stdout)?.lines() {

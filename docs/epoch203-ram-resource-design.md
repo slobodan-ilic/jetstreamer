@@ -105,6 +105,21 @@ as an admission service or reinterpret the old disk runner's free-space gate.
 The geometry is intentionally separated from implementation and admission.
 Leave existing replays, guards, metadata owners and sealed binaries unchanged.
 
+### Running oneshot identity (source preparation only)
+
+The real RAM supervisor sandbox uses `Type=oneshot`: while its process runs,
+systemd reports `ActiveState=activating` and `SubState=start`, not
+`active/running`. The explicit private-RAM observer role and fleet role accept
+that phase only for `Type=oneshot`, a positive matching MainPID, the exact bound
+invocation, zero restarts and stable before/after identity. Ordinary replay and
+existing diagnostic live-state gates remain `active/running`; pre-start,
+post-start, exited, stopping and PID-less states are not RAM replay evidence.
+The fleet additionally matches every before/after observation's PID and phase
+to the current auxiliary owner. Policy regression tests are not actual observer
+or fleet capability attestations. This source correction neither deploys a
+monitor nor starts a benchmark; all independent capability, fresh-admission,
+owned-worker first-fire and publication gates above still apply.
+
 ## Persistent-storage capability probe
 
 `jetstreamer-epoch203-ram-storage-probe` now implements the storage/sandbox
