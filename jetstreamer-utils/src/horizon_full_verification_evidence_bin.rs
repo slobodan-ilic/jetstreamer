@@ -227,7 +227,9 @@ struct Receipt<'a> {
 }
 
 fn usage(program: &str) -> String {
-    format!("usage: {program} PLAN.json --plan-sha256 HEX --self-sha256 HEX [--check-only (transient v2 only)]")
+    format!(
+        "usage: {program} PLAN.json --plan-sha256 HEX --self-sha256 HEX [--check-only (transient v2 only)]"
+    )
 }
 
 fn parse_arguments() -> Result<Arguments, String> {

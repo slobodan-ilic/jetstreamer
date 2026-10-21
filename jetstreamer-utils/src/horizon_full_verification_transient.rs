@@ -528,7 +528,10 @@ mod tests {
     #[test]
     fn accepts_exact_quoted_reset_and_identical_core_limit_duplicates() {
         let plan = plan();
-        let fragment = format!("Type=oneshot\nRemainAfterExit=yes\nRestart=no\nProtectSystem=strict\nProtectHome=read-only\nPrivateNetwork=yes\nLimitCORE=0\nLimitCORE=0\nExecStart=\n{}\n",quoted_exec_start(&plan).unwrap());
+        let fragment = format!(
+            "Type=oneshot\nRemainAfterExit=yes\nRestart=no\nProtectSystem=strict\nProtectHome=read-only\nPrivateNetwork=yes\nLimitCORE=0\nLimitCORE=0\nExecStart=\n{}\n",
+            quoted_exec_start(&plan).unwrap()
+        );
         validate_fragment(&plan, fragment.as_bytes()).unwrap();
         for changed in [
             fragment.replace("ExecStart=\n", ""),
