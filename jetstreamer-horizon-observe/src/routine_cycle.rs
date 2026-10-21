@@ -22,6 +22,9 @@ const FLEET_ROOT_101: &str = "/var/lib/jetstreamer-horizon-fleet-101-200-2026101
 const LIMIT: u64 = 16 << 20;
 const BUCKET: &str = "solana-archive-with-accounts-data";
 
+#[path = "routine_next.rs"]
+mod next_preparation;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Bound {
@@ -1300,10 +1303,12 @@ fn main() {
     let result = (|| -> Result<()> {
         let args: Vec<_> = env::args().collect();
         ensure!(
-            (args.len() == 6 || (args.len() == 7 && args[6] == "--check-only"))
+            (args.len() == 6
+                || (args.len() == 7
+                    && matches!(args[6].as_str(), "--check-only" | "--prepare-next")))
                 && args[2] == "--plan-sha256"
                 && args[4] == "--self-sha256",
-            "usage: jetstreamer-horizon-routine-cycle PLAN --plan-sha256 HEX --self-sha256 HEX [--check-only]"
+            "usage: jetstreamer-horizon-routine-cycle PLAN --plan-sha256 HEX --self-sha256 HEX [--check-only|--prepare-next]"
         );
         ensure!(
             unsafe { libc::geteuid() } == 0,
@@ -1318,6 +1323,9 @@ fn main() {
             sha256: args[3].clone(),
         };
         let plan: Plan = serde_json::from_slice(&bound_bytes(&bound, true)?)?;
+        if args.get(6).map(String::as_str) == Some("--prepare-next") {
+            return next_preparation::prepare(&plan, &bound, &args[5]);
+        }
         execute(&plan, &bound, &args[5], args.len() == 7)
     })();
     if let Err(error) = result {

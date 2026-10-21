@@ -1,5 +1,38 @@
 # Routine metadata child diagnostics
 
+## Offline successor preparation (201–300 only)
+
+After a cycle has an accepted `completion.json`, a separately sealed candidate
+may be invoked with the current sealed plan and its exact bindings:
+
+```sh
+jetstreamer-horizon-routine-cycle CURRENT_PLAN --plan-sha256 HEX --self-sha256 HEX --prepare-next
+```
+
+This mode needs no credentials and makes no subprocess, systemd, resource or
+remote observation. It consumes the exact accepted observer/model/estimate/
+fleet/status receipts, rejects a newer fleet, and preserves all owner IDs,
+diagnostic claims, gates, additional evidence and tool pins. It advances by
+exactly1800seconds and increments only the canonical observer generation.
+The existing 101–200 profile, an out-of-band observation, changed auxiliary
+scope or an inconsistent/partial completion fails closed for manual review.
+
+Precreate root-owned mode0700
+`/var/lib/jetstreamer/horizon-next-preparations-v1`. The tool writes one
+no-clobber `TIMESTAMP-v1/` child containing `observer.json`, `cycle-plan.json`,
+their two separate deployment-sealer plans, and `preparation.json`. No
+preparation receipt means no completed preparation. Preserve an interrupted
+partial directory for explicit recovery; do not overwrite it or retry into it.
+
+Preparation is not deployment or scheduling authority. Separately seal both
+plans, run the ordinary credential-aware `--check-only` preflight, authenticate
+the current owner chain and timer uniqueness, then arm the single next observer
+and metadata owner at the normal deadlines. Existing sealed destinations and
+already-armed owners must not be replaced or duplicated. An offline probe may
+prepare the same future time as an already-armed manual cycle for comparison,
+but its generated plans must then remain unused. Do not migrate the actual
+cycle executor merely to use this planning mode.
+
 The routine-cycle coordinator remains a single, non-restarting metadata owner
 for one already-completed 30-minute observation. It does not sample resources,
 launch replay, upload archives, create sidecars, or delete objects. A failed
