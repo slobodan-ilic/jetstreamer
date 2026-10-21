@@ -20,14 +20,15 @@ use {
 };
 
 const GIB: u64 = 1 << 30;
-const MEMORY_MAX: u64 = 64 * GIB;
-// A distinct diagnostic generation: the 56-GiB profile recorded 6,874 high
-// events in five minutes. Keep the hard cap and host/tmpfs reserves unchanged.
-const MEMORY_HIGH: u64 = 60 * GIB;
+// Separate diagnostic envelope, never a change to a live replay or old sandbox.
+// The 64-GiB experiment stalled at ~65 GB including unreclaimable tmpfs pages.
+const MEMORY_MAX: u64 = 128 * GIB;
+const MEMORY_HIGH: u64 = 112 * GIB;
 const TMPFS_SIZE: u64 = 512 * GIB;
 const FLOOR: u64 = 231_874_716_783;
-const START_MEMORY: u64 = 512 * GIB;
 const STOP_MEMORY: u64 = 448 * GIB;
+// Reserve the complete diagnostic cap above the unchanged host stop reserve.
+const START_MEMORY: u64 = STOP_MEMORY + MEMORY_MAX;
 const SNAPSHOT_SHA: &str = "348cba573c9e737e77c512d2c7ceda7bc81db61be6f4dc02838d168a10103043";
 const GENESIS_SHA: &str = "133f7eaefcd59466f3b291aadd1b0d3522432072cf5b539445218c6c125ea945";
 const TEST_SHA: &str = "bfa7aadf5be9d895747b379c18354ecc312e50ba895341a5e46a21a6a085fd64";
@@ -1056,8 +1057,11 @@ mod tests {
     }
     #[test]
     fn tmpfs_cgroup_bound_preserves_century_floor_even_at_limit() {
-        assert_eq!(MEMORY_HIGH, 60 * GIB);
-        assert_eq!(MEMORY_MAX - MEMORY_HIGH, 4 * GIB);
+        assert_eq!(MEMORY_HIGH, 112 * GIB);
+        assert_eq!(MEMORY_MAX - MEMORY_HIGH, 16 * GIB);
+        assert_eq!(START_MEMORY, 576 * GIB);
+        assert_eq!(START_MEMORY - MEMORY_MAX, STOP_MEMORY);
+        assert_eq!(TMPFS_SIZE - MEMORY_MAX, 384 * GIB);
         validate_reserves(TMPFS_SIZE, MEMORY_MAX, FLOOR, STOP_MEMORY).unwrap();
         assert!(validate_reserves(64 * GIB, MEMORY_MAX, FLOOR, STOP_MEMORY).is_err());
         assert!(validate_reserves(TMPFS_SIZE, MEMORY_MAX, FLOOR, 64 * GIB).is_err());
