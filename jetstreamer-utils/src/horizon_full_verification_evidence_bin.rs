@@ -228,7 +228,7 @@ struct Receipt<'a> {
 
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} PLAN.json --plan-sha256 HEX --self-sha256 HEX [--check-only (transient v2 only)]"
+        "usage: {program} PLAN.json --plan-sha256 HEX --self-sha256 HEX [--check-only (transient v2/v3 only)]"
     )
 }
 
@@ -768,7 +768,7 @@ fn run() -> Result<(), String> {
     require_root_sealed_file(plan_identity, "plan")?;
     let plan: Plan = serde_json::from_slice(&plan_bytes)
         .map_err(|error| format!("invalid plan JSON: {error}"))?;
-    if plan.schema == transient::PLAN_SCHEMA {
+    if plan.schema == transient::PLAN_SCHEMA || plan.schema == transient::CHAIN_PLAN_SCHEMA {
         return transient::run(&arguments, &plan);
     }
     if plan.schema != PLAN_SCHEMA

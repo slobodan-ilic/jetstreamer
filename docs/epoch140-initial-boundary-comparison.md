@@ -59,3 +59,21 @@ HORIZON_EPOCH140_RPC_FIXTURE_ROOT=/usr/local/lib/jetstreamer/horizon-epoch140-in
 ```
 
 That source test alone does not establish a comparison with the real archive.
+
+## Separate anchored-chain evidence
+
+The full-verification evidence collector also has an explicit private v3 profile
+for the exact `horizon-epoch140-anchored-chain-20261021-v1` invocation. Its plan
+schema is `jetstreamer-horizon-anchored-chain-evidence-plan-v3`; the existing v2
+internal-full profile remains distinct and unchanged in scope. The transient
+profile additionally requires `anchored_chain.full_verification` and
+`anchored_chain.first_block_comparison` bindings to the independently recorded,
+root-sealed copies of the two successful prior receipts.
+
+The v3 command must be the exact non-full, non-segment `--chain --anchor` command.
+Both its per-archive `RESULT: OK` and `CHAIN RESULT: OK` must appear exactly once
+in the PID/EXE/argv/invocation-bound terminal journal. Collection independently
+rehashes the complete unchanged source after the chain check. A successful v3
+receipt can mark this source's incoming anchor proven, but still explicitly
+denies complete-prefix qualification, replay, manifest and publication authority.
+Never replace, rename or reinterpret the internal-full v2 receipt as that proof.
