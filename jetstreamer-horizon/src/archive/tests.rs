@@ -646,7 +646,7 @@ fn prefix_export_source(anchor: Hash, epoch_count: u64) -> Vec<u8> {
             write_version: 9_007_199_254_740_993 + offset * 10,
             data: b"retained exactly",
         };
-        if offset == 2 {
+        if offset == 2 && epoch_count != 0 {
             let mut epoch = EpochMeta::new_boxed();
             epoch.epoch = 1;
             epoch.start_slot = 432_000;
@@ -762,7 +762,8 @@ fn prefix_export_rejects_unsafe_range_anchor_metadata_and_provenance() {
     }
     let zero_anchor = prefix_export_source(Hash::default(), 7);
     let wrong_metadata = prefix_export_source(Hash::new_from_array([0xa5; 32]), 6);
-    for source in [&zero_anchor, &wrong_metadata] {
+    let missing_metadata = prefix_export_source(Hash::new_from_array([0xa5; 32]), 0);
+    for source in [&zero_anchor, &wrong_metadata, &missing_metadata] {
         assert!(
             reencode_archive_prefix(
                 std::io::Cursor::new(source),
@@ -795,6 +796,33 @@ fn prefix_export_rejects_unsafe_range_anchor_metadata_and_provenance() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn prefix_export_all_skipped_cut_preserves_anchor_in_each_new_bucket() {
+    let anchor = Hash::new_from_array([0xa5; 32]);
+    let source = prefix_export_source(anchor, 7);
+    let (output, stats) = reencode_archive_prefix(
+        std::io::Cursor::new(source),
+        Vec::new(),
+        ArchiveWriterConfig {
+            bucket_slots: 1,
+            ..Default::default()
+        },
+        2,
+    )
+    .unwrap();
+    assert_eq!(stats.source_semantic_sha256, stats.output_semantic_sha256);
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(output)).unwrap();
+    for index in 0..2 {
+        reader
+            .read_bucket(index, &mut SemanticDigest::new())
+            .unwrap();
+        assert_eq!(
+            reader.current_bucket_header().unwrap().poh_start_hash,
+            anchor
+        );
+    }
 }
 
 #[test]

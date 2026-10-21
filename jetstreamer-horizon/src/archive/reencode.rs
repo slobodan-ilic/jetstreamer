@@ -397,6 +397,9 @@ where
         if slots != prefix_slot_count {
             return Err(invalid("prefix source ended before its declared cut"));
         }
+        if visitor.prefix_first_block_slot.is_some() && !visitor.prefix_epoch_seen {
+            return Err(invalid("prefix source first block has no epoch metadata"));
+        }
         (
             slots,
             visitor.source_digest.finish()?,
@@ -698,6 +701,7 @@ struct ReencodeVisitor<'a, W: Write> {
     prefix_next_slot: Option<u64>,
     prefix_last_blockhash: Option<Hash>,
     prefix_epoch_seen: bool,
+    prefix_first_block_slot: Option<u64>,
 }
 
 impl<'a, W: Write> ReencodeVisitor<'a, W> {
@@ -714,6 +718,7 @@ impl<'a, W: Write> ReencodeVisitor<'a, W> {
             prefix_next_slot: None,
             prefix_last_blockhash: None,
             prefix_epoch_seen: false,
+            prefix_first_block_slot: None,
         }
     }
 
@@ -740,6 +745,9 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
                 return;
             }
             self.prefix_next_slot = slot.checked_add(1);
+            if kind == SlotKind::Block && self.prefix_first_block_slot.is_none() {
+                self.prefix_first_block_slot = Some(slot);
+            }
         }
         self.source_digest.on_slot_start(slot, kind);
         self.output_digest.on_slot_start(slot, kind);
@@ -761,6 +769,7 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
                 || meta.start_slot != start
                 || meta.slot_count != original_count
                 || meta.first_block_slot.checked_add(1) != self.prefix_next_slot
+                || Some(meta.first_block_slot) != self.prefix_first_block_slot
             {
                 self.error = Some(ArchiveFormatError::InvalidContainerLayout(
                     "prefix source epoch metadata range mismatch",
