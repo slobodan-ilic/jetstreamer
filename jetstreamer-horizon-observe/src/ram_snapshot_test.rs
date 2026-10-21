@@ -21,6 +21,9 @@ use {
 
 const GIB: u64 = 1 << 30;
 const MEMORY_MAX: u64 = 64 * GIB;
+// A distinct diagnostic generation: the 56-GiB profile recorded 6,874 high
+// events in five minutes. Keep the hard cap and host/tmpfs reserves unchanged.
+const MEMORY_HIGH: u64 = 60 * GIB;
 const TMPFS_SIZE: u64 = 512 * GIB;
 const FLOOR: u64 = 231_874_716_783;
 const START_MEMORY: u64 = 512 * GIB;
@@ -297,7 +300,7 @@ fn authenticate(p: &Plan) -> Result<String> {
     let cg = Path::new("/sys/fs/cgroup/system.slice").join(&p.unit);
     for (file, expected) in [
         ("memory.max", MEMORY_MAX),
-        ("memory.high", 56 * GIB),
+        ("memory.high", MEMORY_HIGH),
         ("memory.swap.max", 0),
         ("memory.oom.group", 1),
         ("pids.max", 512),
@@ -1053,6 +1056,8 @@ mod tests {
     }
     #[test]
     fn tmpfs_cgroup_bound_preserves_century_floor_even_at_limit() {
+        assert_eq!(MEMORY_HIGH, 60 * GIB);
+        assert_eq!(MEMORY_MAX - MEMORY_HIGH, 4 * GIB);
         validate_reserves(TMPFS_SIZE, MEMORY_MAX, FLOOR, STOP_MEMORY).unwrap();
         assert!(validate_reserves(64 * GIB, MEMORY_MAX, FLOOR, STOP_MEMORY).is_err());
         assert!(validate_reserves(TMPFS_SIZE, MEMORY_MAX, FLOOR, 64 * GIB).is_err());
