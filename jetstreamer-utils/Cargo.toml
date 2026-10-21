@@ -121,6 +121,10 @@ name = "jetstreamer-horizon-full-verification-evidence"
 path = "src/horizon_full_verification_evidence_bin.rs"
 
 [[bin]]
+name = "jetstreamer-epoch140-initial-boundary"
+path = "src/epoch140_initial_boundary_bin.rs"
+
+[[bin]]
 name = "jetstreamer-horizon-standalone-guard"
 path = "src/horizon_standalone_guard_bin.rs"
 
