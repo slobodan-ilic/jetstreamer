@@ -23,7 +23,7 @@ pub struct Scan {
     pub references: Vec<String>,
 }
 
-fn encoded_reference(bytes: &[u8], needle: &[u8], end_of_file: bool) -> bool {
+pub(crate) fn encoded_reference(bytes: &[u8], needle: &[u8], end_of_file: bool) -> bool {
     bytes.windows(needle.len()).enumerate().any(|(i, word)| {
         let end = i + needle.len();
         word == needle

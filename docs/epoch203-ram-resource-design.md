@@ -6,6 +6,25 @@ Entry replay, IPC, resource behavior and all canonical/plugin gates remain
 independent. Existing disk-backed comparison admission remains closed while
 the healthy epoch203 root-prefix producer has unbounded future scratch growth.
 
+For a targeted reproducible-cache check, the separately sealed Rust
+`jetstreamer-horizon-dev-cache-check` accepts
+`PLAN --plan-sha256 HEX --self-sha256 HEX`. Its strict plan contains `schema`
+(`jetstreamer-horizon-dev-cache-check-plan-v1`), `source_commit`,
+`cargo_lock_sha256` and `output`; it cannot select an arbitrary target.
+The only cache is this host's exact repository `target/debug`. It verifies
+preserved clean source/lock and Git-ignore classification, measures physical
+bytes without following cache links, rejects archives/snapshots/sidecars or
+foreign mounts, and performs bounded staged-unit and complete process-reference
+checks. It writes only root-private, no-clobber `check.json` under an existing
+mode0700 `/var/lib/jetstreamer/horizon-dev-cache-check-ATTEMPT` directory.
+It never removes a file or runs Cargo. A positive check is not retirement or
+replay-admission authority: preserve its evidence, apply the ordinary cache
+policy and fresh final checks, and use only the pinned native Cargo dev-profile
+cleanup when authorized. Preserve `target/release`, immutable tools, source,
+locks, archives, snapshots, receipts and every replay tree. Do not equate
+measured cache blocks with observed filesystem-free-space delta while replays
+continue allocating.
+
 `jetstreamer-epoch203-ram-resource-plan` performs an offline, hash-bound
 geometry check. It reads only one immutable root-owned regular JSON input
 and prints planning JSON; it never samples resources, mounts a filesystem,
