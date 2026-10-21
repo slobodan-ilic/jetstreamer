@@ -231,3 +231,59 @@ census model and fleet integration; do not omit either job from the observer,
 rename it to another epoch, weaken the overlap check globally or treat an old
 fleet as evidence of the expanded producer set. The fourth-entry-replay ceiling
 and all publication ownership boundaries remain intact.
+
+## Owned RAM safety component (not deployed)
+
+The observer crate now exports `ram_replay_guard::OwnedRamGuard`. It is a
+library component for the future `StorageHooks` implementation, not an
+executable, launcher, admission report, external fleet observer or new timer.
+No existing binary instantiates it. It sends no signals and performs no remote
+operations, mount/unmount or retirement. The caller must retain its unreaped
+owned child/group, call the guard from the bounded runner, and terminate only
+that owned group after a guard rejection. The actual supervisor/sandbox and
+complete admission path remain independently required.
+
+`start` authenticates the invocation's own cgroup and private RAM device/inode,
+the immutable parent path, 768-GiB tmpfs geometry, actual320/304-GiB memory
+limits, swap0/groupOOM, pids512 and CPU16, startup864-GiB available memory and
+host VMA limit. A no-clobber private start receipt prevents reopening the same
+run to renew the at-most60-second initial zero-worker grace. This grace is not
+a successful worker/maps capability proof. Before unattended replay require
+an actual positive worker observation under the sealed supervisor.
+
+`check` performs at most one owned-canary safety sample per15seconds, on calls
+from that supervisor; it creates no loop and never samples another replay.
+It preserves the544-GiB host reserve, century tmpfs floor,320-GiB total charged
+memory, zero max/OOM events,224-GiB aggregate RAM-file ceiling and16-GiB private
+archive budget. The192-GiB scratch component is independently enforced by the
+shared runner's frozen target capture, not falsely described as a periodic
+full-tree hard bound. The aggregate file ceiling includes scratch, archive and
+file/metadata overhead; it is not an evidence-backed full-prefix peak.
+
+The own-cgroup census accepts only the supervisor, exact owned parent and one
+hash/identity-bound `historical-worker` beneath this run's scratch. It checks
+the child's process group, stable worker inode/stat identity and readable maps
+with a500,000-VMA ceiling. Foreign/multiple workers, a pre-target disappearing
+worker, unreadable state, replacement RAM root, changed limits, memory pressure
+at the hard bound and oversized/unexpected output fail closed.
+
+A zero-worker post-target drain requires the exact existing epoch203 target
+stop receipt, same invocation and child,87720000target, bounded overshoot,
+no external signal and no more than180seconds age. The matching retained
+capture must have the exact canonical JSON hash, private path, bounded scratch
+and accounts-state/cgroup contents. The guard pins that receipt digest and its
+own monotonic deadline so a rewritten timestamp or clock change cannot renew
+the exception. Its no-clobber private stop intent is fsynced before rejection;
+neither receipt grants deletion, restart, runtime promotion or publication.
+Actual OOM can kill the supervisor before any terminal receipt; preserved
+systemd/journal evidence and RAM artifacts must still be collected, never
+classified as success from missing output.
+
+Ten component tests cover reserve/limit failures, bounded parsers/maps reads,
+exact child/target/time drainage, canonical capture hashing, digest/deadline
+renewal rejection, executable identity, forbidden output and private no-clobber
+intent evidence. They are not a real
+RAM entry-replay or sandbox qualification. Integrate and seal the component,
+qualify actual worker/group behavior plus the complete fresh fleet/census and
+artifact lifecycle, and prove a real sandboxed guard fire before any launch is
+left unattended. Keep healthy jobs and deployed guards unchanged.
