@@ -17,7 +17,7 @@ groups; a real self-probe proves zero effective child capabilities and writable
 private `/tmp`. No private receipt permissions are relaxed.
 
 Require `Type=oneshot`, `Restart=no`, `KillMode=control-group`, `Delegate=no`,
-`MemoryHigh=56G`, `MemoryMax=64G`, `MemorySwapMax=0`, `TasksMax=512`, and
+`MemoryHigh=60G`, `MemoryMax=64G`, `MemorySwapMax=0`, `TasksMax=512`, and
 `CPUQuota=200%`. Set `OOMScoreAdjust=1000` and `OOMPolicy=kill` so a resource
 failure stays within this diagnostic. The runner independently requires the
 actual cgroup `memory.oom.group` value to be `1`; the host's native
@@ -59,6 +59,15 @@ pre-kill snapshot in any stop intent. Terminal capture failure preserves the
 actual child outcome but fails qualification closed. Do not infer memory
 throttling from a peak alone: terminal cgroups can disappear before external
 inspection. This capture never samples or changes another replay's cgroup.
+
+The 60-GiB soft threshold is a new diagnostic generation, not an in-place
+change to the prior 56-GiB sandbox or any campaign replay. The five-minute
+56-GiB measurement (`59f179096f334d7aa749c194c95f8654`) recorded 6,874
+`memory.events high` events and 34.7 seconds of full memory pressure, with
+zero hard-limit/OOM events. This motivates a bounded comparison within the
+unchanged 64-GiB hard ceiling, not a claim that the tests or replay fit. Require
+a new immutable executable/plan, exact sandbox capability proof and fresh
+observer/fleet admission. Preserve any timeout or OOM as failure evidence.
 
 A successful child exit, unchanged input identities and no guard trip produce
 a private result, never a publication receipt. Preserve a failing invocation
