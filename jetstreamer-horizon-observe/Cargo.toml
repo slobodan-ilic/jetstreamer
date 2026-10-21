@@ -17,6 +17,10 @@ path = "src/status_estimate.rs"
 name = "jetstreamer-horizon-routine-cycle"
 path = "src/routine_cycle.rs"
 
+[[bin]]
+name = "jetstreamer-horizon-ram-snapshot-test"
+path = "src/ram_snapshot_test.rs"
+
 [dependencies]
 anyhow.workspace = true
 libc.workspace = true
