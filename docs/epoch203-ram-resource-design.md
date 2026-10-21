@@ -201,3 +201,33 @@ Keep it preserved pending the reviewed retention/retirement lifecycle. This
 passes actual storage/sandbox authentication only, not fleet/CPU admission,
 host-memory reserve checks, input verification, entry replay, VMA qualification,
 artifact retirement, runtime promotion or publication.
+
+## Shared bounded-runner integration points
+
+The reviewed bounded runner now has compile-bound `StorageHooks` for decoding
+an extended plan, preparing storage after input verification, setting the child
+environment, rejecting admission immediately before spawn, and checking an
+owned-child safety guard during execution. It binds the returned storage
+evidence in the result. A guard rejection follows the existing owned-group
+termination/failure path; the implementation must persist its stop intent
+before returning that rejection. No JSON field or command-line flag chooses
+the hook implementation. All current utility binaries still select the empty
+`DiskStorage` implementation and retain their existing scope/free-space gates.
+No running binary has been replaced.
+
+These extension points reuse the existing target detection, pre-shutdown
+capture, controlled-stop normalization and result writer; they are not a RAM
+supervisor implementation or admission. New subprocess regressions prove an
+admission rejection starts no child and a guard rejection preserves its
+intent/child binding and a failure result, never a successful resource result.
+The RAM implementation must still authenticate the persistent sandbox, restrict
+all mutable paths to it, bind fresh fleet/CPU/memory/input evidence and implement
+the host/tmpfs/cgroup/VMA guard and retained-artifact lifecycle before launch.
+
+The current coordinated observer rejects overlapping diagnostic ranges, as well
+as ordinary replay claims. A same-input epoch203 canary beside the healthy
+epoch203 root-prefix job therefore also needs an explicit reviewed diagnostic
+census model and fleet integration; do not omit either job from the observer,
+rename it to another epoch, weaken the overlap check globally or treat an old
+fleet as evidence of the expanded producer set. The fourth-entry-replay ceiling
+and all publication ownership boundaries remain intact.
