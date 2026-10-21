@@ -1,5 +1,14 @@
 # Routine metadata child diagnostics
 
+The separately bound October21 epoch203 capacity-stop incident may replace only
+its exact stale natural-root task with an open `failed-needs-repair` gate. The
+coordinator authenticates the fixed immutable incident, exact failed invocation,
+guard reason, last/required slots and denial of cleanup/retry/publication rights.
+Other gates, diagnostic history and tracked units remain unchanged. This is an
+idempotent incident recording, not a generic gate-edit API or scratch-retirement
+authority. A newer reviewed task is never overwritten. The ordinary fresh
+observer, full fleet census, R2 inventory and status gates still run independently.
+
 ## Offline successor preparation (201–300 only)
 
 After a cycle has an accepted `completion.json`, a separately sealed candidate

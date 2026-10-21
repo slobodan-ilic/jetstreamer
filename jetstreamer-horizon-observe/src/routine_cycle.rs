@@ -783,7 +783,84 @@ fn correct_stale_225_action(fleet: &mut Value, evidence: &Bound, incident: &Valu
     Ok(true)
 }
 
+const INCIDENT_203_SHA: &str = "216f090a859f5136c131e43ae378da6646c16b32b982f5d5ee39474f67a866dc";
+const INCIDENT_203_PATH: &str =
+    "/var/lib/jetstreamer/horizon-203-reserve-stop-incident-20261021-v1/incident.json";
+const STALE_203_ACTION_SHA: &str =
+    "9ae0af8421923b885d590d795614bd6308cd874c6289a91e5da716d0e4e2c35a";
+
+/// Record one independently retained terminal capacity incident. This changes
+/// only its stale task/state; it cannot grant cleanup, retry or publication.
+fn record_exact_203_stop(fleet: &mut Value, evidence: &Bound, incident: &Value) -> Result<bool> {
+    if evidence.sha256 != INCIDENT_203_SHA || evidence.path != Path::new(INCIDENT_203_PATH) {
+        return Ok(false);
+    }
+    ensure!(
+        incident["schema"] == "jetstreamer-private-epoch203-reserve-stop-incident-v1"
+            && incident["epoch"] == 203
+            && incident["producer_invocation_id"] == "92e367eb7cf944a1825fe5a20d9243ca"
+            && incident["producer_unit"] == "horizon-qualify-203-root-prefix-resource-v1.service"
+            && incident["guard_invocation_id"] == "3ff59266284844d18f15b2978714e187"
+            && incident["guard_stop_reason"] == "filesystem-floor"
+            && incident["failure_error"] == "external signal"
+            && incident["failure_external_signal"] == 15
+            && incident["last_progress_slot"] == 88_036_553u64
+            && incident["required_terminal_slot"] == 88_127_580u64
+            && incident["producer_terminal"]["main_pid"] == 0
+            && incident["producer_terminal"]["restarts"] == 0
+            && incident["producer_terminal"]["active_state"] == "failed"
+            && incident["producer_terminal"]["exec_main_status"] == 1
+            && incident["partial_archive"]["preserve"] == true
+            && incident["partial_archive"]["complete_archive"] == false
+            && incident["repair_closed"] == false,
+        "bound203incident does not establish the exact terminal capacity stop"
+    );
+    for field in [
+        "archive_deletion_authorized",
+        "scratch_deletion_authorized",
+        "replay_launch_authorized",
+        "runtime_promotion_authorized",
+        "publication_authorized",
+        "remote_mutations",
+        "r2_mutations",
+        "natural_parent_success",
+        "canonical_root_reached",
+        "independent_prefix_qualified",
+    ] {
+        ensure!(
+            incident[field] == false,
+            "203incident grants unrelated authority: {field}"
+        );
+    }
+    let next = incident["next_action"]
+        .as_str()
+        .context("203repair action missing")?;
+    ensure!(!next.trim().is_empty(), "203repair action empty");
+    if fleet["gates"]["203"]["state"] == "failed-needs-repair"
+        && fleet["gates"]["203"]["next_action"] == next
+    {
+        return Ok(false);
+    }
+    if fleet["gates"]["203"]["state"] != "blocked-qualification"
+        || fleet["gates"]["203"]["next_action"]
+            .as_str()
+            .map(|s| sha(s.as_bytes()))
+            .as_deref()
+            != Some(STALE_203_ACTION_SHA)
+    {
+        return Ok(false);
+    }
+    fleet["gates"]["203"]["state"] = json!("failed-needs-repair");
+    fleet["gates"]["203"]["next_action"] = json!(next);
+    Ok(true)
+}
+
 fn apply_known_action_corrections(p: &Plan, fleet: &mut Value) -> Result<()> {
+    if let Some(evidence) = p.additional_gate_evidence.get("203") {
+        for e in evidence.iter().filter(|e| e.sha256 == INCIDENT_203_SHA) {
+            record_exact_203_stop(fleet, e, &bound_json(e, false)?)?;
+        }
+    }
     if let Some(evidence) = p.additional_gate_evidence.get("225") {
         for e in evidence.iter().filter(|e| e.sha256 == INCIDENT_225_SHA) {
             correct_stale_225_action(fleet, e, &bound_json(e, false)?)?;
@@ -1336,6 +1413,94 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    fn incident203_fixture() -> (Bound, Value, Value) {
+        let old = "Continue exact guarded natural-root prefix qualification; no independent full prefix or full epoch is qualified yet. Independent native validator now supports literal prefix203filename and no-clobber fsynced private --receipt;6tests passed,source pushed and reader sealed. On natural parent success and exact431581slot segment, freshly admit independent complete reread. No prefix sidecar/public countdown; native restart,419slot suffix,assembly,current plugin and publication remain separate.";
+        assert_eq!(sha(old.as_bytes()), STALE_203_ACTION_SHA);
+        let evidence = Bound {
+            path: INCIDENT_203_PATH.into(),
+            sha256: INCIDENT_203_SHA.into(),
+        };
+        let mut incident = json!({"schema":"jetstreamer-private-epoch203-reserve-stop-incident-v1",
+            "epoch":203,"producer_invocation_id":"92e367eb7cf944a1825fe5a20d9243ca",
+            "producer_unit":"horizon-qualify-203-root-prefix-resource-v1.service",
+            "guard_invocation_id":"3ff59266284844d18f15b2978714e187",
+            "guard_stop_reason":"filesystem-floor","failure_error":"external signal",
+            "failure_external_signal":15,"last_progress_slot":88036553,"required_terminal_slot":88127580,
+            "producer_terminal":{"main_pid":0,"restarts":0,"active_state":"failed","exec_main_status":1},
+            "partial_archive":{"preserve":true,"complete_archive":false},
+            "repair_closed":false,"next_action":"Retain partial and inputs; qualify exact cleanup and fresh recovery admission."});
+        for field in [
+            "archive_deletion_authorized",
+            "scratch_deletion_authorized",
+            "replay_launch_authorized",
+            "runtime_promotion_authorized",
+            "publication_authorized",
+            "remote_mutations",
+            "r2_mutations",
+            "natural_parent_success",
+            "canonical_root_reached",
+            "independent_prefix_qualified",
+        ] {
+            incident[field] = json!(false);
+        }
+        let fleet = json!({"gates":{"203":{"state":"blocked-qualification","next_action":old,
+            "evidence":[{"path":INCIDENT_203_PATH,"sha256":INCIDENT_203_SHA}]},
+            "225":{"state":"failed-needs-repair","next_action":"preserve225"}},
+            "diagnostics":[{"epoch":203}],"tracked_units":["preserved-failed-unit"]});
+        (evidence, incident, fleet)
+    }
+
+    #[test]
+    fn exact203stop_records_open_repair_without_weakening_other_gates() {
+        let (evidence, incident, original) = incident203_fixture();
+        let mut fleet = original.clone();
+        assert!(record_exact_203_stop(&mut fleet, &evidence, &incident).unwrap());
+        let mut expected = original;
+        expected["gates"]["203"]["state"] = json!("failed-needs-repair");
+        expected["gates"]["203"]["next_action"] = incident["next_action"].clone();
+        assert_eq!(fleet, expected);
+        assert!(!record_exact_203_stop(&mut fleet, &evidence, &incident).unwrap());
+        assert_eq!(fleet, expected);
+    }
+
+    #[test]
+    fn exact203stop_rejects_wrong_owner_or_any_unrelated_authority() {
+        let (evidence, incident, original) = incident203_fixture();
+        for (field, value) in [
+            ("producer_invocation_id", json!("foreign")),
+            ("guard_stop_reason", json!("unknown")),
+            ("last_progress_slot", json!(88127580)),
+            ("archive_deletion_authorized", json!(true)),
+            ("scratch_deletion_authorized", json!(true)),
+            ("replay_launch_authorized", json!(true)),
+            ("publication_authorized", json!(true)),
+            ("r2_mutations", json!(true)),
+            ("natural_parent_success", json!(true)),
+            ("repair_closed", json!(true)),
+        ] {
+            let mut bad = incident.clone();
+            bad[field] = value;
+            let mut fleet = original.clone();
+            assert!(record_exact_203_stop(&mut fleet, &evidence, &bad).is_err());
+            assert_eq!(fleet, original);
+        }
+    }
+
+    #[test]
+    fn exact203stop_never_rewrites_a_newer_review_or_foreign_binding() {
+        let (evidence, incident, original) = incident203_fixture();
+        let mut newer = original.clone();
+        newer["gates"]["203"]["next_action"] = json!("newer reviewed recovery");
+        let before = newer.clone();
+        assert!(!record_exact_203_stop(&mut newer, &evidence, &incident).unwrap());
+        assert_eq!(newer, before);
+        let mut foreign = evidence;
+        foreign.path = "/foreign/incident.json".into();
+        let mut fleet = original.clone();
+        assert!(!record_exact_203_stop(&mut fleet, &foreign, &incident).unwrap());
+        assert_eq!(fleet, original);
+    }
+
     #[test]
     fn exact225scratch_task_correction_preserves_all_gates_and_open_repair() {
         use super::*;
