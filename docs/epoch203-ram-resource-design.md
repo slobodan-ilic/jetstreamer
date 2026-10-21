@@ -189,3 +189,15 @@ inside the protected namespace. Preserve the failure. The v2 **plan schema**
 separately records the host ID, binds device and propagation master, and requires
 the service's actual mount ID/peer to remain stable before/after. This is an
 explicit corrected identity model, not permission to accept arbitrary mounts.
+
+The third sealed actual probe passed with exit0 (invocation
+`01fe443690454ef6a61354b892db4787`). Its root-owned retained capability is
+`/var/lib/jetstreamer/horizon-203-ram-storage-success-v3/storage-capability.json`,
+SHA256 `bb7bc335b8a2161f9966bd0c7f23c45b33501224e13e33b107deac8bf9a36ffb`.
+The original metadata is still on the independently managed RAM mount after
+the probe service ended, proving it is not service-lifetime tmpfs. That mount
+contains only capability metadata and empty directories; no replay has run.
+Keep it preserved pending the reviewed retention/retirement lifecycle. This
+passes actual storage/sandbox authentication only, not fleet/CPU admission,
+host-memory reserve checks, input verification, entry replay, VMA qualification,
+artifact retirement, runtime promotion or publication.
