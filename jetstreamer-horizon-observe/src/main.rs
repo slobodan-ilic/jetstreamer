@@ -95,6 +95,20 @@ struct Config {
     // must not suppress healthy ordinary observations.
     #[serde(default)]
     diagnostic_replays: Vec<ReplayConfig>,
+    // A separate, tightly scoped private benchmark is not a publication claim.
+    // Its predecessor namespace must not collide with the primary epoch203.
+    #[serde(default)]
+    epoch203_ram_auxiliary: Option<RamAuxiliaryConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RamAuxiliaryConfig {
+    replay: ReplayConfig,
+    supervisor_profile: String,
+    worker_sha256: String,
+    target_slot: u64,
+    terminal_root_slot: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,7 +311,93 @@ fn parse_args() -> Result<Config> {
         "filesystem path must be absolute"
     );
     validate_replay_configs(&config.replays, &config.diagnostic_replays)?;
+    validate_ram_auxiliary(&config)?;
     Ok(config)
+}
+
+fn validate_ram_auxiliary(config: &Config) -> Result<()> {
+    let Some(auxiliary) = &config.epoch203_ram_auxiliary else {
+        return Ok(());
+    };
+    let replay = &auxiliary.replay;
+    // Preserve the ordinary/diagnostic validator unchanged. Only this explicit
+    // role may share epoch203, never a controller, invocation or mutable tree.
+    validate_replay_configs(&[], std::slice::from_ref(replay))?;
+    ensure!(
+        replay.range == "203-203"
+            && auxiliary.supervisor_profile
+                == "jetstreamer-private-epoch203-ram-bounded-runner-plan-v1"
+            && auxiliary.target_slot == 87_720_000
+            && auxiliary.terminal_root_slot == 88_127_580,
+        "wrong private RAM auxiliary scope"
+    );
+    let family = match auxiliary.worker_sha256.as_str() {
+        "3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a" => "baseline",
+        "4aeca56378a4bb2c55d0e590c1e334c4afa6a375a2c0d94894b412bea261f1cc" => "shrink",
+        _ => anyhow::bail!("unbound RAM auxiliary worker"),
+    };
+    let root = replay
+        .scratch_path
+        .parent()
+        .context("auxiliary scratch has no root")?;
+    ensure!(
+        replay.controller_unit == replay.producer_unit
+            && replay.expected_controller_invocation_id == replay.expected_producer_invocation_id
+            && replay
+                .producer_unit
+                .starts_with(&format!("horizon-203-ram-resource-{family}-"))
+            && replay.worker_executable_basename == "historical-worker"
+            && replay.append_log.is_none()
+            && replay
+                .scratch_path
+                .file_name()
+                .is_some_and(|name| name == "scratch")
+            && root.parent() == Some(Path::new("/home/ubuntu/.jetstreamer-private"))
+            && root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| { s.starts_with(&format!("ram-resource-203-{family}-")) }),
+        "RAM auxiliary owner or mutable namespace differs"
+    );
+    let owners = config.replays.iter().chain(&config.diagnostic_replays);
+    let mut primary = 0;
+    for owner in owners {
+        ensure!(
+            owner.controller_unit != replay.controller_unit
+                && owner.producer_unit != replay.producer_unit
+                && owner.expected_controller_invocation_id
+                    != replay.expected_controller_invocation_id
+                && owner.expected_producer_invocation_id != replay.expected_producer_invocation_id
+                && !owner.scratch_path.starts_with(root)
+                && !root.starts_with(&owner.scratch_path),
+            "RAM auxiliary aliases a primary owner or scratch tree"
+        );
+        let (start, end) = owner
+            .range
+            .split_once('-')
+            .unwrap_or((&owner.range, &owner.range));
+        let (start, end) = (start.parse::<u64>()?, end.parse::<u64>()?);
+        if start <= 203 && end >= 203 {
+            ensure!(
+                owner.range == "203-203"
+                    && owner.producer_unit == "horizon-qualify-203-root-prefix-resource-v1.service"
+                    && owner.controller_unit == owner.producer_unit
+                    && owner.expected_controller_invocation_id
+                        == owner.expected_producer_invocation_id
+                    && config
+                        .diagnostic_replays
+                        .iter()
+                        .any(|d| std::ptr::eq(d, owner)),
+                "auxiliary overlaps an ordinary or unsupported primary claim"
+            );
+            primary += 1;
+        }
+    }
+    ensure!(
+        primary == 1,
+        "RAM auxiliary requires its explicit primary diagnostic owner"
+    );
+    Ok(())
 }
 
 fn validate_replay_configs(
@@ -1526,9 +1626,9 @@ fn observe_replay(
     })
 }
 
-fn diagnostic_predecessor(previous: &Value) -> Value {
+fn private_predecessor(previous: &Value, role: &str) -> Value {
     let observations: Vec<Value> = previous
-        .get("diagnostic_replays")
+        .get(role)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -1545,9 +1645,18 @@ fn diagnostic_predecessor(previous: &Value) -> Value {
 fn observe_diagnostics(
     replays: &[ReplayConfig],
     previous: &Value,
+    sample: impl FnMut(&ReplayConfig, &Value) -> Result<Value>,
+) -> Vec<Value> {
+    observe_private(replays, previous, "diagnostic_replays", sample)
+}
+
+fn observe_private(
+    replays: &[ReplayConfig],
+    previous: &Value,
+    role: &str,
     mut sample: impl FnMut(&ReplayConfig, &Value) -> Result<Value>,
 ) -> Vec<Value> {
-    let predecessor = diagnostic_predecessor(previous);
+    let predecessor = private_predecessor(previous, role);
     replays
         .iter()
         .map(|replay| {
@@ -1575,6 +1684,8 @@ fn observe_diagnostics(
 }
 
 fn run(config: Config) -> Result<()> {
+    validate_replay_configs(&config.replays, &config.diagnostic_replays)?;
+    validate_ram_auxiliary(&config)?;
     let (previous_bytes, previous_value, previous_timestamp, previous_unix) =
         previous_sample(&config.previous_sample)?;
     let started_unix = now_unix()?;
@@ -1627,6 +1738,53 @@ fn run(config: Config) -> Result<()> {
             .map_err(Into::into)
         },
     );
+    let auxiliary_observations = if let Some(auxiliary) = &config.epoch203_ram_auxiliary {
+        let mut rows = observe_private(
+            std::slice::from_ref(&auxiliary.replay),
+            &previous_value,
+            "epoch203_ram_auxiliary",
+            |replay, previous| {
+                let observation =
+                    observe_replay(replay, previous, started_unix, progress_since_unix)?;
+                for worker in [&observation.worker_before, &observation.worker_after] {
+                    let bytes =
+                        read_bounded(&worker.executable, 256 << 20, "RAM auxiliary worker")?;
+                    ensure!(
+                        sha256(&bytes) == auxiliary.worker_sha256,
+                        "RAM auxiliary worker digest differs"
+                    );
+                }
+                serde_json::to_value(observation).map_err(Into::into)
+            },
+        );
+        for row in &mut rows {
+            row["role"] = serde_json::json!("epoch203-private-ram-comparison");
+            row["supervisor_profile"] = serde_json::json!(auxiliary.supervisor_profile);
+            row["worker_sha256"] = serde_json::json!(auxiliary.worker_sha256);
+            row["target_slot"] = serde_json::json!(auxiliary.target_slot);
+            row["terminal_root_slot"] = serde_json::json!(auxiliary.terminal_root_slot);
+        }
+        rows
+    } else {
+        Vec::new()
+    };
+    // This is only the successfully observed subset, not admission or a full
+    // service census: unavailable diagnostics remain explicitly unresolved.
+    let observed_entries = observations.len()
+        + diagnostic_observations
+            .iter()
+            .filter(|r| r["status"] == "observed")
+            .count()
+        + auxiliary_observations
+            .iter()
+            .filter(|r| r["status"] == "observed")
+            .count();
+    if config.epoch203_ram_auxiliary.is_some() {
+        ensure!(
+            observed_entries <= 4,
+            "more than four entry replays observed"
+        );
+    }
     let available_after = filesystem_available_bytes(&config.filesystem_path)?;
     let (_, memory_available_after_kib) = host_memory()?;
     let completed_unix = now_unix()?;
@@ -1664,6 +1822,18 @@ fn run(config: Config) -> Result<()> {
         "vm_max_map_count": vm_max_map_count()?,
         "replays": observations,
         "diagnostic_replays": diagnostic_observations,
+        "epoch203_ram_auxiliary": auxiliary_observations,
+        "auxiliary_policy": {
+            "configured": config.epoch203_ram_auxiliary.is_some(),
+            "observed_entry_replays": observed_entries,
+            "maximum_entry_replays": 4,
+            "maximum_auxiliary_diagnostics": 1,
+            "complete_live_census_verified": false,
+            "fresh_admission_passed": false,
+            "ordinary_replay_authorized": false,
+            "publication_authorized": false,
+            "r2_mutations": false
+        },
         "mutation": {
             "producer_or_controller_signals_sent": false,
             "service_state_changed": false,
@@ -1752,6 +1922,110 @@ mod tests {
         }
     }
 
+    fn auxiliary_config() -> Config {
+        let mut primary = diagnostic_config("203-203");
+        primary.controller_unit = "horizon-qualify-203-root-prefix-resource-v1.service".into();
+        primary.producer_unit = primary.controller_unit.clone();
+        let mut replay = diagnostic_config("203-203");
+        replay.controller_unit = "horizon-203-ram-resource-baseline-test.service".into();
+        replay.producer_unit = replay.controller_unit.clone();
+        replay.expected_controller_invocation_id = "b".repeat(32);
+        replay.expected_producer_invocation_id = "b".repeat(32);
+        replay.scratch_path =
+            "/home/ubuntu/.jetstreamer-private/ram-resource-203-baseline-test/scratch".into();
+        Config {
+            schema: CONFIG_SCHEMA.into(),
+            previous_sample: "/previous.json".into(),
+            minimum_interval_seconds: 1800,
+            not_before_utc: "2026-10-21T05:29:36Z".into(),
+            observation_reason: ObservationReason::Routine,
+            filesystem_path: "/".into(),
+            output: "/output.json".into(),
+            replays: Vec::new(),
+            diagnostic_replays: vec![primary],
+            epoch203_ram_auxiliary: Some(RamAuxiliaryConfig {
+                replay,
+                supervisor_profile: "jetstreamer-private-epoch203-ram-bounded-runner-plan-v1"
+                    .into(),
+                worker_sha256: "3f5e8efec328b3e00dd9ce5ae396fc4067e6be6554e4da8831a13273186a748a"
+                    .into(),
+                target_slot: 87_720_000,
+                terminal_root_slot: 88_127_580,
+            }),
+        }
+    }
+
+    #[test]
+    fn ram_auxiliary_is_explicit_bounded_and_never_an_ordinary_overlap_exception() {
+        let mut config = auxiliary_config();
+        validate_ram_auxiliary(&config).unwrap();
+        validate_replay_configs(&config.replays, &config.diagnostic_replays).unwrap();
+        config.replays.push(config.diagnostic_replays.remove(0));
+        assert!(validate_ram_auxiliary(&config).is_err());
+        let mut config = auxiliary_config();
+        config.diagnostic_replays[0].range = "202-204".into();
+        assert!(validate_ram_auxiliary(&config).is_err());
+        let mut config = auxiliary_config();
+        config.diagnostic_replays.clear();
+        assert!(validate_ram_auxiliary(&config).is_err());
+    }
+
+    #[test]
+    fn ram_auxiliary_rejects_scope_identity_worker_and_tree_substitution() {
+        for mutation in 0..10 {
+            let mut config = auxiliary_config();
+            let auxiliary = config.epoch203_ram_auxiliary.as_mut().unwrap();
+            match mutation {
+                0 => auxiliary.replay.range = "204-204".into(),
+                1 => auxiliary.target_slot += 1,
+                2 => auxiliary.terminal_root_slot += 1,
+                3 => auxiliary.worker_sha256 = "0".repeat(64),
+                4 => auxiliary.replay.expected_producer_invocation_id = "c".repeat(32),
+                5 => auxiliary.replay.scratch_path = "/private/scratch".into(),
+                6 => auxiliary.replay.controller_unit = "foreign.service".into(),
+                7 => auxiliary.replay.expected_controller_invocation_id = "a".repeat(32),
+                8 => {
+                    config.diagnostic_replays[0].scratch_path =
+                        auxiliary.replay.scratch_path.clone()
+                }
+                9 => {
+                    auxiliary.worker_sha256 =
+                        "4aeca56378a4bb2c55d0e590c1e334c4afa6a375a2c0d94894b412bea261f1cc".into()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_ram_auxiliary(&config).is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn ram_auxiliary_history_does_not_borrow_same_epoch_primary_counters() {
+        let previous = serde_json::json!({
+            "schema":OUTPUT_SCHEMA,"completed_at_utc":"2026-10-21T05:29:36Z",
+            "diagnostic_replays":[{"status":"observed","observation":{"range":"203-203","source":"primary"}}],
+            "epoch203_ram_auxiliary":[{"status":"observed","observation":{"range":"203-203","source":"auxiliary"}}]
+        });
+        let config = auxiliary_config();
+        let results = observe_private(
+            &[config.epoch203_ram_auxiliary.unwrap().replay],
+            &previous,
+            "epoch203_ram_auxiliary",
+            |_, history| {
+                assert_eq!(history["replays"][0]["source"], "auxiliary");
+                Ok(serde_json::json!({"range":"203-203"}))
+            },
+        );
+        assert_eq!(results[0]["status"], "observed");
+        assert_eq!(results[0]["ordinary_replay_claim"], false);
+        assert_eq!(results[0]["current_sidecar_eta_valid"], false);
+        assert_eq!(results[0]["publication_authorized"], false);
+        let empty = private_predecessor(&previous, "missing-role");
+        assert!(empty["replays"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn diagnostic_failure_is_explicit_and_does_not_suppress_other_samples() {
         let configs = [diagnostic_config("203-203"), diagnostic_config("225-225")];
@@ -1798,7 +2072,7 @@ mod tests {
                 {"status":"observed", "observation":{"range":"203-203"}}
             ]
         });
-        let selected = diagnostic_predecessor(&previous);
+        let selected = private_predecessor(&previous, "diagnostic_replays");
         assert_eq!(selected["schema"], OUTPUT_SCHEMA);
         assert_eq!(selected["completed_at_utc"], previous["completed_at_utc"]);
         assert_eq!(
@@ -1806,7 +2080,7 @@ mod tests {
             serde_json::json!([{"range":"203-203"}])
         );
         assert!(
-            diagnostic_predecessor(&serde_json::json!({}))["replays"]
+            private_predecessor(&serde_json::json!({}), "diagnostic_replays")["replays"]
                 .as_array()
                 .unwrap()
                 .is_empty()

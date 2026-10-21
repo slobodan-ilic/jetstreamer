@@ -354,3 +354,80 @@ them, or treat the synthetic in-memory unit-test fixtures as qualification.
 Implement and exercise the real observer/fleet auxiliary role and retained-
 artifact lifecycle, seal their actual capability evidence, qualify this exact
 supervisor package/environment and prove its real guard fire before deployment.
+
+Append `--storage-capability` for the separately scoped **no-entry** path.
+The shared runner still authenticates its self/plan, exact profile and all
+parent/worker/snapshot/genesis/checkpoint input hashes. It authenticates the
+actual RAM sandbox before the large reads, repeats preparation checks, copies
+only verified genesis into the private ledger, builds the exact child command/
+cleared environment, and authenticates the pre-spawn storage phase. It then
+returns through a distinct capability dispatch **before any replay/measurement
+call** and writes only `receipts/supervisor-storage-capability.json` mode0400,
+no-clobber with file/directory fsync. A subprocess-dispatch regression rejects
+any path into replay admission, spawn or safety guard during this operation.
+Existing DiskStorage profiles reject this extra CLI argument.
+
+This mode intentionally does not load auxiliary qualification or claim fresh
+fleet/CPU/memory admission: it takes no host-memory sample, starts no guard,
+executes neither node nor worker and creates no archive. Its distinct schema
+denies replay launch, workerIPC, fullpeak, runtime promotion, publication and
+retirement. It cannot satisfy any of the observer/fleet/retention attestation
+schemas. Unresolved auxiliary-contract fields in this capability-only envelope
+are not receipts and must never be filled with fabricated positive evidence.
+Seal the resulting metadata onto durable storage; its original RAM copy does
+not survive reboot. Fullbenchmark mode remains fail-closed on all qualification
+evidence and repeats fresh admission immediately before its actual fork.
+
+The actual baseline no-entry invocation passed on October21 at05:18:41UTC:
+`horizon-203-ram-resource-baseline-capability-v1.service`, invocation
+`4b6aac090fb1421aa2e9a4161561b6f8`, exit0. Its independently sealed retained
+metadata is `/var/lib/jetstreamer/horizon-203-ram-supervisor-capability-success-v1/supervisor-storage-capability.json`,
+SHA256 `6e8778e2a536ae612f59cbc7ac1259f90286030fc5b3b195d17605292a341f26`.
+This verifies the actual RAM sandbox, input hashes, genesis preparation and
+cleared child command/environment only. Node/worker execution, IPC, guard,
+admission, retirement and publication remain unqualified. The separate persistent
+RAM mount and original metadata remain preserved; no replay was started.
+
+## Explicit auxiliary observer role (not deployed)
+
+The v2 observer now accepts one optional `epoch203_ram_auxiliary` config object
+with `replay` (the existing invocation-bound replay config), `supervisor_profile`,
+`worker_sha256`, `target_slot` and `terminal_root_slot`. It admits only the
+bounded87720000/88127580private epoch203 baseline or shrink comparison, with
+the exact pinned worker, matching supervisor/root namespace and isolated scratch.
+It requires the primary203root-prefix diagnostic to remain explicitly configured.
+Ordinary replay and existing diagnostic overlap rejection is unchanged; this
+separate role cannot serve as an ordinary publication claim or sidecar ETA.
+
+Auxiliary results and cross-sample counters live only in the separate
+`epoch203_ram_auxiliary` array. A same-epoch primary can never supply the
+benchmark's predecessor counters. The observer verifies the copied worker digest
+and retains explicit unavailable outcomes without suppressing healthy samples.
+It rejects more than four successfully observed entries but does not claim that
+this subset proves a complete live census or admission. Fleet discovery now
+recognizes the RAM supervisor namespace and rejects an unbound owner. Complete
+auxiliary fleet/launch evidence and real observer/fleet/retention capability
+qualification are still required; neither source tests nor this documentation
+are an attestation. Keep deployed observer and R2 binaries unchanged until the
+full contract is qualified, and retain the single30-minute control cadence.
+
+The fleet plan now has its own optional `epoch203_ram_auxiliary` object with
+`unit`, `invocation_id`, `run_root` and hash-bound `launch_receipt`. Its separate
+`auxiliary_diagnostics` result array cannot replace the primary diagnostic,
+ordinary epoch state, production status binding or remote-ready evidence.
+Live ownership requires the matching separate observer role, stable before/after
+invocations, zero restarts, an exact sealed setpriv/supervisor/plan command and
+three distinct primary entry producers (legacy per-epoch duplicates do not
+consume extra lanes). A fourth primary or an omitted/unbound RAM supervisor
+fails closed. Ordinary/diagnostic overlap rules remain unchanged; delivery
+overlap, mutable-tree aliasing and same-sample admission tricks are rejected.
+
+The private launch schema is
+`jetstreamer-private-epoch203-ram-resource-launch-v1`. It binds the fixed profile,
+parent/worker/snapshot, target/root, persistent tmpfs and immutable supervisor,
+plan and setpriv files. It denies ordinary replay, full-cold peak qualification,
+runtime promotion, canonical sidecars, publication, retirement and all remote
+mutation. This is a policy implementation, not a real launch receipt: a reviewed
+launcher/collector and actual observer/fleet/retention capability evidence are
+still missing. Unit-test fixtures must never be published as those receipts.
+The fleet binary remains undeployed until those independent qualifications pass.

@@ -591,10 +591,14 @@ fn live_census(own: &str) -> Result<Vec<String>> {
 
 #[derive(Default)]
 struct RamStorage {
+    storage_capability: bool,
     envelope: RefCell<Option<Envelope>>,
     guard: RefCell<Option<OwnedRamGuard>>,
 }
 impl StorageHooks for RamStorage {
+    fn capability_only(&self) -> bool {
+        self.storage_capability
+    }
     fn decode_plan(&self, bytes: &[u8]) -> Result<Plan> {
         let envelope: Envelope = serde_json::from_slice(bytes)?;
         ensure!(
@@ -603,12 +607,24 @@ impl StorageHooks for RamStorage {
         );
         // Reject missing qualification before hashing multi-GiB replay inputs.
         // Repeat immediately before fork after all input/sandbox checks.
-        let evidence = Evidence::load(&envelope)?;
-        validate_evidence(
-            &envelope,
-            &evidence,
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-        )?;
+        if self.storage_capability {
+            // Early actual sandbox authentication, before large input reads.
+            // The shared runner will return from capability_result before its
+            // only child-spawn/measurement call site, regardless of reports.
+            authenticate_replay(
+                &serde_json::to_vec(&envelope.sandbox)?,
+                &envelope.runner.unit,
+                &envelope.runner.run_root,
+                ReplayPhase::BeforePreparation,
+            )?;
+        } else {
+            let evidence = Evidence::load(&envelope)?;
+            validate_evidence(
+                &envelope,
+                &evidence,
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            )?;
+        }
         let p = envelope.runner.clone();
         *self.envelope.borrow_mut() = Some(envelope);
         Ok(p)
@@ -693,9 +709,51 @@ impl StorageHooks for RamStorage {
             .check(child, elapsed, draining)?;
         Ok(())
     }
+    fn capability_result(
+        &self,
+        p: &Plan,
+        inv: &str,
+        bindings: &Value,
+        command: &Command,
+    ) -> Result<()> {
+        ensure!(self.storage_capability, "not the no-entry capability path");
+        let borrow = self.envelope.borrow();
+        let e = borrow.as_ref().context("RAM envelope absent")?;
+        let sandbox = authenticate_replay(
+            &serde_json::to_vec(&e.sandbox)?,
+            &p.unit,
+            &p.run_root,
+            ReplayPhase::BeforeSpawn,
+        )?;
+        let report = json!({"schema":"jetstreamer-private-epoch203-ram-supervisor-storage-capability-v1",
+            "unit":p.unit,"invocation_id":inv,"self_sha256":bindings["self_sha256"],"plan":bindings,
+            "profile":profile::PLAN_SCHEMA,"worker_sha256":profile::WORKER,"parent_sha256":profile::PARENT_SHA,
+            "snapshot_sha256":profile::SNAPSHOT,"sandbox":sandbox,
+            "command_program":command.get_program().to_string_lossy(),
+            "command_args":command.get_args().map(|s|s.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            "command_environment":command.get_envs().map(|(k,v)|(k.to_string_lossy().into_owned(),v.map(|s|s.to_string_lossy().into_owned())))
+                .collect::<std::collections::BTreeMap<_,_>>(),
+            "input_file_hashes_verified":true,"genesis_copy_verified":true,
+            "auxiliary_contract_loaded":false,"host_memory_sample_taken":false,"live_fleet_inspected":false,
+            "node_arguments_executed":false,"worker_ipc_qualified":false,"entry_replay":false,
+            "guard_started":false,"fresh_admission_passed":false,"replay_launch_authorized":false,
+            "full_cold_epoch_peak_qualified":false,"runtime_promotion_authorized":false,"publication_authorized":false,
+            "retirement_authorized":false,"remote_mutations":false,"r2_mutations":false});
+        let path = p
+            .run_root
+            .join("receipts/supervisor-storage-capability.json");
+        bounded_resource_runner::persist(&path, &report)?;
+        println!("{}", path.display());
+        Ok(())
+    }
 }
 fn main() {
-    bounded_resource_runner::main_with_storage(&RamStorage::default());
+    let storage_capability =
+        std::env::args().next_back().as_deref() == Some("--storage-capability");
+    bounded_resource_runner::main_with_storage(&RamStorage {
+        storage_capability,
+        ..RamStorage::default()
+    });
 }
 
 #[cfg(test)]
