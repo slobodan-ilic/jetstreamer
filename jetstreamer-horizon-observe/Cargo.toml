@@ -9,6 +9,11 @@ repository.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 
+[features]
+# Diagnostic CPU allocation released by the exact reserve-stopped epoch225.
+# Cannot run while that producer or another fleet claim is live.
+ram-snapshot-eight-core-stopped225 = []
+
 [[bin]]
 name = "jetstreamer-horizon-status-estimate"
 path = "src/status_estimate.rs"
