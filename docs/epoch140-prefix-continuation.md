@@ -162,3 +162,124 @@ replay, runtime promotion and publication. Obtain finalized metadata for all
 listed post-gap blocks, bind their exact parents and visible hashes, then
 complete the ordinary audit/recovery path. A small earlier 11-target receipt
 must not be broadened or relabeled to cover this wider interval.
+
+For RPC backends that time out on a single large `getBlocks` request, use
+`--paged-census-only` with the distinct
+`jetstreamer-horizon-finalized-paged-gap-census-plan-v1` schema. Its `pages`
+array contains `{first_slot,last_slot,request,response}` entries; both bindings
+are immutable `{path,sha256}` files. At most 512 pages may cover the exact
+global interval, with no missing, overlapping or reordered pages and no page
+wider than 50,000 slots. Each original request must bind that page's exact
+finalized interval and match its original response ID. Skipped page endpoints
+are allowed; the global endpoints must be present. Derive gaps across page
+joins as well as within pages. Do not synthesize an HTTP/RPC response by joining
+JSON with shell or a floating-point parser.
+
+The resulting `jetstreamer-horizon-finalized-paged-gap-census-v1` receipt binds
+every actual request/response pair and retains the same non-authorizing
+first-stage semantics. Timeouts and error responses are preserved separately;
+they are not empty pages or evidence of a completed census.
+
+## Bounded finalized target metadata collection
+
+`jetstreamer-epoch140-gap-metadata-fetch` is a separate root-only, fixed-census
+collector for all 18,283 targets in the sealed next-root census (SHA-256
+`11a6049bc9378b4e3e063e765ce2b908b621f5d7845a49d372aca509d6d37a9f`).
+It does not run a Bank, read a `.jet`, recover hidden hashes, contact R2 or
+grant replay/publication authority. Its strict plan schema is
+`jetstreamer-epoch140-gap-metadata-fetch-plan-v1`, with `unit`, `census` and
+`curl` `{path,sha256}` bindings, and a root-private `root` directly beneath
+`/var/lib/jetstreamer-epoch140-gap-metadata-UNIQUE`. Seal the collector, exact
+curl executable and plan with the normal Rust deployment sealer.
+
+Invoke `PLAN --plan-sha256 HEX --self-sha256 HEX [--check-only]`. Both modes
+authenticate the exact non-restarting systemd MainPID/invocation. The check
+unit is the production unit name with `-check` inserted before `.service`;
+it makes no network requests or output writes. Pre-create the root-owned
+0700 output root and prove that mode under the intended sandbox before launch.
+
+The endpoint is fixed to the public mainnet Solana RPC. Requests contain at
+most three finalized, rewards-free, metadata-only `getBlock` calls. The
+collector pins every ID, exact parent from the census, and both canonical
+32-byte hash encodings. It uses a two-second successful-batch delay and
+bounded backoff on partial/error responses. Curl gets a 45-second timeout;
+the owner independently kills/reaps only its own child after 50 seconds and
+bounds response capture to 64 KiB (plus a diagnostic overflow byte). Six
+hours, 10,000 attempts, eight consecutive no-progress attempts, a 1-GiB
+output budget and a retained 1-GiB private-filesystem reserve are hard stops.
+
+Actual request bytes, bounded captured response bytes and attempt errors
+remain private. Per-target checkpoints are immutable and atomically published
+without replacement only after finalized metadata validates. A deliberate
+resume takes the same output lock, rehashes all checkpoint/request/response
+bindings and repeats the parent/hash checks; file presence alone never skips
+a target. An interrupted partial stays diagnostic. No automatic restart or
+unconditional output replacement is supported.
+
+The final `complete.json` is written only after an independent reread of every
+verified target checkpoint and original RPC binding. It proves finalized
+parent/visible-hash metadata collection, not hidden PoH recovery, native
+live-state completeness, a terminal root, prefix qualification or publication.
+The retained ledger reports data through slot 61,344,045, covering the planned
+61,328,765 root, but its bounds do not replace complete native MANIFEST/WAL/CF
+validation and exact entry-chain recovery for every target.
+
+## Complete-census native candidate acquisition (not yet operationally qualified)
+
+The native runner has a distinct
+`jetstreamer-epoch141-ledger-native-full-census-plan-v2` profile. The existing
+`jetstreamer-epoch141-ledger-native-plan-v1` remains exactly 11-target-bound;
+neither a wider census nor new collection fields can be passed as that profile.
+The new profile keeps every existing source, complete-retention, independent
+tar-census, column-family, admission, private-path and output binding. Its
+`gap_audit` must bind the fixed complete paged census SHA above. It additionally
+requires `finalized_collection_plan` and `finalized_collection_receipt`
+`{path,sha256}` bindings, plus an exact service `unit` in the
+`horizon-epoch141-native-full-census-*.service` namespace.
+
+The metadata consumer requires the actual collector `complete.json`, all
+18,283 ordered target bindings, and the fixed census/plan/owner/authority fields.
+It independently rehashes every target checkpoint and original finalized RPC
+request/response and repeats the exact parent/hash checks. A partial collection,
+mere checkpoint presence, changed digest, duplicate or reordered binding is not
+admissible. The native check unit is the exact production name with `-check`
+before `.service`; both modes authenticate their own MainPID/invocation and
+non-restarting service policy. Check-only still performs no native database open
+or receipt writes.
+
+The complete profile uses one read-only native database session, not 18,283
+full-database rehashes. It hashes the complete retained census before open and
+again after close, requires the complete native column-family allowlist and
+every live SST reference, and retains checksum-verified logical reads with WAL,
+version and tombstone resolution. For each target it reads complete SlotMeta,
+plans every contiguous data shred using the unchanged bounded v1.4.25 decoder,
+then reads all those shreds plus an identical SlotMeta recheck. Each batch retains
+the 65,536-query, 64-MiB-return and 1-MiB-per-value ceilings. The entire session
+allows at most 36,566 batches, 16,777,216 exact lookups and 8 GiB returned values;
+these are hard ceilings, not a claim that the retained source fits. Any suppressed
+batch failure poisons the session and prevents a successful final summary.
+
+Fresh admission must separately reserve 32 GiB above the existing protected
+filesystem floor. Actual combined private output is capped at 24 GiB, with the
+legacy 224-MiB per-record bound retained. Logs and results must be root-private
+on the campaign `/home/sol` filesystem, disjoint from retained inputs and the
+compressed source. Use the existing CLI, separately bound executable/plan and
+fresh admission hashes, persistent non-restarting systemd execution, hard
+memory/CPU/task/time ceilings and the required least-privilege traversal
+capabilities. Do not admit it merely because the old 256-MiB profile fit.
+
+Each `target-candidates/slot-N.json` is explicitly provisional, immutable
+no-clobber diagnostic output, not a completed session. The distinct final v2
+receipt appears only after all targets succeed, native close and complete input
+rehashing pass, every output is independently reread, and all top-level inputs
+are rebound. A failure preserves provisional outputs without a final completion
+claim. A new attempt needs fresh isolated logs/results and fresh admission; no
+automatic restart or in-place output replacement is supported.
+
+Even a complete candidate receipt does not decode/authenticate PoH clocks,
+recover hidden boundaries, prove original backup completeness or historical
+liveness, qualify a canonical root, or authorize replay, assembly, publication,
+sidecars or R2 mutation. Source tests are not actual-source sandbox qualification.
+Keep this profile dormant until the live metadata collection and ledger retention
+complete and a sealed exact-package check, fresh admission and independent
+operational qualification have passed.
