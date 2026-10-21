@@ -40,6 +40,25 @@ struct Plan {
     output: PathBuf,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BlockListPage {
+    first_slot: u64,
+    last_slot: u64,
+    request: BoundFile,
+    response: BoundFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PagedCensusPlan {
+    schema: String,
+    first_slot: u64,
+    last_slot: u64,
+    pages: Vec<BlockListPage>,
+    output: PathBuf,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct Gap {
     parent_slot: u64,
@@ -147,6 +166,11 @@ fn target_pairs(first: u64, last: u64, response: &Value) -> Result<(Vec<u64>, Ga
         .iter()
         .map(|v| v.as_u64().context("block slot is not an integer"))
         .collect::<Result<Vec<_>>>()?;
+    let gaps = pairs_from_present(first, last, &blocks)?;
+    Ok((blocks, gaps))
+}
+
+fn pairs_from_present(first: u64, last: u64, blocks: &[u64]) -> Result<GapPairs> {
     ensure!(
         blocks.first() == Some(&first) && blocks.last() == Some(&last),
         "block-list endpoints differ from plan"
@@ -155,12 +179,11 @@ fn target_pairs(first: u64, last: u64, response: &Value) -> Result<(Vec<u64>, Ga
         blocks.windows(2).all(|p| p[0] < p[1]),
         "block list is not strictly increasing"
     );
-    let gaps = blocks
+    Ok(blocks
         .windows(2)
         .filter(|p| p[1] - p[0] > 1)
         .map(|p| (p[0], p[1]))
-        .collect();
-    Ok((blocks, gaps))
+        .collect())
 }
 
 fn check_hash(value: &Value) -> Result<String> {
@@ -333,15 +356,27 @@ fn census_receipt(
     present: &[u64],
     pairs: &[(u64, u64)],
 ) -> Result<Value> {
+    let mut receipt = census_summary(binding, plan.first_slot, plan.last_slot, present, pairs)?;
+    receipt["schema"] = json!("jetstreamer-horizon-finalized-gap-census-v1");
+    receipt["block_list_request"] = serde_json::to_value(&plan.block_list_request)?;
+    receipt["block_list"] = serde_json::to_value(&plan.block_list)?;
+    Ok(receipt)
+}
+
+fn census_summary(
+    binding: &BoundFile,
+    first_slot: u64,
+    last_slot: u64,
+    present: &[u64],
+    pairs: &[(u64, u64)],
+) -> Result<Value> {
     let skipped: u64 = pairs.iter().map(|(parent, slot)| slot - parent - 1).sum();
     ensure!(
-        present.len() as u64 + skipped == plan.last_slot - plan.first_slot + 1,
+        present.len() as u64 + skipped == last_slot - first_slot + 1,
         "interval count mismatch"
     );
     Ok(json!({
-        "schema":"jetstreamer-horizon-finalized-gap-census-v1",
-        "plan":binding,"first_slot":plan.first_slot,"last_slot":plan.last_slot,
-        "block_list_request":plan.block_list_request,"block_list":plan.block_list,
+        "plan":binding,"first_slot":first_slot,"last_slot":last_slot,
         "present_slots":present.len(),"skipped_slots":skipped,
         "post_gap_targets":pairs.len(),
         "expected_tick_boundaries":skipped + pairs.len() as u64,
@@ -357,14 +392,97 @@ fn census_receipt(
     }))
 }
 
+fn validate_page_ranges(plan: &PagedCensusPlan) -> Result<()> {
+    ensure!(
+        plan.schema == "jetstreamer-horizon-finalized-paged-gap-census-plan-v1"
+            && plan.last_slot >= plan.first_slot
+            && plan.last_slot - plan.first_slot <= 432_000
+            && !plan.pages.is_empty()
+            && plan.pages.len() <= 512
+            && plan
+                .output
+                .file_name()
+                .is_some_and(|name| name == "gap-census.json"),
+        "invalid paged census scope, schema or output"
+    );
+    let mut next = plan.first_slot;
+    for page in &plan.pages {
+        ensure!(
+            page.first_slot == next
+                && page.last_slot >= page.first_slot
+                && page.last_slot <= plan.last_slot
+                && page.last_slot - page.first_slot < 50_000,
+            "pages must cover the complete interval contiguously without overlap"
+        );
+        next = page
+            .last_slot
+            .checked_add(1)
+            .context("page bound overflow")?;
+    }
+    ensure!(next - 1 == plan.last_slot, "incomplete final page");
+    Ok(())
+}
+
+fn page_blocks(page: &BlockListPage, request: &Value, response: &Value) -> Result<Vec<u64>> {
+    check_block_list_request(page.first_slot, page.last_slot, request, response)?;
+    ensure!(
+        response["jsonrpc"] == "2.0" && response.get("error").is_none(),
+        "invalid page RPC response"
+    );
+    let blocks = array(&response["result"])?
+        .iter()
+        .map(|slot| slot.as_u64().context("page slot is not an integer"))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        blocks
+            .iter()
+            .all(|slot| *slot >= page.first_slot && *slot <= page.last_slot)
+            && blocks.windows(2).all(|pair| pair[0] < pair[1]),
+        "page contains an out-of-range or unordered slot"
+    );
+    // A page edge can itself be skipped; only the global endpoints are
+    // required to be present. Cross-page gaps are derived after concatenation.
+    Ok(blocks)
+}
+
+fn paged_census(binding: &BoundFile, plan: &PagedCensusPlan) -> Result<Value> {
+    validate_page_ranges(plan)?;
+    let mut blocks = Vec::new();
+    for page in &plan.pages {
+        blocks.extend(page_blocks(
+            page,
+            &serde_json::from_slice(&read_bound(&page.request)?)?,
+            &serde_json::from_slice(&read_bound(&page.response)?)?,
+        )?);
+    }
+    let pairs = pairs_from_present(plan.first_slot, plan.last_slot, &blocks)?;
+    // Use the exact same count/authority semantics as single-response census,
+    // but retain every actual RPC request/response rather than inventing one
+    // combined RPC response or attributing it to a request never answered.
+    let mut receipt = census_summary(binding, plan.first_slot, plan.last_slot, &blocks, &pairs)?;
+    let object = receipt
+        .as_object_mut()
+        .context("census receipt is not an object")?;
+    object.insert(
+        "schema".into(),
+        json!("jetstreamer-horizon-finalized-paged-gap-census-v1"),
+    );
+    object.insert(
+        "block_list_pages".into(),
+        serde_json::to_value(&plan.pages)?,
+    );
+    Ok(receipt)
+}
+
 fn run() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
     let census_only = args.len() == 6 && args[5] == "--census-only";
+    let paged_only = args.len() == 6 && args[5] == "--paged-census-only";
     ensure!(
-        (args.len() == 5 || census_only)
+        (args.len() == 5 || census_only || paged_only)
             && args[1] == "--plan-sha256"
             && args[3] == "--self-sha256",
-        "usage: jetstreamer-horizon-gap-audit PLAN --plan-sha256 HEX --self-sha256 HEX [--census-only]"
+        "usage: jetstreamer-horizon-gap-audit PLAN --plan-sha256 HEX --self-sha256 HEX [--census-only|--paged-census-only]"
     );
     ensure!(
         valid_sha(&args[4]) && digest(&fs::read("/proc/self/exe")?) == args[4],
@@ -375,7 +493,18 @@ fn run() -> Result<()> {
         path: PathBuf::from(&args[0]),
         sha256: args[2].clone(),
     };
-    let plan: Plan = serde_json::from_slice(&read_bound(&plan_binding)?)?;
+    let bytes = read_bound(&plan_binding)?;
+    if paged_only {
+        let plan: PagedCensusPlan = serde_json::from_slice(&bytes)?;
+        let receipt = paged_census(&plan_binding, &plan)?;
+        write_receipt(&plan.output, &receipt)?;
+        println!(
+            "{}",
+            json!({"output":plan.output,"pages":plan.pages.len(),"post_gap_targets":receipt["post_gap_targets"],"full_gap_audit_complete":false})
+        );
+        return Ok(());
+    }
+    let plan: Plan = serde_json::from_slice(&bytes)?;
     validate_mode(&plan, census_only)?;
     let blocks: Value = serde_json::from_slice(&read_bound(&plan.block_list)?)?;
     let block_request: Value = serde_json::from_slice(&read_bound(&plan.block_list_request)?)?;
@@ -438,6 +567,77 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn page(first: u64, last: u64) -> BlockListPage {
+        BlockListPage {
+            first_slot: first,
+            last_slot: last,
+            request: BoundFile {
+                path: "/immutable/request".into(),
+                sha256: "a".repeat(64),
+            },
+            response: BoundFile {
+                path: "/immutable/response".into(),
+                sha256: "b".repeat(64),
+            },
+        }
+    }
+
+    #[test]
+    fn paged_census_requires_complete_nonoverlapping_exact_coverage() {
+        let mut plan = PagedCensusPlan {
+            schema: "jetstreamer-horizon-finalized-paged-gap-census-plan-v1".into(),
+            first_slot: 100,
+            last_slot: 108,
+            pages: vec![page(100, 103), page(104, 108)],
+            output: "/private/gap-census.json".into(),
+        };
+        validate_page_ranges(&plan).unwrap();
+        plan.pages[1].first_slot = 105;
+        assert!(validate_page_ranges(&plan).is_err());
+        plan.pages[1].first_slot = 103;
+        assert!(validate_page_ranges(&plan).is_err());
+        plan.pages[1].first_slot = 104;
+        plan.pages[1].last_slot = 107;
+        assert!(validate_page_ranges(&plan).is_err());
+        plan.pages[1].last_slot = 109;
+        assert!(validate_page_ranges(&plan).is_err());
+        plan.pages[1].last_slot = 108;
+        plan.schema = "jetstreamer-horizon-finalized-gap-audit-plan-v1".into();
+        assert!(validate_page_ranges(&plan).is_err());
+    }
+
+    #[test]
+    fn paged_census_checks_each_actual_rpc_and_keeps_cross_page_gaps() {
+        let first = page(100, 103);
+        let second = page(104, 108);
+        let request = |start, end| json!({"jsonrpc":"2.0","id":start,"method":"getBlocks","params":[start,end,{"commitment":"finalized"}]});
+        let response = |id, slots| json!({"jsonrpc":"2.0","id":id,"result":slots});
+        let mut blocks =
+            page_blocks(&first, &request(100, 103), &response(100, vec![100, 101])).unwrap();
+        blocks.extend(
+            page_blocks(&second, &request(104, 108), &response(104, vec![105, 108])).unwrap(),
+        );
+        assert_eq!(
+            pairs_from_present(100, 108, &blocks).unwrap(),
+            [(101, 105), (105, 108)]
+        );
+        // Neither page edge needs to be a produced block, but all returned
+        // blocks must belong to the exact page and responses must match IDs.
+        assert!(page_blocks(&first, &request(100, 103), &response(100, vec![100, 104])).is_err());
+        assert!(page_blocks(&first, &request(100, 103), &response(101, vec![100, 101])).is_err());
+        assert!(page_blocks(&first, &request(100, 102), &response(100, vec![100, 101])).is_err());
+        assert!(
+            page_blocks(
+                &first,
+                &request(100, 103),
+                &json!({"jsonrpc":"2.0","id":100,"error":{"code":429}})
+            )
+            .is_err()
+        );
+        assert!(pairs_from_present(100, 108, &[101, 105, 108]).is_err());
+        assert!(pairs_from_present(100, 108, &[100, 105, 107]).is_err());
+    }
 
     fn census_plan() -> Plan {
         let bound = || BoundFile {

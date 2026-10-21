@@ -162,3 +162,20 @@ replay, runtime promotion and publication. Obtain finalized metadata for all
 listed post-gap blocks, bind their exact parents and visible hashes, then
 complete the ordinary audit/recovery path. A small earlier 11-target receipt
 must not be broadened or relabeled to cover this wider interval.
+
+For RPC backends that time out on a single large `getBlocks` request, use
+`--paged-census-only` with the distinct
+`jetstreamer-horizon-finalized-paged-gap-census-plan-v1` schema. Its `pages`
+array contains `{first_slot,last_slot,request,response}` entries; both bindings
+are immutable `{path,sha256}` files. At most 512 pages may cover the exact
+global interval, with no missing, overlapping or reordered pages and no page
+wider than 50,000 slots. Each original request must bind that page's exact
+finalized interval and match its original response ID. Skipped page endpoints
+are allowed; the global endpoints must be present. Derive gaps across page
+joins as well as within pages. Do not synthesize an HTTP/RPC response by joining
+JSON with shell or a floating-point parser.
+
+The resulting `jetstreamer-horizon-finalized-paged-gap-census-v1` receipt binds
+every actual request/response pair and retains the same non-authorizing
+first-stage semantics. Timeouts and error responses are preserved separately;
+they are not empty pages or evidence of a completed census.
