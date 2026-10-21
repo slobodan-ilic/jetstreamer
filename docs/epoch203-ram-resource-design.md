@@ -460,3 +460,32 @@ attestation and explicitly denies retirement/unmount authority. Exact-reference-
 scanned retirement and complete lifecycle qualification are still required
 before the RAM comparison can be admitted. Preserve the original RAM artifacts
 and mount pending those gates, even after a successful retention inventory.
+
+## Scratch-only retirement (qualification pending)
+
+The retention implementation is now shared in `ram_artifact_retention`; the
+`jetstreamer-epoch203-ram-retain` CLI still only inspects and retains artifacts.
+`jetstreamer-epoch203-ram-retire-scratch` is a separate executable. Its strict
+plan binds the original immutable retention plan, exact retention receipt and
+verifier binary, the direct scratch inode and a private durable receipt directory.
+It accepts only the reviewed isolated bootstrap runner, not a resumable native
+checkpoint, ordinary replay, reserve-stopped legacy cohort or unrelated epoch.
+
+Check-only revalidates terminal ownership/no triggers, source/outcome/mount
+bindings, all preserved artifact hashes/identities and a complete process
+reference scan, then pins a per-entry scratch identity ledger. Execute mode
+requires that exact self/plan-bound check, acquires a scratch-directory lock,
+fsyncs a no-clobber intent and rechecks every independent gate before unlinking.
+The descriptor-relative walker rejects links, special entries, foreign devices,
+owners, nested mounts and replacements. It removes only recorded scratch
+children, preserves the scratch directory and fsyncs each changed parent.
+
+An interrupted intent may resume only with the original executable, plan and
+check digest; remaining entries must be an identity-matching subset of the
+original ledger. Missing entries are not replacement authority. Completion
+requires empty original scratch plus unchanged archive/ledger/metadata and
+mount. No archive deletion, unmount, replay launch or publication is authorized.
+The primitive has real local-filesystem unlink/resumption tests; a real sealed
+check-only run and representative RAM unlink/lifecycle capability qualification
+are still independent requirements. Do not treat an empty scratch dry run as
+proof that a populated benchmark retirement has been qualified.
