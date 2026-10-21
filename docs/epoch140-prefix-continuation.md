@@ -179,3 +179,47 @@ The resulting `jetstreamer-horizon-finalized-paged-gap-census-v1` receipt binds
 every actual request/response pair and retains the same non-authorizing
 first-stage semantics. Timeouts and error responses are preserved separately;
 they are not empty pages or evidence of a completed census.
+
+## Bounded finalized target metadata collection
+
+`jetstreamer-epoch140-gap-metadata-fetch` is a separate root-only, fixed-census
+collector for all 18,283 targets in the sealed next-root census (SHA-256
+`11a6049bc9378b4e3e063e765ce2b908b621f5d7845a49d372aca509d6d37a9f`).
+It does not run a Bank, read a `.jet`, recover hidden hashes, contact R2 or
+grant replay/publication authority. Its strict plan schema is
+`jetstreamer-epoch140-gap-metadata-fetch-plan-v1`, with `unit`, `census` and
+`curl` `{path,sha256}` bindings, and a root-private `root` directly beneath
+`/var/lib/jetstreamer-epoch140-gap-metadata-UNIQUE`. Seal the collector, exact
+curl executable and plan with the normal Rust deployment sealer.
+
+Invoke `PLAN --plan-sha256 HEX --self-sha256 HEX [--check-only]`. Both modes
+authenticate the exact non-restarting systemd MainPID/invocation. The check
+unit is the production unit name with `-check` inserted before `.service`;
+it makes no network requests or output writes. Pre-create the root-owned
+0700 output root and prove that mode under the intended sandbox before launch.
+
+The endpoint is fixed to the public mainnet Solana RPC. Requests contain at
+most three finalized, rewards-free, metadata-only `getBlock` calls. The
+collector pins every ID, exact parent from the census, and both canonical
+32-byte hash encodings. It uses a two-second successful-batch delay and
+bounded backoff on partial/error responses. Curl gets a 45-second timeout;
+the owner independently kills/reaps only its own child after 50 seconds and
+bounds response capture to 64 KiB (plus a diagnostic overflow byte). Six
+hours, 10,000 attempts, eight consecutive no-progress attempts, a 1-GiB
+output budget and a retained 1-GiB private-filesystem reserve are hard stops.
+
+Actual request bytes, bounded captured response bytes and attempt errors
+remain private. Per-target checkpoints are immutable and atomically published
+without replacement only after finalized metadata validates. A deliberate
+resume takes the same output lock, rehashes all checkpoint/request/response
+bindings and repeats the parent/hash checks; file presence alone never skips
+a target. An interrupted partial stays diagnostic. No automatic restart or
+unconditional output replacement is supported.
+
+The final `complete.json` is written only after an independent reread of every
+verified target checkpoint and original RPC binding. It proves finalized
+parent/visible-hash metadata collection, not hidden PoH recovery, native
+live-state completeness, a terminal root, prefix qualification or publication.
+The retained ledger reports data through slot 61,344,045, covering the planned
+61,328,765 root, but its bounds do not replace complete native MANIFEST/WAL/CF
+validation and exact entry-chain recovery for every target.

@@ -16,9 +16,9 @@ use {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct BoundFile {
-    path: PathBuf,
-    sha256: String,
+pub(crate) struct BoundFile {
+    pub(crate) path: PathBuf,
+    pub(crate) sha256: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -69,18 +69,18 @@ struct Gap {
     previous_poh_hash: String,
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(crate) fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn valid_sha(value: &str) -> bool {
+pub(crate) fn valid_sha(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn read_bound(bound: &BoundFile) -> Result<Vec<u8>> {
+pub(crate) fn read_bound(bound: &BoundFile) -> Result<Vec<u8>> {
     ensure!(valid_sha(&bound.sha256), "invalid input SHA-256");
     ensure!(
         bound.path.is_absolute() && bound.path.canonicalize()? == bound.path,
@@ -198,7 +198,7 @@ fn check_hash(value: &Value) -> Result<String> {
     Ok(hash.to_owned())
 }
 
-fn collect_batch(
+pub(crate) fn collect_batch(
     request: &Value,
     response: &Value,
     targets: &BTreeSet<u64>,
