@@ -57,6 +57,10 @@ and producer unit names, and both invocation IDs. Observed/configured census
 lengths must equal production model ranges plus that explicit diagnostic set.
 Missing, extra, restarted or identity-changing diagnostics fail closed; they
 are never converted into production status claims or inactive cleanup evidence.
+An optional `additional_tracked_units` list in `scope_101_200` may add up to 128
+distinct constrained `horizon-`/`jetstreamer-` service names to the next fleet
+observation. It cannot remove prior tracked units, start a service, or add an ETA
+claim; all normal fleet identity/command/claim gates remain independent.
 
 The service name is `horizon-routine-cycle-101-200-TIMESTAMP-v2.service`.
 Cycle state belongs beneath

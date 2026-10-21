@@ -67,6 +67,8 @@ struct Plan {
 #[serde(deny_unknown_fields)]
 struct Scope101200 {
     diagnostic_ranges: Vec<DiagnosticClaim>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    additional_tracked_units: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -86,6 +88,18 @@ fn is_101(p: &Plan) -> Result<bool> {
             ensure!(
                 scope.diagnostic_ranges.len() <= 1,
                 "unsupported diagnostic census"
+            );
+            let unique: BTreeSet<_> = scope.additional_tracked_units.iter().collect();
+            ensure!(
+                unique.len() == scope.additional_tracked_units.len()
+                    && unique.len() <= 128
+                    && unique.iter().all(|s| (s.starts_with("horizon-")
+                        || s.starts_with("jetstreamer-"))
+                        && s.ends_with(".service")
+                        && s.len() <= 255
+                        && s.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))),
+                "invalid additional observational unit census"
             );
             for d in &scope.diagnostic_ranges {
                 ensure!(
@@ -794,6 +808,19 @@ fn derive(p: &Plan, model: &Value, fleet: &Value, observer: &Bound) -> Result<(V
     fleet["observer"] = serde_json::to_value(observer)?;
     fleet["previous_fleet"] = serde_json::to_value(&p.previous_fleet)?;
     fleet["output"] = json!(p.fleet_output);
+    if let Some(scope) = &p.scope_101_200
+        && !scope.additional_tracked_units.is_empty()
+    {
+        let tracked = fleet["tracked_units"]
+            .as_array_mut()
+            .context("missing tracked-unit template census")?;
+        for unit in &scope.additional_tracked_units {
+            let value = json!(unit);
+            if !tracked.contains(&value) {
+                tracked.push(value);
+            }
+        }
+    }
     for (epoch, evidence) in &p.additional_gate_evidence {
         let entries = fleet["gates"][epoch]["evidence"]
             .as_array_mut()
@@ -1593,6 +1620,9 @@ mod tests {
             fixture();
         p.schema = PLAN_SCHEMA_101.into();
         p.scope_101_200 = Some(Scope101200 {
+            additional_tracked_units: vec![
+                "horizon-routine101-root-sealer-probe-20261021-v2.service".into(),
+            ],
             diagnostic_ranges: vec![DiagnosticClaim {
                 range: "144".into(),
                 controller_unit: "horizon-qualify-epoch144-loader-focus-20261016-v1.service".into(),
@@ -1627,6 +1657,7 @@ mod tests {
         fleet["first_epoch"] = json!(101);
         fleet["last_epoch"] = json!(200);
         fleet["gates"] = json!({"140":{"state":"blocked-qualification","evidence":[]}});
+        fleet["tracked_units"] = json!(["horizon-preserved-private.service"]);
         prior["first_epoch"] = json!(101);
         prior["last_epoch"] = json!(200);
         (p, model, fleet, prior, est, old, config, observer)
@@ -1653,6 +1684,13 @@ mod tests {
         assert_eq!(derived["evidence"].as_array().unwrap().len(), 3);
         assert_eq!(derived["ranges"], model["ranges"]);
         assert_eq!(updated["gates"], fleet["gates"]);
+        assert_eq!(
+            updated["tracked_units"],
+            json!([
+                "horizon-preserved-private.service",
+                "horizon-routine101-root-sealer-probe-20261021-v2.service"
+            ])
+        );
         assert_eq!(p.expected_epochs, vec![198]);
     }
 
@@ -1728,6 +1766,31 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn observational_additions_are_bounded_and_integer_evidence_is_lossless() {
+        let (mut p, model, mut fleet, _, _, _, _, _) = fixture101();
+        fleet["diagnostics"][0]["consensus_integer_fixture"] = json!(u64::MAX);
+        let bound = Bound {
+            path: p.observer.clone(),
+            sha256: "b".repeat(64),
+        };
+        let (_, derived) = derive(&p, &model, &fleet, &bound).unwrap();
+        let restored: Value =
+            serde_json::from_slice(&serde_json::to_vec(&derived).unwrap()).unwrap();
+        assert_eq!(
+            restored["diagnostics"][0]["consensus_integer_fixture"].as_u64(),
+            Some(u64::MAX)
+        );
+        for units in [
+            vec!["foreign.service".into()],
+            vec!["horizon-/escape.service".into()],
+            vec!["horizon-one.service".into(), "horizon-one.service".into()],
+        ] {
+            p.scope_101_200.as_mut().unwrap().additional_tracked_units = units;
+            assert!(is_101(&p).is_err());
+        }
     }
 
     #[test]
