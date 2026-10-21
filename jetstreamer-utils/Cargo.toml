@@ -85,6 +85,22 @@ path = "src/epoch141_ledger_native_bin.rs"
 required-features = ["sst-capability-tests"]
 
 [[bin]]
+name = "jetstreamer-epoch140-checkpoint-journal"
+path = "src/epoch140_checkpoint_journal_bin.rs"
+
+[[bin]]
+name = "jetstreamer-epoch140-native-launch-capture"
+path = "src/epoch140_native_launch_capture_bin.rs"
+
+[[bin]]
+name = "jetstreamer-epoch140-snapshot-download"
+path = "src/epoch140_snapshot_download_bin.rs"
+
+[[bin]]
+name = "jetstreamer-epoch140-snapshot-metadata"
+path = "src/epoch140_snapshot_metadata_bin.rs"
+
+[[bin]]
 name = "jetstreamer-horizon-boundary-bridge"
 path = "src/horizon_boundary_bridge_bin.rs"
 
