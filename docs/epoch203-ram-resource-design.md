@@ -153,9 +153,10 @@ admission remain separate gates before **any replay**.
 `User=1000` alone retains ubuntu's NSS supplementary groups (including sudo
 and lxd on this host). Instead the probe service starts a fixed setpriv exec
 wrapper as `User=root`, `Group=root`, with only
-`CapabilityBoundingSet=CAP_SETGID CAP_SETUID CAP_SETPCAP` and no ambient or
-added supplementary groups. Invoke the immutable reviewed wrapper with
-`--reuid=1000 --regid=1000 --clear-groups --bounding-set=-all --no-new-privs`
+`CapabilityBoundingSet=CAP_SETGID CAP_SETUID CAP_SETPCAP` and the same exact
+`AmbientCapabilities=` for the initial drop, with no added supplementary groups.
+Invoke the immutable reviewed wrapper with
+`--reuid=1000 --regid=1000 --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs`
 and the sealed probe/plan/digests. The probe itself must observe all four
 real/effective/saved/filesystem UID and GID values1000, no foreign supplementary
 groups, all five process capability sets zero and effective NoNewPrivs1.
@@ -163,3 +164,14 @@ A real host read-only `/usr/bin/setpriv ... /usr/bin/cat /proc/self/status`
 check confirmed that this drop mechanism works; that check was **not** an
 actual sandbox or storage capability pass. No mount or replay is authorized
 by it. Require a separately sealed actual probe invocation before deployment.
+
+The first sealed real probe attempt (`horizon-203-ram-storage-probe-v1`,
+invocation `c8a6527a5a604b8b86a686e2f1c9a1f0`) failed in setpriv with exit127:
+`setresuid failed: Operation not permitted`. A bounding set alone did not
+provide the required effective drop capabilities in this sandbox. Preserve that
+failed unit/journal and package. The revised sandbox explicitly binds the same
+minimal ambient set for the wrapper, clears inherited/ambient sets before exec,
+and still requires the actual probe to prove all five capability sets zero.
+This correction must use a distinct sealed binary/plan and service invocation;
+the failed v1 attempt is not capability evidence. The independently managed
+empty RAM mount remains preserved and bound to its original mount invocation.

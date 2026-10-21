@@ -164,7 +164,9 @@ fn validate_service(text: &str, p: &Plan, inv: &str, pid: u32) -> Result<()> {
         ("PrivateNetwork", "no"),
         ("TemporaryFileSystem", ""),
         ("CapabilityBoundingSet", "cap_setgid cap_setuid cap_setpcap"),
-        ("AmbientCapabilities", ""),
+        // The fixed wrapper needs these effective at the UID/GID drop point.
+        // It must then clear both inherited and ambient sets before exec.
+        ("AmbientCapabilities", "cap_setgid cap_setuid cap_setpcap"),
         ("OOMPolicy", "kill"),
         ("OOMScoreAdjust", "1000"),
         ("PrivateDevices", "yes"),
@@ -576,7 +578,7 @@ mod tests {
     }
     fn service(p: &Plan) -> String {
         format!(
-            "Id={}\nInvocationID={}\nUser=root\nGroup=root\nSupplementaryGroups=\nType=oneshot\nRestart=no\nNRestarts=0\nKillMode=control-group\nDelegate=no\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectControlGroups=yes\nPrivateNetwork=no\nTemporaryFileSystem=\nCapabilityBoundingSet=cap_setgid cap_setuid cap_setpcap\nAmbientCapabilities=\nOOMPolicy=kill\nOOMScoreAdjust=1000\nPrivateDevices=yes\nRestrictSUIDSGID=yes\nUMask=0077\nMainPID=456\nReadWritePaths={}\nActiveState=activating\nSubState=start\n",
+            "Id={}\nInvocationID={}\nUser=root\nGroup=root\nSupplementaryGroups=\nType=oneshot\nRestart=no\nNRestarts=0\nKillMode=control-group\nDelegate=no\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectControlGroups=yes\nPrivateNetwork=no\nTemporaryFileSystem=\nCapabilityBoundingSet=cap_setgid cap_setuid cap_setpcap\nAmbientCapabilities=cap_setgid cap_setuid cap_setpcap\nOOMPolicy=kill\nOOMScoreAdjust=1000\nPrivateDevices=yes\nRestrictSUIDSGID=yes\nUMask=0077\nMainPID=456\nReadWritePaths={}\nActiveState=activating\nSubState=start\n",
             p.unit,
             "b".repeat(32),
             p.run_root.display()
@@ -622,6 +624,10 @@ mod tests {
             ),
             ("ReadWritePaths=", "ReadWritePaths=/tmp "),
             ("SupplementaryGroups=\n", "SupplementaryGroups=27\n"),
+            (
+                "AmbientCapabilities=cap_setgid cap_setuid cap_setpcap\n",
+                "AmbientCapabilities=\n",
+            ),
         ] {
             assert!(
                 validate_service(&service(&p).replace(a, b), &p, &"b".repeat(32), 456).is_err(),
