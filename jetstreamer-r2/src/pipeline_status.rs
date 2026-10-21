@@ -505,6 +505,7 @@ pub(super) async fn run() -> Result<()> {
             .is_none(),
         "canonical sidecar already exists; reconcile completion instead of publishing a countdown"
     );
+    preflight_status_receipt_write(&plan.receipt_directory)?;
     let (object_etag, previous_object_etag) = publish_epoch_status(&s3, &r2, &status).await?;
     let receipt = StatusPublicationReceipt {
         schema: PIPELINE_STATUS_RECEIPT_SCHEMA.into(),

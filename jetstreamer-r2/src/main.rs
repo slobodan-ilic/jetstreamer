@@ -1397,11 +1397,21 @@ fn validate_status_archive_directory(
     });
     if root_cohort {
         let run = scratch.parent().context("scratch has no run parent")?;
-        let cohort_name = format!("root-cohort-{}", observer_string(replay, &["range"])?);
+        let range = observer_string(replay, &["range"])?;
+        let claim = parse_observer_claim_range(range)?;
+        let cohort_name = format!("root-cohort-{range}");
+        let canonical_cohort_name = format!(
+            "root-cohort-{}-{}",
+            claim.first().context("empty cohort claim")?,
+            claim.last().context("empty cohort claim")?
+        );
         ensure!(
             scratch.file_name() == Some(std::ffi::OsStr::new("scratch"))
-                && run.parent().and_then(Path::file_name)
-                    == Some(std::ffi::OsStr::new(&cohort_name)),
+                && run
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == std::ffi::OsStr::new(&cohort_name)
+                        || name == std::ffi::OsStr::new(&canonical_cohort_name)),
             "observer root-cohort scratch layout does not bind its claim"
         );
         ensure!(
@@ -1492,12 +1502,60 @@ fn epoch_status_bytes(status: &EpochStatus) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn prepare_status_receipt_directory(directory: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    ensure!(
+        directory.is_absolute(),
+        "status receipt directory must be absolute"
+    );
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)?;
+    let metadata = fs::symlink_metadata(directory)?;
+    let uid = unsafe { libc::geteuid() };
+    ensure!(
+        directory.canonicalize()? == directory
+            && metadata.is_dir()
+            && (uid == 0 || metadata.uid() == uid),
+        "status receipt directory must already be canonical,private and owned by the reader or its authorized user"
+    );
+    // Never chmod an already-private or foreign-owned directory. A privileged reader may deliberately
+    // traverse a campaign-user-owned 0700 directory using only DAC_OVERRIDE;
+    // chmod would additionally require FOWNER and can fail after an R2 commit.
+    if metadata.mode() & 0o7777 != 0o700 {
+        ensure!(
+            metadata.uid() == uid,
+            "foreign-owned status receipt directory is not private"
+        );
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY)
+            .open(directory)?;
+        let opened = handle.metadata()?;
+        ensure!(
+            opened.dev() == metadata.dev() && opened.ino() == metadata.ino() && opened.uid() == uid,
+            "receipt directory changed before private-mode initialization"
+        );
+        handle.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn preflight_status_receipt_write(directory: &Path) -> Result<()> {
+    prepare_status_receipt_directory(directory)?;
+    let probe = tempfile::Builder::new()
+        .prefix(".status-receipt-write-probe-")
+        .tempfile_in(directory)
+        .context("status receipt directory is not writable before remote mutation")?;
+    probe.as_file().sync_all()?;
+    probe.close()?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
 fn write_status_receipt(directory: &Path, receipt: &StatusPublicationReceipt) -> Result<PathBuf> {
-    fs::create_dir_all(directory)?;
-    fs::set_permissions(
-        directory,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )?;
+    prepare_status_receipt_directory(directory)?;
     let final_path = status_receipt_path(directory, &receipt.status);
     if final_path.exists() {
         let before = regular_identity(&final_path)?;
@@ -1574,6 +1632,7 @@ async fn status_publish(
         phase: config.phase.clone().expect("validated"),
     };
     validate_epoch_status(&status, epoch)?;
+    preflight_status_receipt_write(config.receipt_directory.as_deref().expect("validated"))?;
     let (object_etag, previous_object_etag) = publish_epoch_status(s3, r2, &status).await?;
     let receipt = StatusPublicationReceipt {
         schema: STATUS_RECEIPT_SCHEMA.to_owned(),
@@ -1664,11 +1723,7 @@ fn write_status_deletion_receipt(
     directory: &Path,
     receipt: &StatusDeletionReceipt,
 ) -> Result<PathBuf> {
-    fs::create_dir_all(directory)?;
-    fs::set_permissions(
-        directory,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )?;
+    prepare_status_receipt_directory(directory)?;
     let final_path = status_deletion_receipt_path(directory, receipt.epoch);
     if final_path.exists() {
         let before = regular_identity(&final_path)?;
@@ -1883,6 +1938,7 @@ async fn status_delete(s3: &Client, r2: &R2Config, config: &Config, epoch: u64) 
     );
     let archive_receipt_sha256 = hex_lower(&Sha256::digest(&archive_receipt_bytes));
 
+    preflight_status_receipt_write(status_receipt_directory)?;
     validate_authenticated_ready_pair(s3, &r2.bucket, &archive_receipt).await?;
 
     let key = format!("epoch-{epoch}.epoch-status.json");
@@ -3536,6 +3592,129 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn singleton_status_directory_accepts_canonical_explicit_bounds_not_other_cohorts() {
+        for range in ["160", "160-160"] {
+            let mut observer = serde_json::json!({"replays":[{"range":range,
+                "scratch_path":"/private/root-cohort-160-160/run-1/scratch"}]});
+            validate_status_archive_directory(
+                &serde_json::to_vec(&observer).unwrap(),
+                160,
+                Path::new("/private/root-cohort-160-160/run-1/archives"),
+                "replay",
+            )
+            .unwrap();
+            for scratch in [
+                "/private/root-cohort-160-161/run-1/scratch",
+                "/private/root-cohort-161-161/run-1/scratch",
+                "/private/root-cohort-160-160/run-1/not-scratch",
+            ] {
+                observer["replays"][0]["scratch_path"] = serde_json::json!(scratch);
+                assert!(
+                    validate_status_archive_directory(
+                        &serde_json::to_vec(&observer).unwrap(),
+                        160,
+                        Path::new("/private/root-cohort-160-160/run-1/archives"),
+                        "replay"
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn status_directory_preflight_is_private_no_chmod_and_refuses_aliases() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("new/private");
+        preflight_status_receipt_write(&directory).unwrap();
+        assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        let before = fs::metadata(&directory).unwrap();
+        prepare_status_receipt_directory(&directory).unwrap();
+        let after = fs::metadata(&directory).unwrap();
+        assert_eq!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        preflight_status_receipt_write(&directory).unwrap();
+        assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o7777, 0o700);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&directory, &alias).unwrap();
+        assert!(preflight_status_receipt_write(&alias).is_err());
+    }
+
+    #[test]
+    fn status_write_preflight_precedes_each_remote_mutation_boundary() {
+        let source = include_str!("main.rs");
+        let publish = &source[source.find("async fn status_publish(").unwrap()
+            ..source
+                .find("// Shared conditional mutation boundary")
+                .unwrap()];
+        assert!(
+            publish.find("preflight_status_receipt_write(").unwrap()
+                < publish.find("publish_epoch_status(").unwrap()
+        );
+        let delete = &source[source.find("async fn status_delete(").unwrap()
+            ..source
+                .find("async fn conditional_delete_epoch_status(")
+                .unwrap()];
+        assert!(
+            delete.find("preflight_status_receipt_write(").unwrap()
+                < delete.find("conditional_delete_epoch_status(").unwrap()
+        );
+        let pipeline = include_str!("pipeline_status.rs");
+        assert!(
+            pipeline.find("preflight_status_receipt_write(").unwrap()
+                < pipeline.find("publish_epoch_status(").unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires sealed root test under DAC_OVERRIDE-only sandbox and dedicated UID1001private probe directory"]
+    fn status_receipt_foreign_private_directory_needs_no_fowner() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let process = fs::read_to_string("/proc/self/status").unwrap();
+        let caps = u64::from_str_radix(
+            process
+                .lines()
+                .find_map(|l| l.strip_prefix("CapEff:\t"))
+                .unwrap(),
+            16,
+        )
+        .unwrap();
+        assert_ne!(caps & (1 << 1), 0, "DAC_OVERRIDE must be effective");
+        assert_eq!(caps & (1 << 3), 0, "FOWNER must not be granted");
+        let directory = PathBuf::from(env::var("HORIZON_STATUS_FOREIGN_DIRECTORY").unwrap());
+        assert!(
+            directory.parent() == Some(Path::new("/var/lib/jetstreamer"))
+                && directory
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("horizon-status-foreign-probe-")
+        );
+        let before = fs::symlink_metadata(&directory).unwrap();
+        assert_eq!(before.uid(), 1001);
+        assert_eq!(before.mode() & 0o7777, 0o700);
+        preflight_status_receipt_write(&directory).unwrap();
+        let receipt = status_publication_receipt(152);
+        let path = write_status_receipt(&directory, &receipt).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        write_status_receipt(&directory, &receipt).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let after = fs::symlink_metadata(&directory).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode()),
+            (before.uid(), before.gid(), before.mode())
+        );
+        assert_eq!(fs::symlink_metadata(path).unwrap().uid(), 0);
     }
 
     #[test]

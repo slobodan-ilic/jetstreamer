@@ -87,3 +87,23 @@ probe (including actual `UMask=0077` behavior), exact local template check-only
 and least-privilege sandbox access have passed. The current manual cycle and
 scheduled observer remain the sole owners until an explicit successful handoff;
 do not arm both metadata paths for the same sample.
+
+The first 101–200 production cycle exposed a second sandbox boundary: the older
+R2 publisher chmodded the existing campaign-user-owned receipt directory only
+after authenticated remote readback. With `CAP_DAC_OVERRIDE` but not `CAP_FOWNER`,
+that chmod failed, leaving epoch 152's status committed without its local receipt.
+Its exact same-sample recovery performed authenticated readback without another
+PutObject, then durably recovered the receipt. Do not retry a whole cycle or grant
+broad capabilities to repair such a partial result.
+
+Qualify a publisher that preflights receipt-directory writes before remote
+mutation and does not chmod an already-private foreign-owned directory. Owned
+directories may still be initialized to 0700; symlinks and non-private foreign
+directories fail closed. The dedicated ignored R2 regression
+`tests::status_receipt_foreign_private_directory_needs_no_fowner` must run in a
+sealed root sandbox with effective DAC_OVERRIDE and no FOWNER, against a dedicated
+UID-1001-owned 0700 probe directory, with networking disabled. It proves durable
+root-owned receipts without changing the directory's owner or permissions.
+Also qualify the canonical `root-cohort-160-160` layout when the observer's claim
+is the scalar `160`; both literal and canonical bounds remain tied to that exact
+authenticated claim, never another cohort or final import destination.
