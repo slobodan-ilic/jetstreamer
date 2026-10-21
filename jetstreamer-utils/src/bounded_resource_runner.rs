@@ -30,27 +30,45 @@ static EXTERNAL_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BoundFile {
-    path: PathBuf,
-    sha256: String,
+pub(crate) struct BoundFile {
+    pub(crate) path: PathBuf,
+    pub(crate) sha256: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Plan {
-    schema: String,
-    unit: String,
-    node: BoundFile,
-    worker: PathBuf,
-    snapshot: PathBuf,
-    ledger_directory: PathBuf,
-    epoch_hashes: BoundFile,
-    run_root: PathBuf,
-    target_slot: u64,
-    terminal_slot: u64,
-    minimum_free_bytes: u64,
-    maximum_runtime_seconds: u64,
+pub(crate) struct Plan {
+    pub(crate) schema: String,
+    pub(crate) unit: String,
+    pub(crate) node: BoundFile,
+    pub(crate) worker: PathBuf,
+    pub(crate) snapshot: PathBuf,
+    pub(crate) ledger_directory: PathBuf,
+    pub(crate) epoch_hashes: BoundFile,
+    pub(crate) run_root: PathBuf,
+    pub(crate) target_slot: u64,
+    pub(crate) terminal_slot: u64,
+    pub(crate) minimum_free_bytes: u64,
+    pub(crate) maximum_runtime_seconds: u64,
 }
+
+/// Compile-bound extension points for a separately reviewed storage sandbox.
+/// Plans cannot select an implementation. Existing binaries use DiskStorage;
+/// no RAM path, mount operation or relaxed resource gate is introduced here.
+pub(crate) trait StorageHooks {
+    fn decode_plan(&self, bytes: &[u8]) -> Result<Plan> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+    fn prepare(&self, _plan: &Plan) -> Result<()> { Ok(()) }
+    fn configure_command(&self, _plan: &Plan, _command: &mut Command) -> Result<()> { Ok(()) }
+    fn before_spawn(&self, _plan: &Plan, _invocation: &str) -> Result<Value> { Ok(Value::Null) }
+    // A safety check, not a new routine observer. Implementations must enforce
+    // their own guard cadence and persist any stop intent before returning Err.
+    fn guard(&self, _plan: &Plan, _invocation: &str, _child: u32,
+        _elapsed: Duration, _draining: bool) -> Result<()> { Ok(()) }
+}
+struct DiskStorage;
+impl StorageHooks for DiskStorage {}
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -471,7 +489,7 @@ fn validate_checkpoint_names(hashes: &str) -> Result<()> {
     Ok(())
 }
 
-fn run() -> Result<()> {
+fn run(storage: &dyn StorageHooks) -> Result<()> {
     ensure!(
         unsafe { libc::geteuid() } != 0,
         "run as isolated replay user"
@@ -483,7 +501,7 @@ fn run() -> Result<()> {
     );
     bound_file(&fs::read_link("/proc/self/exe")?, &args[5], 256 << 20)?;
     bound_file(Path::new(&args[1]), &args[3], 1 << 20)?;
-    let p: Plan = serde_json::from_slice(&fs::read(&args[1])?)?;
+    let p = storage.decode_plan(&fs::read(&args[1])?)?;
     validate_plan(&p)?;
     let invocation = env::var("INVOCATION_ID")?;
     ensure!(identity(&invocation), "missing canonical invocation");
@@ -531,6 +549,7 @@ fn run() -> Result<()> {
             .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
         "genesis shadow"
     );
+    storage.prepare(&p)?;
     // The parent may unpack genesis beside its ledger. Keep immutable evidence
     // read-only and give this one diagnostic its own no-clobber ledger copy.
     let genesis = p.run_root.join("ledger/genesis.tar.bz2");
@@ -549,6 +568,7 @@ fn run() -> Result<()> {
     output.set_permissions(fs::Permissions::from_mode(0o400))?;
     File::open(p.run_root.join("ledger"))?.sync_all()?;
     let mut cmd = command(&p);
+    storage.configure_command(&p, &mut cmd)?;
     let execute = if NATURAL_ROOT_FINISH {
         measure_root
     } else {
@@ -560,6 +580,7 @@ fn run() -> Result<()> {
         &cgroup,
         &mut cmd,
         &json!({"plan_path":args[1],"plan_sha256":args[3],"self_sha256":args[5]}),
+        storage,
     )
 }
 
@@ -644,6 +665,7 @@ fn measure_root(
     cgroup: &Path,
     cmd: &mut Command,
     bindings: &Value,
+    storage: &dyn StorageHooks,
 ) -> Result<()> {
     ensure!(
         NATURAL_ROOT_FINISH && TARGET == TERMINAL,
@@ -653,6 +675,7 @@ fn measure_root(
     ensure!(free_before >= p.minimum_free_bytes, "fresh free-space gate");
     let before = metrics(cgroup)?;
     install_signals()?;
+    let storage_evidence = storage.before_spawn(p, invocation)?;
     let mut child = ChildGroup(cmd.spawn()?, false);
     let pid = child.0.id();
     let (tx, rx) = mpsc::sync_channel(64);
@@ -669,6 +692,7 @@ fn measure_root(
     let mut code = None;
     let outcome = (|| -> Result<()> {
         loop {
+            storage.guard(p, invocation, pid, started.elapsed(), false)?;
             ensure!(
                 EXTERNAL_SIGNAL.load(Ordering::SeqCst) == 0,
                 "external signal"
@@ -768,6 +792,7 @@ fn measure_root(
         "cgroup_before":before,"cgroup_after":metrics(cgroup)?,"archive_length":archive_length,
         "producer_segment_manifest":manifest,"producer_segment_manifest_sha256":manifest_sha,
         "free_before":free_before,"free_after":free_bytes(&p.run_root)?,"success":success,"error":error,
+        "storage_evidence":storage_evidence,
         "producer_canonical_root_prefix_present":success,
         "authority":{"canonical_prefix_independently_qualified":false,"full_cold_epoch_peak_qualified":false,
             "ordinary_replay_authorized":false,"runtime_promotion_authorized":false,
@@ -789,11 +814,13 @@ fn measure(
     cgroup: &Path,
     cmd: &mut Command,
     bindings: &Value,
+    storage: &dyn StorageHooks,
 ) -> Result<()> {
     let free_before = free_bytes(&p.run_root)?;
     ensure!(free_before >= p.minimum_free_bytes, "fresh free-space gate");
     let before = metrics(cgroup)?;
     install_signals()?;
+    let storage_evidence = storage.before_spawn(p, invocation)?;
     let mut child = ChildGroup(cmd.spawn()?, false);
     let pid = child.0.id();
     let (tx, rx) = mpsc::sync_channel(64);
@@ -810,6 +837,7 @@ fn measure(
     let mut last_progress: Option<Value> = None;
     let outcome = (|| -> Result<()> {
         loop {
+            storage.guard(p, invocation, pid, started.elapsed(), stop_at.is_some())?;
             let external = EXTERNAL_SIGNAL.load(Ordering::SeqCst);
             if stop_at.is_none()
                 && (external != 0 || started.elapsed().as_secs() >= p.maximum_runtime_seconds)
@@ -906,6 +934,7 @@ fn measure(
     let success = error.is_none() && controlled_success(target, external, code);
     let payload = json!({"schema":RESULT_SCHEMA,"epoch":EPOCH,"unit":p.unit,"invocation_id":invocation,"plan":{"path":bindings["plan_path"],"sha256":bindings["plan_sha256"]},"runner_sha256":bindings["self_sha256"],"node_sha256":p.node.sha256,"worker_sha256":WORKER,"snapshot_sha256":SNAPSHOT,"target_slot":p.target_slot,"observed_slot":observed,"target_reached":target,"first_progress":first_progress,"last_progress":last_progress,"child_pid":pid,"child_return_code":code,"external_signal":external,"elapsed_millis":started.elapsed().as_millis(),"capture":capture,"cgroup_before":before,"cgroup_after":metrics(cgroup)?,"free_before":free_before,"free_after":free_bytes(&p.run_root)?,"success":success,"error":error,"authority":{"ordinary_replay_authorized":false,"full_cold_epoch_peak_qualified":false,"publication_authorized":false,"runtime_promotion_authorized":false,"canonical_sidecar_authorized":false,"remote_mutations":false,"r2_mutations":false}});
     let mut payload = payload;
+    payload["storage_evidence"] = storage_evidence;
     payload["solana_rayon_threads"] = json!(RAYON_THREADS);
     persist(
         &p.run_root.join(if success {
@@ -923,7 +952,11 @@ fn measure(
 }
 
 pub(crate) fn main() {
-    if let Err(e) = run() {
+    main_with_storage(&DiskStorage);
+}
+
+pub(crate) fn main_with_storage(storage: &dyn StorageHooks) {
+    if let Err(e) = run(storage) {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
@@ -1089,7 +1122,8 @@ mod root_tests {
                 &"a".repeat(32),
                 &t.path().join("cgroup"),
                 &mut cmd,
-                &bindings
+                &bindings,
+                &DiskStorage
             )
             .is_err()
         );
@@ -1171,6 +1205,7 @@ mod root_success_tests {
             &t.path().join("cgroup"),
             &mut cmd,
             &bindings,
+            &DiskStorage,
         )
         .unwrap();
         let r: Value =
@@ -1476,6 +1511,10 @@ mod tests {
     }
 
     fn exercise_child(pretarget: bool) -> (tempfile::TempDir, Result<()>) {
+        exercise_child_with_storage(pretarget, &DiskStorage)
+    }
+
+    fn exercise_child_with_storage(pretarget: bool, storage: &dyn StorageHooks) -> (tempfile::TempDir, Result<()>) {
         let temp = tempfile::Builder::new()
             .prefix("epoch225-resource-fixture-")
             .tempdir()
@@ -1520,8 +1559,48 @@ mod tests {
             &cgroup,
             &mut cmd,
             &json!({"plan_path":"/sealed/test","plan_sha256":"b".repeat(64),"self_sha256":"c".repeat(64)}),
+            storage,
         );
         (temp, result)
+    }
+
+    #[test]
+    fn storage_admission_rejection_prevents_child_start() {
+        struct Reject;
+        impl StorageHooks for Reject {
+            fn before_spawn(&self, _p: &Plan, _inv: &str) -> Result<Value> {
+                anyhow::bail!("fixture storage admission rejected")
+            }
+        }
+        let (t, outcome) = exercise_child_with_storage(false, &Reject);
+        assert!(outcome.unwrap_err().to_string().contains("storage admission rejected"));
+        assert!(!t.path().join("scratch/runtime/accounts-state").exists());
+        assert!(fs::read_dir(t.path().join("receipts")).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn storage_guard_intent_precedes_owned_child_failure() {
+        struct Reject;
+        impl StorageHooks for Reject {
+            fn before_spawn(&self, _p: &Plan, _inv: &str) -> Result<Value> {
+                Ok(json!({"storage_scope":"fixture-only","publication_authorized":false}))
+            }
+            fn guard(&self, p: &Plan, inv: &str, child: u32, _elapsed: Duration, _draining: bool) -> Result<()> {
+                persist(&p.run_root.join("receipts/storage-guard-stop.json"),
+                    &json!({"invocation_id":inv,"child_pid":child,"reason":"fixture-stop"}))?;
+                anyhow::bail!("fixture storage guard stop")
+            }
+        }
+        let (t, outcome) = exercise_child_with_storage(false, &Reject);
+        assert!(outcome.is_err());
+        let stop: Value = serde_json::from_slice(&fs::read(t.path().join("receipts/storage-guard-stop.json")).unwrap()).unwrap();
+        let failure: Value = serde_json::from_slice(&fs::read(t.path().join("receipts/failure.json")).unwrap()).unwrap();
+        assert_eq!(failure["child_pid"],stop["child_pid"]);
+        assert_eq!(failure["invocation_id"],stop["invocation_id"]);
+        assert_eq!(failure["success"],false);
+        assert_eq!(failure["storage_evidence"]["storage_scope"],"fixture-only");
+        assert_eq!(failure["authority"]["publication_authorized"],false);
+        assert!(!t.path().join("receipts/resource.json").exists());
     }
 
     #[test]
