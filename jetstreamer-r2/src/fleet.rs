@@ -1128,6 +1128,10 @@ pub(super) fn unit(name: &str) -> Result<Value> {
     Ok(Value::Object(values))
 }
 
+fn ram_entry_owner(name: &str) -> bool {
+    name.starts_with("horizon-203-ram-resource-")
+}
+
 pub(super) fn census(
     names: &BTreeSet<String>,
     first_epoch: u64,
@@ -1183,6 +1187,10 @@ pub(super) fn census(
         if name.starts_with("jetstreamer-root-sweep-")
             || name.starts_with("horizon-controller-")
             || name.starts_with("horizon-qualify-")
+            // Private RAM supervisors are entry owners too. Until the explicit
+            // auxiliary claim contract is integrated, fail closed rather than
+            // silently omit one from the complete campaign census.
+            || ram_entry_owner(name)
             || assigned_diagnostic
             || assigned_pipeline
         {
@@ -2215,6 +2223,21 @@ mod tests {
         register_live_pipeline_stage(&mut stages, &claim).unwrap();
     }
     use super::*;
+    #[test]
+    fn ram_supervisors_cannot_disappear_from_the_complete_service_census() {
+        for name in [
+            "horizon-203-ram-resource-baseline-test.service",
+            "horizon-203-ram-resource-shrink-test.service",
+            "horizon-203-ram-resource-baseline-capability-v1.service",
+        ] {
+            assert!(ram_entry_owner(name));
+        }
+        assert!(!ram_entry_owner(
+            "unrelated-horizon-203-ram-resource-test.service"
+        ));
+        assert!(!ram_entry_owner("horizon-203-ram-storage-probe-v3.service"));
+    }
+
     #[test]
     fn natural_root_225_launch_keeps_the_complete_span_and_tail_private() {
         let mut claim = DiagnosticClaim {
